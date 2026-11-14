@@ -64,7 +64,8 @@ DEFAULT_CONFIG = {
     "quota_guard": True,       # True：5 小时额度低于 15% 的成员自动跳过；False：照样让他干活（用户可在设置里关）
     "lan_access": False,       # 手机通过局域网访问面板；默认关闭，只能在电脑上打开
     "gpt_full_access": False,  # True：GPT 在「允许改文件」的任务里不受沙箱限制，才能调用 hub 指挥队友、联网
-    "codex_effort": "",        # GPT 的思考强度：留空=跟随 Codex 自己的设置；low / medium / high / max
+    "codex_effort": "",        # 旧设置：GPT 的思考强度；成员卡片上单独设过（见 effort）就以那个为准
+    "effort": {},              # 每位成员的思考等级 {成员: low/medium/high/xhigh/max}，""=沿用该程序自己的默认；对 GPT、Claude 有效，Gemini 的等级写在模型名里
     "profiles": {
         "gemini": "额度最充裕（每周和每 5 小时仍有上限），能力中上。团队主力干活的人：阅读、搜索、整理、写初稿、写代码、批量改写等执行类的活默认都给它。",
         "claude": "最聪明，额度有限。岗位是拍板和把关：定方案、做关键决定、审查重要成果，不做体力活。",
@@ -134,6 +135,48 @@ def load_config():
     except Exception as e:  # 配置坏了也别挂
         eprint("[hub] 配置文件读取失败，使用默认配置：%s" % e)
         return DEFAULT_CONFIG
+
+
+WEB_NOTE = ("\n\n（这个问题可以联网：需要最新或你不确定的信息时，请先用你的网页搜索工具查，"
+            "回答里附上主要来源链接；搜不到或没有搜索工具就直说，不要编。）")
+CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]   # 来自 claude --help 的 --effort 档位
+CODEX_EFFORTS_FALLBACK = ["low", "medium", "high", "xhigh", "max"]
+_EFFORT_ID = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
+
+
+def codex_model_efforts(model):
+    """某个 GPT 模型自己支持的思考档位 [(名字, 说明)]，读 Codex 的模型清单；读不到就用常见的五档。"""
+    model = model or codex_defaults()[0]
+    cm = read_json(os.path.join(HOME, ".codex", "models_cache.json")) or {}
+    for m in cm.get("models") or []:
+        if isinstance(m, dict) and m.get("slug") == model:
+            out = [(str(x.get("effort")), str(x.get("description") or "")) for x in m.get("supported_reasoning_levels") or []
+                   if isinstance(x, dict) and _EFFORT_ID.match(str(x.get("effort") or ""))]
+            if out:
+                return out
+    return [(e, "") for e in CODEX_EFFORTS_FALLBACK]
+
+
+def effort_levels(spec):
+    """这个后端/模型能选的思考档位名单；空列表=不能单独调（Gemini 的档位写在模型名里，DeepSeek 不支持）。"""
+    kind, _, mdl = (spec or "").partition(":")
+    if kind == "codex":
+        return [e for e, _ in codex_model_efforts(mdl)]
+    if kind == "claude":
+        return list(CLAUDE_EFFORTS)
+    return []
+
+
+def agent_effort(cfg, agent, spec):
+    """这位成员用这个模型时的思考档位；""=不指定。卡片上设过（哪怕设成默认）就以卡片为准，否则 GPT 沿用旧的 codex_effort。
+    模型不支持这一档（比如换成了备用模型）就不传，让它用自己的默认。"""
+    eff = cfg.get("effort") if isinstance(cfg.get("effort"), dict) else {}
+    kind = (spec or "").partition(":")[0]
+    if agent in eff:
+        e = eff.get(agent) or ""
+    else:
+        e = (cfg.get("codex_effort") or "") if kind == "codex" else ""
+    return e if e and e in effort_levels(spec) else ""
 
 
 def find_bin(cfg, name):
@@ -424,6 +467,8 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
     cmd = [exe, "--print=" + prompt, "--output-format", "stream-json", "--print-timeout", "%ds" % timeout]
     if model:
         cmd += ["--model", model]
+    if cfg.get("_resume"):  # 续接上一轮的会话，只发这一轮的话
+        cmd += ["--conversation", cfg["_resume"]]
     if write:
         cmd += ["--mode", "accept-edits", "--dangerously-skip-permissions"]
     live = Live()
@@ -485,14 +530,18 @@ def backend_codex(cfg, model, prompt, cwd, write, timeout):
         raise BackendError("未找到 codex CLI")
     fd, outfile = tempfile.mkstemp(suffix=".txt", prefix="hub-codex-")
     os.close(fd)
-    cmd = [exe, "exec", "--skip-git-repo-check", "-C", cwd,
-           "-s", ("danger-full-access" if cfg.get("gpt_full_access") else "workspace-write") if write else "read-only",
-           "-o", outfile]
+    sandbox = ("danger-full-access" if cfg.get("gpt_full_access") else "workspace-write") if write else "read-only"
+    if cfg.get("_resume"):  # 续接上一轮的会话；resume 不认 -s/-C，用配置项指定沙箱，目录靠进程的当前目录
+        cmd = [exe, "exec", "resume", "--skip-git-repo-check", "-c", 'sandbox_mode="%s"' % sandbox, "-o", outfile]
+    else:
+        cmd = [exe, "exec", "--skip-git-repo-check", "-C", cwd, "-s", sandbox, "-o", outfile]
     if model:
         cmd += ["-m", model]
-    if cfg.get("codex_effort"):
-        cmd += ["-c", 'model_reasoning_effort="%s"' % cfg["codex_effort"]]
-    cmd += ["--json", "-"]
+    if cfg.get("_effort") and _EFFORT_ID.match(cfg["_effort"]):
+        cmd += ["-c", 'model_reasoning_effort="%s"' % cfg["_effort"]]
+    if cfg.get("_web"):  # 打开 GPT 自带的实时网页搜索
+        cmd += ["-c", 'web_search="live"']
+    cmd += ["--json"] + ([cfg["_resume"]] if cfg.get("_resume") else []) + ["-"]
     live = Live()
     box = {}
 
@@ -539,7 +588,8 @@ def backend_dsh(cfg, model, prompt, cwd, write, timeout):
     if not exe:
         raise BackendError("未安装 dsh")
     env = clean_env({"DSH_PERMISSION_MODE": "danger-full-access" if write else "read-only"})
-    cmd = [exe, "--patch", DSH_PATCH, "--profile", "headless", "--json", "-"]
+    cmd = [exe, "--patch", DSH_PATCH, "--profile", "headless", "--json"] + \
+        (["--session-id", cfg["_resume"]] if cfg.get("_resume") else []) + ["-"]
     live = Live()
 
     def on_line(line):
@@ -592,8 +642,29 @@ def backend_claude(cfg, model, prompt, cwd, write, timeout):
         raise BackendError("未找到 claude CLI")
     cmd = [exe, "-p", "--model", model or "opus",
            "--permission-mode", "acceptEdits" if write else "plan"]
+    if cfg.get("_effort") in CLAUDE_EFFORTS:
+        cmd += ["--effort", cfg["_effort"]]
+    if cfg.get("_web"):  # 只读模式下也放行 Claude 自带的网页搜索和读网页
+        cmd += ["--allowedTools", "WebSearch", "WebFetch"]
+    if cfg.get("_resume"):
+        cmd += ["--resume", cfg["_resume"]]
+    cmd += ["--output-format", "json"]  # 拿到会话编号，下次追问能续接
     rc, out, err = _run(cmd, cwd, clean_env(), timeout, stdin_text=prompt)
     text = out.strip()
+    try:
+        d = json.loads(text)
+    except ValueError:
+        d = None
+    if isinstance(d, dict) and "result" in d:
+        if d.get("is_error"):
+            raise BackendError("claude 出错：%s" % _tail(str(d.get("result") or d.get("subtype") or text)))
+        text = str(d.get("result") or "").strip()
+        u = d.get("usage") if isinstance(d.get("usage"), dict) else {}
+        _ctx.tokens = {"in": int(u.get("input_tokens") or 0), "out": int(u.get("output_tokens") or 0),
+                       "cache": int(u.get("cache_read_input_tokens") or 0)}
+        if d.get("session_id"):
+            _ctx.session = {"id": str(d["session_id"]), "app": "Claude Code",
+                            "resume": "cd %s && %s --resume %s" % (shq(cwd), shq(exe), shq(str(d["session_id"])))}
     not_logged = len(text) < 200 and ("Not logged in" in text or "Please run /login" in text)
     if rc != 0 or not text or not_logged:
         hint = "（未登录：请在终端运行一次 claude 并执行 /login）" if not_logged else ""
@@ -792,7 +863,32 @@ def team_note(cfg, me):
             "不需要就别用。直接给出最终结果，不要反问。" % (me, " / ".join(others)))
 
 
-def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, quiet=False, note=True, meta=None):
+_SID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
+def resume_plan(agent, ext, meta, web):
+    """追问时能不能直接续接上一轮的原生会话（各家都会缓存会话前文，命中率更高，也不用重发上文）。
+    只在「接着上一轮、同一位、同一个模型、上一轮成功、没派过团队、那个会话还没被别的分支接过」时续接；
+    分叉、只带一条上文、换人换模型时都不续接，照旧把上文写进提示词新开会话。"""
+    f = ext.get("follows") or {}
+    if ext.get("fork") or ext.get("scope", "full") != "full" or f.get("type") != "call" \
+            or not re.fullmatch(r"c_[0-9a-f]+", str(f.get("id") or "")):
+        return None
+    tpath = os.path.join(CALLS_DIR, f["id"] + ".json")
+    t = read_json(tpath) or {}
+    ses = t.get("session") if isinstance(t.get("session"), dict) else {}
+    if t.get("status") != "ok" or t.get("agent") != agent or t.get("kind") not in ("ask", "chat", "side") \
+            or t.get("dispatch") or t.get("session_continued_by") or not _SID.match(str(ses.get("id") or "")):
+        return None
+    text = meta.get("resume_prompt") or ext.get("display")
+    if not text:
+        return None
+    return {"from": f["id"], "path": tpath, "sid": str(ses["id"]), "backend": t.get("backend"),
+            "prompt": text + (WEB_NOTE if web else "")}
+
+
+def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, quiet=False, note=True, meta=None,
+        spec=None, effort=None, web=False):
     """调用某个角色。返回 (回答文本, 实际使用的后端描述)。全部后备都失败则抛 BackendError。"""
     if agent not in cfg["agents"]:
         raise BackendError("未知 agent：%s（可选：%s）" % (agent, ", ".join(cfg["agents"])))
@@ -811,8 +907,12 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
         raise BackendError("%s 没有配置任何后端" % agent)
     if model:
         chain[0] = chain[0].split(":")[0] + ":" + model
+    if spec:  # 旁问里指定的模型排第一，失败了再按这位成员原来的顺序换备用
+        chain = [spec] + [x for x in chain if x != spec]
     # 只有当对方还能再找队友时才告诉它可以求助，免得它试了碰壁
     full_prompt = prompt + (team_note(cfg, agent) if note and hub_depth() + 1 < MAX_DEPTH else "")
+    if web:
+        full_prompt += WEB_NOTE
     errors = []
     meta = meta or {}
     cid = "c_" + uuid.uuid4().hex[:10]
@@ -823,11 +923,16 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
            "secs": None, "write": bool(write), "cwd": cwd, "prompt": prompt, "answer": None,
            "error": None, "attempts": [], "pid": os.getpid(),
            "image": meta.get("image"), "follows": None, "display": None, "chat": meta.get("chat")}
-    if rec["kind"] in ("ask", "image", "chat") and not rec["parent"]:
+    if web or spec or effort is not None:
+        rec["side"] = {"web": bool(web), "effort": effort or "", "spec": spec or ""}
+    if rec["kind"] in ("ask", "image", "chat", "side") and not rec["parent"]:
         ext = top_meta()
         rec["follows"], rec["display"] = ext.get("follows"), ext.get("display") or meta.get("display")
+        if ext.get("fork"):
+            rec["fork"] = True
         rec["submission_id"] = ext.get("submission_id")
     cpath = os.path.join(CALLS_DIR, cid + ".json")
+    resume = resume_plan(agent, top_meta(), meta, web) if not rec["parent"] and rec["kind"] in ("ask", "chat", "side") else None
     write_json(cpath, rec)
     if meta.get("on_start"):
         meta["on_start"](cid)
@@ -843,29 +948,52 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
         write_json(cpath, rec)
         _ctx.call_id, _ctx.run_id, _ctx.write = previous
 
-    for i, spec in enumerate(chain):
+    for i, spec_i in enumerate(chain):
         if _stopping.is_set():
             break
-        kind, _, mdl = spec.partition(":")
+        kind, _, mdl = spec_i.partition(":")
         fn = BACKENDS.get(kind)
         if not fn:
-            errors.append((spec, "未知后端（找不到）"))
-            rec["attempts"].append({"backend": spec, "error": "未知后端", "reason": "配置里写了不认识的模型：%s" % spec})
+            errors.append((spec_i, "未知后端（找不到）"))
+            rec["attempts"].append({"backend": spec_i, "error": "未知后端", "reason": "配置里写了不认识的模型：%s" % spec_i})
             continue
         t0 = time.time()
-        rec["backend"] = spec
+        rec["backend"] = spec_i
         write_json(cpath, rec)
         _ctx.tokens = None
         _ctx.session = None
         _ctx.partial = None
         try:
-            text = fn(cfg, mdl, full_prompt, cwd, write, timeout)
+            eff = agent_effort(cfg, agent, spec_i)
+            if effort is not None and i == 0 and spec:  # 旁问里单独选的档位只用在指定的那个模型上
+                eff = effort if effort in effort_levels(spec_i) else ""
+            run_cfg = dict(cfg, _effort=eff, _web=bool(web))
+            text = None
+            if resume and resume["backend"] == spec_i:
+                t = read_json(resume["path"]) or {}
+                t["session_continued_by"] = cid  # 先占住：这个会话之后只沿这条线续，别的分支另开新会话
+                write_json(resume["path"], t)
+                try:
+                    text = fn(dict(run_cfg, _resume=resume["sid"]), mdl, resume["prompt"], cwd, write, timeout)
+                    rec["resumed"] = resume["from"]
+                except (BackendError, OSError) as e:
+                    if _stopping.is_set():
+                        raise
+                    rec["attempts"].append({"backend": spec_i, "error": str(e)[:800], "resume_failed": True,
+                                            "reason": "续接上一轮的会话没成功（%s），改为带上前文重新问" % explain_error(str(e))[0]})
+                    write_json(cpath, rec)
+                    _ctx.tokens = _ctx.session = _ctx.partial = None
+                    if not quiet:
+                        eprint("[hub] 续接上一轮会话没成功，改为带上前文重新问…")
+                resume = None
+            if text is None:
+                text = fn(run_cfg, mdl, full_prompt, cwd, write, timeout)
             dt = time.time() - t0
-            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec, "ok": True,
+            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": True,
                       "secs": round(dt, 1), "write": write, "cwd": cwd,
                       "prompt": prompt[:200], "answer_chars": len(text)})
             if i > 0 and not quiet:
-                eprint("[hub] 注意：%s 的首选模型没成功，这次由备用的 %s 完成。" % (agent, spec_label(spec)))
+                eprint("[hub] 注意：%s 的首选模型没成功，这次由备用的 %s 完成。" % (agent, spec_label(spec_i)))
             if meta.get("defer"):  # 调用方还要接着处理（例如对接人派活），先别标「完成」
                 finish(status="running", tokens=getattr(_ctx, "tokens", None), session=getattr(_ctx, "session", None))
                 rec["end"] = rec["secs"] = None
@@ -873,19 +1001,19 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
             else:
                 finish(status="ok", answer=text, tokens=getattr(_ctx, "tokens", None),
                        session=getattr(_ctx, "session", None))
-            return text, spec
+            return text, spec_i
         except (BackendError, OSError) as e:
-            errors.append((spec, str(e)))
-            att = {"backend": spec, "error": str(e)[:800], "reason": "%s：%s" % (spec_label(spec), explain_error(str(e))[0])}
+            errors.append((spec_i, str(e)))
+            att = {"backend": spec_i, "error": str(e)[:800], "reason": "%s：%s" % (spec_label(spec_i), explain_error(str(e))[0])}
             if getattr(_ctx, "partial", None):
                 att["partial"] = _ctx.partial
                 rec["partial"] = _ctx.partial  # 超时等情况下已经写出来的部分，标「未完成」给人看
             rec["attempts"].append(att)
-            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec, "ok": False,
+            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": False,
                       "secs": round(time.time() - t0, 1), "error": str(e)[:500], "prompt": prompt[:200]})
             if not quiet:
                 nxt = chain[i + 1] if i + 1 < len(chain) else None
-                eprint("[hub] %s 没成功（%s）%s" % (spec_label(spec), explain_error(str(e))[0],
+                eprint("[hub] %s 没成功（%s）%s" % (spec_label(spec_i), explain_error(str(e))[0],
                                                  "，换 %s 再试…" % spec_label(nxt) if nxt else "。"))
     msg = failure_text(agent, errors)
     finish(status="fail", error=msg, error_detail="\n\n".join("[%s] %s" % (sp, raw) for sp, raw in errors))
@@ -1148,7 +1276,7 @@ def _open_run(cfg, goal, cwd, write, **fields):
              "end": None, "cwd": cwd, "planner": None, "synthesizer": None, "tasks": [], "final": None,
              "error": None, "pid": os.getpid(), "write": bool(write), "timeout": cfg["timeout"],
              "follows": top_meta().get("follows"), "display": top_meta().get("display"),
-             "submission_id": top_meta().get("submission_id")}
+             "submission_id": top_meta().get("submission_id"), "fork": bool(top_meta().get("fork")) or None}
     state.update(fields)
     slock = threading.RLock()
 
@@ -1511,7 +1639,7 @@ def _chat_fail_record(cfg, message, error, info):
         "agent": "-", "backend": "-", "preferred_backend": "-", "status": "fail", "start": now, "end": now, "secs": 0,
         "write": False, "cwd": os.getcwd(), "prompt": message, "answer": None, "error": error, "attempts": [],
         "pid": os.getpid(), "follows": ext.get("follows"), "display": ext.get("display"),
-        "submission_id": ext.get("submission_id"), "chat": info})
+        "submission_id": ext.get("submission_id"), "chat": info, "fork": bool(ext.get("fork")) or None})
 
 
 def run_chat(cfg, message, cwd=None, write=False, contact=None):
@@ -1537,7 +1665,8 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
     text, spec = ask(cfg, name, CHAT_PROMPT.format(team=team, phase_note=note, message=message), cwd=cwd,
                      write=False, note=False,
                      meta={"kind": "chat", "title": "联络：" + shown[:40], "chat": info, "on_start": cid_box.append,
-                           "defer": True})
+                           "defer": True,
+                           "resume_prompt": CHAT_PROMPT.format(team=team, phase_note=note, message=shown) if top_meta().get("display") else None})
     cpath = os.path.join(CALLS_DIR, cid_box[0] + ".json")
 
     def update(**kw):
@@ -1715,7 +1844,7 @@ def ui_state(cfg):
     for c in calls[:200]:
         d = {k: c.get(k) for k in ("id", "parent", "run", "task", "kind", "title", "agent", "backend", "status",
                                    "start", "end", "secs", "write", "cwd", "error", "follows", "display", "submission_id",
-                                   "chat", "dispatch")}
+                                   "chat", "dispatch", "side", "fork", "resumed")}
         d["preferred_backend"] = call_preferred(c)
         d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
         d["answer_preview"] = _preview(c.get("answer"))
@@ -1726,7 +1855,7 @@ def ui_state(cfg):
     for r in runs:
         d = {k: r.get(k) for k in ("id", "goal", "status", "summary", "start", "end", "cwd", "planner",
                                    "synthesizer", "error", "write", "follows", "display", "submission_id",
-                                   "participants", "skipped", "timeout_warning", "parent_call", "pressure")}
+                                   "participants", "skipped", "timeout_warning", "parent_call", "pressure", "fork")}
         d["mode"] = r.get("mode") or "run"  # 旧记录没有 mode，都是自动分工
         d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min",
                                              "progress", "leftover", "skip_reason", "started",
@@ -1738,12 +1867,14 @@ def ui_state(cfg):
         lite_runs.append(d)
     health = read_json(HEALTH_PATH) or {}
     return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls,
+            "archived": load_archived(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
                        "running": bool(_health_running.is_set())},
             "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout")},
                            council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
                            council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
-                           quota_guard=quota_guard_on(), pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1]),
+                           quota_guard=quota_guard_on(), pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1],
+                           effort={n: agent_effort(cfg, n, (cfg["agents"][n] or [""])[0]) for n in cfg["agents"]}),
             "workspace": UI_WORKSPACE, "backends": backend_choices(cfg),
             "ui_version": int(os.path.getmtime(UI_HTML)) if os.path.exists(UI_HTML) else 0}
 
@@ -1814,6 +1945,12 @@ def backend_choices(cfg):
             {"spec": "claude:opus", "label": "Claude Opus（需登录）"},
             {"spec": "claude:sonnet", "label": "Claude Sonnet（需登录）"},
             {"spec": "claude:haiku", "label": "Claude Haiku（需登录）"}]
+    for o in out:
+        kind, _, mdl = o["spec"].partition(":")
+        if kind == "codex":
+            o["efforts"] = [{"id": e, "desc": d} for e, d in codex_model_efforts(mdl)]
+        elif kind == "claude":
+            o["efforts"] = [{"id": e, "desc": ""} for e in CLAUDE_EFFORTS]
     known = set(o["spec"] for o in out)
     for chain in cfg["agents"].values():
         for sp in chain:
@@ -1905,10 +2042,10 @@ def ui_record(kind, rid):
     return ui_run(rid) if kind == "run" else ui_call(rid) if kind == "call" else None
 
 
-def follow_context(kind, rid):
-    """保留最近多轮问答，按时间顺序提供；旧记录无需迁移。"""
+def follow_context(kind, rid, depth=8):
+    """保留最近多轮问答，按时间顺序提供；旧记录无需迁移。depth=1 时只带这一条。"""
     turns, seen = [], set()
-    for _ in range(8):
+    for _ in range(max(1, min(8, depth))):
         if kind == "run" and isinstance(rid, str) and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", rid):
             pc = (read_json(os.path.join(RUNS_DIR, rid, "run.json")) or {}).get("parent_call")
             if pc:  # 对接人派出的项目组：上文是派它的那一轮对话（对话里已含项目组结果）
@@ -1932,6 +2069,34 @@ def follow_context(kind, rid):
         return ""
     return ("===== 之前的对话（背景）=====\n" + "\n\n".join(reversed(turns)) +
             "\n\n===== 用户现在的追问 =====\n")
+
+
+ARCHIVE_PATH = os.path.join(HUB_HOME, "archived.json")
+_archive_lock = threading.Lock()
+_ARCHIVE_KEY = re.compile(r"^(run|call):[A-Za-z0-9._-]{1,80}$")
+
+
+def load_archived():
+    """已归档的记录，形如 ["run:2026...", "call:abc"]。只是不在左栏常规列表里显示，记录本身不删。"""
+    d = read_json(ARCHIVE_PATH)
+    keys = d.get("keys") if isinstance(d, dict) else None
+    return [k for k in keys if isinstance(k, str) and _ARCHIVE_KEY.match(k)] if isinstance(keys, list) else []
+
+
+def set_archived(keys, on):
+    if not isinstance(keys, list) or not keys or len(keys) > 500 or not isinstance(on, bool):
+        raise ValueError("归档请求格式不对")
+    for k in keys:
+        if not isinstance(k, str) or not _ARCHIVE_KEY.match(k):
+            raise ValueError("归档请求格式不对")
+    with _archive_lock:
+        cur = load_archived()
+        if on:
+            cur = cur + [k for k in keys if k not in cur]
+        else:
+            drop = set(keys)
+            cur = [k for k in cur if k not in drop]
+        write_json(ARCHIVE_PATH, {"keys": cur[-5000:]})
 
 
 def stop_record(kind, rid):
@@ -2246,7 +2411,7 @@ class PairLimiter(object):
             self.fails.clear()
 
 
-REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
+REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
 
 
 def gate(ip, host, sock_ip, port, path, cookie, lan_on):
@@ -2620,12 +2785,29 @@ def serve_ui(port, me):
         c = load_config()
         if not text:
             raise ValueError("内容是空的")
-        if mode not in ("run", "pressure", "ask", "image", "council", "chat"):
+        if mode not in ("run", "pressure", "ask", "image", "council", "chat", "side"):
             raise ValueError("方式不对")
         if mode == "council" and body.get("write"):
             raise ValueError("会审只读，不能允许改文件")
-        if mode == "ask" and agent not in c["agents"]:
+        if mode in ("ask", "side") and agent not in c["agents"]:
             raise ValueError("没有这个 agent")
+        side = []
+        if mode == "side":  # 旁问：只读，可指定模型、档位、联网
+            if body.get("write"):
+                raise ValueError("旁问只读，不能允许改文件")
+            sp, ef = body.get("spec") or "", body.get("effort")
+            if sp:
+                if sp not in set(o["spec"] for o in backend_choices(c)):
+                    raise ValueError("不认识这个模型：%s" % sp)
+                side += ["--spec", sp]
+            if ef not in (None, ""):
+                if ef not in effort_levels(sp or (c["agents"][agent] or [""])[0]):
+                    raise ValueError("这个模型没有「%s」这一档" % ef)
+                side += ["--effort", ef]
+            if "web" in body and not isinstance(body["web"], bool):
+                raise ValueError("联网搜索必须是开或关")
+            if body.get("web"):
+                side.append("--web")
         if mode == "chat" and agent not in list(c["agents"]) + ["auto"]:
             raise ValueError("没有这个联络人")
         if not os.path.isdir(cwd):
@@ -2642,11 +2824,21 @@ def serve_ui(port, me):
                 pc = (read_json(os.path.join(RUNS_DIR, ctx["id"], "run.json")) or {}).get("parent_call")
                 if pc:  # 在对接人派出的项目组里接着说，算接着那段对话
                     ctx = {"type": "call", "id": pc}
-            pre = follow_context(ctx["type"], ctx["id"])
+            scope = body.get("context_scope", "full")
+            if scope not in ("full", "one"):
+                raise ValueError("上下文范围不对")
+            pre = follow_context(ctx["type"], ctx["id"], 1 if scope == "one" else 8)
+            meta["scope"] = scope
             if not pre:
                 raise ValueError("找不到要追问的记录")
             full = pre + text
             meta["follows"] = {"type": ctx["type"], "id": ctx["id"]}
+            if "fork" in body and not isinstance(body["fork"], bool):
+                raise ValueError("分叉必须是开或关")
+            if body.get("fork"):  # 从这里分出一条新线：带上到这里为止的上下文，之后各走各的
+                if mode == "side":
+                    raise ValueError("旁问不用分叉")
+                meta["fork"] = True
         if mode == "image":
             out = os.path.join(UI_WORKSPACE, "images", "img-%s-%s.png" % (time.strftime("%Y%m%d-%H%M%S"),
                                                                            uuid.uuid4().hex[:4]))
@@ -2668,6 +2860,8 @@ def serve_ui(port, me):
             cmd = [sys.executable, me, "run", "--pressure", "-w", cwd] + (["--write"] if body.get("write") else []) + ["-"]
         elif mode == "chat":
             cmd = [sys.executable, me, "chat", "--contact", agent, "-w", cwd] + (["--write"] if body.get("write") else []) + ["-"]
+        elif mode == "side":
+            cmd = [sys.executable, me, "ask", agent, "--side"] + side + ["-w", cwd, "-"]
         else:
             cmd = [sys.executable, me, mode] + ([agent] if mode == "ask" else []) + ["-w", cwd]
             if body.get("write"):
@@ -2709,9 +2903,18 @@ def serve_ui(port, me):
                 raise ValueError("开关格式不对")
             raw["quota_guard"] = body["quota_guard"]
         if "codex_effort" in body:
-            if body["codex_effort"] not in ("", "low", "medium", "high", "max"):
+            if body["codex_effort"] != "" and body["codex_effort"] not in effort_levels("codex"):
                 raise ValueError("思考强度不对")
             raw["codex_effort"] = body["codex_effort"]
+        ef = body.get("effort")
+        if "effort" in body:
+            if not isinstance(ef, dict) or ef.get("agent") not in c["agents"]:
+                raise ValueError("思考等级设置不对")
+            if ef.get("level") != "" and ef.get("level") not in effort_levels((c["agents"][ef["agent"]] or [""])[0]):
+                raise ValueError("这个模型没有「%s」这一档" % ef.get("level"))
+            cur = raw.get("effort") if isinstance(raw.get("effort"), dict) else {}
+            cur[ef["agent"]] = ef["level"]
+            raw["effort"] = cur
         ch = body.get("chain")
         if "chain" in body and not isinstance(ch, dict):
             raise ValueError("模型设置格式不对")
@@ -2885,6 +3088,8 @@ def serve_ui(port, me):
                     err = stop_record(body.get("type"), body.get("id"))
                     if err:
                         raise ValueError(err)
+                elif self.path == "/api/archive":
+                    set_archived(body.get("keys"), body.get("on"))
                 elif self.path == "/api/health":
                     run_health()
                 elif self.path == "/api/quota":
@@ -3010,6 +3215,10 @@ def main():
     a.add_argument("--write", action="store_true", help="允许它创建/修改工作目录里的文件")
     a.add_argument("--model", help="指定首选后端的模型")
     a.add_argument("--timeout", type=int)
+    a.add_argument("--spec", help="这次先用哪个模型（如 codex:gpt-6-astra、agy:gemini-4-carbon-high）")
+    a.add_argument("--effort", help="这次用的思考档位（这个模型自己的档位名）")
+    a.add_argument("--web", action="store_true", help="允许联网搜索")
+    a.add_argument("--side", action="store_true", help="作为旁问记录（不进主线）")
 
     r = sub.add_parser("run", help="规划 -> 并行分工 -> 汇总")
     r.add_argument("goal", nargs="+", help="目标；写 - 则从标准输入读")
@@ -3059,8 +3268,11 @@ def main():
             warn = timeout_warning(args.timeout or cfg["timeout"])
             if warn:
                 eprint("[hub] 提醒：" + warn)
+            if args.spec and args.spec not in set(o["spec"] for o in backend_choices(cfg)):
+                raise BackendError("不认识这个模型：%s" % args.spec)
             text, _ = ask(cfg, args.agent, read_prompt(args.prompt), cwd=args.cwd, write=args.write,
-                          timeout=args.timeout, model=args.model)
+                          timeout=args.timeout, model=args.model, spec=args.spec, effort=args.effort,
+                          web=args.web, meta={"kind": "side"} if args.side else None)
             print(text)
             return 0
         if args.cmd == "run":

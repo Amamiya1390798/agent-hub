@@ -116,6 +116,7 @@ class API(unittest.TestCase):
         for b in [{'timeout':None},{'timeout':59},{'timeout':7201},{'max_parallel':0},
                   {'max_parallel':1.5},{'max_parallel':True},{'planner':'missing'},
                   {'codex_effort':'invalid'},{'chain':[]},
+                  {'effort':{'agent':'claude','level':'ultra'}},{'effort':{'agent':'nobody','level':'low'}},{'effort':'high'},
                   {'chain':{'agent':'gpt','index':99,'spec':'codex'}},
                   {'chain':{'agent':'gpt','index':.5,'spec':'codex'}},
                   {'chain':{'agent':'gpt','index':0,'spec':'agy:claude-forbidden'}}]:
@@ -127,6 +128,10 @@ class API(unittest.TestCase):
         self.assertEqual(cfg['timeout'],120)
         self.assertEqual(cfg['agents']['gpt'][0],'dsh')
         self.assertEqual(cfg['planner'],'gemini')
+        self.assertEqual(self.request('/api/config',{'effort':{'agent':'claude','level':'xhigh'}})[0],400)  # 现在是 Gemini 假模型，没有这一档
+        self.assertEqual(self.request('/api/config',{'chain':{'agent':'claude','index':0,'spec':'claude:opus'}})[0],200)
+        self.assertEqual(self.request('/api/config',{'effort':{'agent':'claude','level':'xhigh'}})[0],200)
+        self.assertEqual(json.loads((self.home/'config.json').read_text())['effort'],{'claude':'xhigh'})
         self.assertIn('agy',cfg['bins'])
 
     def test_image_allowlist_and_ids(self):
@@ -208,6 +213,67 @@ class API(unittest.TestCase):
         pid = int((self.home/'fake.pid').read_text())
         state = subprocess.run(['ps','-o','stat=','-p',str(pid)],capture_output=True,text=True).stdout.strip()
         self.assertTrue(not state or state.startswith('Z'), state)
+
+
+    def test_side_question(self):
+        for bad in ({'mode':'side','agent':'gemini','text':'x','write':True},
+                    {'mode':'side','agent':'gemini','text':'x','spec':'agy:not-real'},
+                    {'mode':'side','agent':'ds','text':'x','effort':'xhigh'},
+                    {'mode':'side','agent':'gemini','text':'x','web':'yes'}):
+            self.assertEqual(self.request('/api/submit',bad)[0],400,bad)
+        self.assertEqual(self.request('/api/submit',{'mode':'side','agent':'gemini','text':'旁问离线测试','web':True})[0],200)
+        for _ in range(100):
+            recs = [json.loads(p.read_text()) for p in (self.home/'calls').glob('*.json')]
+            m = [r for r in recs if r.get('display')=='旁问离线测试']
+            if m and m[0]['status'] != 'running':
+                break
+            time.sleep(.05)
+        self.assertEqual(m[0]['kind'],'side')
+        self.assertEqual(m[0]['side']['web'],True)
+        self.assertFalse(m[0]['write'])
+        self.assertEqual(m[0]['answer'],'测试回答')
+
+
+    def test_fork_and_context_scope(self):
+        def wait(text):
+            for _ in range(100):
+                recs = [json.loads(p.read_text()) for p in (self.home/'calls').glob('*.json')]
+                m = [r for r in recs if r.get('display')==text]
+                if m and m[0]['status'] != 'running':
+                    return m[0]
+                time.sleep(.05)
+        self.assertEqual(self.request('/api/submit',{'mode':'ask','agent':'gemini','text':'分叉的起点'})[0],200)
+        root = wait('分叉的起点')
+        self.assertEqual(self.request('/api/submit',{'mode':'ask','agent':'gemini','text':'第二轮','context':{'type':'call','id':root['id']}})[0],200)
+        second = wait('第二轮')
+        for bad in ({'mode':'ask','agent':'gemini','text':'x','context':{'type':'call','id':root['id']},'fork':'yes'},
+                    {'mode':'side','agent':'gemini','text':'x','context':{'type':'call','id':root['id']},'fork':True},
+                    {'mode':'ask','agent':'gemini','text':'x','context':{'type':'call','id':root['id']},'context_scope':'half'}):
+            self.assertEqual(self.request('/api/submit',bad)[0],400,bad)
+        self.assertEqual(self.request('/api/submit',{'mode':'ask','agent':'gemini','text':'分出去的','context':{'type':'call','id':root['id']},'fork':True})[0],200)
+        fork = wait('分出去的')
+        self.assertTrue(fork['fork'])
+        self.assertEqual(fork['follows'],{'type':'call','id':root['id']})
+        self.assertIn('分叉的起点', fork['prompt'])
+        self.assertNotIn('fork', second)
+        self.assertEqual(self.request('/api/submit',{'mode':'side','agent':'gemini','text':'只带一条','context':{'type':'call','id':second['id']},'context_scope':'one'})[0],200)
+        one = wait('只带一条')
+        self.assertIn('第二轮', one['prompt'])
+        self.assertNotIn('分叉的起点', one['prompt'])
+        self.assertEqual(self.request('/api/submit',{'mode':'side','agent':'gemini','text':'带完整','context':{'type':'call','id':second['id']},'context_scope':'full'})[0],200)
+        self.assertIn('分叉的起点', wait('带完整')['prompt'])
+
+
+    def test_archive(self):
+        self.assertEqual(self.request('/api/archive',{'keys':['run:20261114-010101','call:c_abc'],'on':True})[0],200)
+        st = json.loads(self.request('/api/state?c=t')[1])
+        self.assertEqual(st['archived'],['run:20261114-010101','call:c_abc'])
+        self.assertEqual(self.request('/api/archive',{'keys':['call:c_abc'],'on':False})[0],200)
+        st = json.loads(self.request('/api/state?c=t')[1])
+        self.assertEqual(st['archived'],['run:20261114-010101'])
+        for bad in ({'keys':['run:../x'],'on':True},{'keys':[],'on':True},{'keys':['call:a'],'on':'yes'},{'keys':'call:a','on':True}):
+            self.assertEqual(self.request('/api/archive',bad)[0],400, bad)
+        self.request('/api/archive',{'keys':['run:20261114-010101'],'on':False})
 
 
 if __name__ == '__main__':

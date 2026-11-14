@@ -14,7 +14,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 
 | 路径 | 作用 |
 | :--- | :--- |
-| `hub` | 全部后端逻辑，单文件 Python 脚本（约 3000 行）：命令行、各后端适配、排工/执行/汇总、会审、对接人、额度读取、面板 HTTP 服务、局域网配对、纯标准库二维码。 |
+| `hub` | 全部后端逻辑，单文件 Python 脚本（约 3300 行）：命令行、各后端适配、排工/执行/汇总、会审、对接人、额度读取、面板 HTTP 服务、局域网配对、纯标准库二维码。 |
 | `ui.html` | 面板前端，单文件原生 JavaScript + CSS，没有构建步骤。由 `hub ui` 的 HTTP 服务直接下发。 |
 | `app/` | macOS 原生窗口壳（Swift + WKWebView），只负责打开 `http://127.0.0.1:8765/`。`sh app/build.sh` 编译并安装到 `~/Applications/Hub.app`。 |
 | `install.sh` | 先跑离线测试，通过后把 `hub` 装到 `~/.local/bin/hub`、`ui.html` 和 `README.md` 装到 `~/.agent-hub/`，并重启面板服务。旧版本备份到 `~/.agent-hub/backup/`。 |
@@ -37,12 +37,19 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 
 前一个模型失败（超时、未登录、额度用完）时，`ask()` 会按链顺序自动换下一个，记录里会标明实际用了哪个。
 
+**思考等级**：配置 `effort` 是 `{成员: 档位}`，档位名沿用各模型自己的（`effort_levels(spec)`）：GPT 读 `~/.codex/models_cache.json` 里该模型的 `supported_reasoning_levels`，以 `-c model_reasoning_effort=…` 传入；Claude 是 `low/medium/high/xhigh/max`，以 `--effort` 传入；Gemini 的档位是不同的模型名（如 `gemini-4-carbon-high`），面板通过换模型来调；DeepSeek 不支持。模型不支持所选档位时不传。旧配置 `codex_effort` 只在成员没单独设过时作为 GPT 的后备。
+
+**续接原生会话**：每次调用会把后端返回的会话编号存进记录的 `session`。追问时由 `resume_plan()` 判断能否直接续接：同一位成员、同一个模型、上一轮成功、没派过团队、不是分叉、上下文范围是完整、且那个会话还没被别的分支续过（`session_continued_by`）。能续接就只发这一轮的话（GPT `codex exec resume <id>`、Gemini `agy --conversation <id>`、Claude `claude --resume <id> --output-format json`、DeepSeek `dsh --session-id <id>`）；续接失败自动改为把前文写进提示词新开会话。
+
 ## 4. 核心流程（都在 `hub` 里）
 
 - **`ask(cfg, agent, prompt, ...)`**：单次调用。负责选后端、写调用记录、实时输出、失败换备用。所有其他流程最终都调用它。
 - **`run_goal(...)`**（`hub run`）：`make_plan` 让排工者按 `PLAN_PROMPT` 输出 JSON 任务列表（含 `depends_on`、`write`、`why`、`eta_min`）→ `_exec_tasks` 按依赖并行执行，同时最多 `max_parallel` 件 → 用 `SYNTH_PROMPT` 汇总。传 `--pressure` 时是「高压模式」：由 `ds` 排工和汇总，并把配置里的 `pressure_prompt` 放在排工提示词前面。
 - **`run_council(...)`**（`hub council`）：几位成员只读、互相看不到答案地回答同一个问题，再由一位按 `COUNCIL_SYNTH_PROMPT` 比较。
 - **`run_chat(...)`**（`hub chat`）：对接人模式。`choose_contact` 按阶段（定方案 / 动手 / 整理）和剩余额度选人，对接人可以直接回答，也可以发起 run 或 council，结果交回对话。
+- **旁问**（`mode: "side"`）：`hub ask <成员> --side [--spec 模型] [--effort 档位] [--web]`。只读；记录的 `kind` 为 `side`，不进左栏主线。`--web` 时 GPT 加 `-c web_search="live"`，Claude 加 `--allowedTools WebSearch WebFetch`，并在提示词末尾附 `WEB_NOTE`。
+- **分叉**：提交时 `fork: true` 加 `context`，记录带 `fork: true`。面板把分叉作为独立项目组，追问链在分叉处断开；后端带上到分叉点为止的上下文，并且不续接原会话。
+- **上下文范围**：提交时 `context_scope` 为 `full`（`follow_context` 最多 8 轮）或 `one`（只带那一轮）。
 - **共享进度板**：`board_text` / `write_board_md` 生成每个项目组的看板。成员回复末尾的进度/遗留段由 `parse_report` 解析后写回看板。
 - **额度**：`quota_agy`（`agy --print=/usage`）、`quota_codex`（读最近的 Codex 会话日志）、`quota_ds`（DeepSeek 余额接口，需要用户自己提供密钥）。Claude 的额度读不到。`quota_skip` 在剩余低于 15% 时跳过该成员，用户可以在配置里把 `quota_guard` 设为 `false` 关掉这个跳过。
 - **嵌套**：成员可以在干活时自己调用 `hub ask` 找队友。深度由环境变量 `HUB_DEPTH` 计数，`MAX_DEPTH = 2`；`HUB_PARENT`、`HUB_RUN`、`HUB_META` 用来把子调用挂到父记录下。
@@ -56,6 +63,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 | `calls.jsonl` | 调用流水。 |
 | `runs/<YYYYmmdd-HHMMSS>/` | 一个项目组：`run.json`、`plan.json`、`board.md`、`t1.md`…（成员原文）、`final.md`。 |
 | `quota.json`、`health.json`、`models.json` | 额度缓存、体检结果、可选模型清单。 |
+| `archived.json` | 已归档记录的名单 `{"keys": ["run:…", "call:…"]}`；只影响面板显示，记录本身不删。 |
 | `pair.json` | 手机配对码（敏感，不要打印）。 |
 | `ui.pid` | 面板服务进程号。 |
 
@@ -66,7 +74,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 `hub ui` 启动 `ThreadingHTTPServer`，默认只监听 `127.0.0.1:8765`。
 
 - GET：`/`、`/api/state?c=<客户端id>`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
-- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `image`）、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
+- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
 - `/api/bye` 不需要令牌，只用于页面关闭时登记。
 
 安全措施：检查 Host 头；图片接口只返回位图（不返回 SVG，防止 XSS）；设置 CSP 和 `X-Frame-Options`。局域网模式（`lan_access`）默认关闭，开启后只接受私有网段，需要配对码加 HttpOnly cookie，配对码输错有限速；设置、登录、开关局域网这些操作只能在本机做（见 `gate()` 和 `REMOTE_POSTS`）。

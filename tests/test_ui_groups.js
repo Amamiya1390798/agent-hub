@@ -252,6 +252,33 @@ const config = { planner: 'gemini', synthesizer: 'gemini', max_parallel: 3, time
   assert.ok(xssHtml.includes('单问&lt;script&gt;evil()&lt;/script&gt;'));
   assert.ok(!xssHtml.includes('undefined'));
 
+  // 归档：归档的组和单条平时不显示，只在「已归档」里出现；进行中的组没有归档按钮
+  {
+    const base = { agents, config, health: { results: {} }, calls, runs, workspace: '/w' };
+    ui.set(Object.assign({}, base, { archived: ['call:c_ask1', 'call:c_ask2', 'call:c_ask3', 'run:r_plan', 'call:c_single_ask', 'call:c_chat1'] }));
+    ui.setFilter('all'); ui.setQuery(''); ui.last.list = ''; ui.last.filters = '';
+    ui.renderList();
+    let h = nodes.list.innerHTML;
+    assert.ok(!h.includes('接着翻第二段暗号词') && !h.includes('先翻第一段'), '整组归档后平时不显示');
+    assert.ok(!h.includes('帮我改个错别字'), '归档的单独提问平时不显示');
+    assert.ok(h.includes('筹备新专辑'), '组里只归档了一部分（后来又有新追问）时仍显示');
+    assert.ok(nodes.filters.innerHTML.includes('已归档 2'), '筛选栏显示归档数量');
+    assert.ok(/class="iarch" data-act="archive" data-keys="call:c_single_img" data-on="1"/.test(h), '单独提问卡片上有归档小按钮');
+    assert.ok(!/data-act="archive"[^>]*call:c_chat1/.test(h), '进行中的组没有归档按钮');
+    ui.setFilter('archived'); ui.last.list = '';
+    ui.renderList();
+    h = nodes.list.innerHTML;
+    assert.ok(h.includes('先翻第一段') && h.includes('帮我改个错别字'), '「已归档」里能看到');
+    assert.ok(!h.includes('买哪款声卡更稳妥'), '「已归档」里不出现没归档的');
+    assert.ok(h.includes('data-on="0"'), '已归档的组显示取消归档按钮');
+    assert.ok(/class="iarch" data-act="archive" data-keys="call:c_single_ask" data-on="0"/.test(h), '已归档的单独提问有取消归档小按钮');
+    ui.set(Object.assign({}, base, { archived: [] }));
+    ui.last.list = '';
+    ui.renderList();
+    assert.ok(nodes.list.innerHTML.includes('还没有归档的记录'), '没有归档时的空状态');
+    ui.setFilter('all'); ui.last.list = ''; ui.last.filters = '';
+  }
+
   console.log('ui groups: grouping, parent_call merge, solo split, expand/collapse, tasks, filter/search and xss escaping passed');
 })().catch(e => {
   console.error(e);

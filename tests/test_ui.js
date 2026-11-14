@@ -61,7 +61,7 @@ const pending = [], conn = {};
 const polling = {pollSeq:0, appliedPollSeq:0, CID:'test', uiVersion:0, S:null,
   api:()=>new Promise((resolve,reject)=>pending.push({resolve,reject})),
   $:()=>conn, followLatest:false, checkDone:()=>{}, renderList:()=>{},
-  renderRail:()=>{}, renderView:()=>{}, renderComposer:()=>{}};
+  renderRail:()=>{}, renderView:()=>{}, renderComposer:()=>{}, renderSide:()=>{}};
 vm.createContext(polling);
 vm.runInContext(script.slice(script.indexOf('async function poll(){'),script.indexOf('function select(type,')),polling);
 (async()=>{

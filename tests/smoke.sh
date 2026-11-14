@@ -18,8 +18,13 @@ python3 tests/test_api.py
 python3 tests/test_council.py
 python3 tests/test_lan.py
 python3 tests/test_pressure.py
+python3 tests/test_effort.py
+python3 tests/test_side.py
+python3 tests/test_resume.py
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js
 node tests/test_ui_groups.js
+node tests/test_ui_effort.js
+node tests/test_ui_side.js
 echo "smoke ok"
