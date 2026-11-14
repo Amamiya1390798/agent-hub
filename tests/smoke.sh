@@ -7,6 +7,7 @@ trap 'rm -rf "$HUB_TEST_HOME"' EXIT HUP INT TERM
 export HUB_HOME="$HUB_TEST_HOME"
 unset HUB_PARENT HUB_RUN HUB_DEPTH HUB_META HUB_READONLY
 export PYTHONDONTWRITEBYTECODE=1
+export HUB_NO_AUTOTITLE=1  # 自动起名会真的叫模型，离线测试里关掉
 python3 - <<'PY'
 import ast
 from pathlib import Path
@@ -22,6 +23,8 @@ python3 tests/test_effort.py
 python3 tests/test_side.py
 python3 tests/test_resume.py
 python3 tests/test_images.py
+python3 tests/test_names.py
+python3 tests/test_handoff.py
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js

@@ -279,6 +279,20 @@ const config = { planner: 'gemini', synthesizer: 'gemini', max_parallel: 3, time
     ui.setFilter('all'); ui.last.list = ''; ui.last.filters = '';
   }
 
+  // 项目组名字：有名字就显示名字，搜索也能搜到；卡片上有重命名按钮
+  {
+    ui.set({ agents, config, health: { results: {} }, calls, runs, workspace: '/w', names: { 'run:r_council': '声卡选购', 'call:c_single_ask': '错别字' } });
+    ui.setFilter('all'); ui.setQuery(''); ui.last.list = '';
+    const gg = ui.groups();
+    assert.equal(gg.projects.find(p => p.id === 'run:r_council').title, '声卡选购');
+    ui.renderList();
+    assert.ok(nodes.list.innerHTML.includes('声卡选购') && nodes.list.innerHTML.includes('错别字'));
+    assert.ok(nodes.list.innerHTML.includes('data-act="rename" data-key="run:r_council" data-name="声卡选购"'));
+    ui.setQuery('声卡选购'); ui.last.list = ''; ui.renderList();
+    assert.ok(nodes.list.innerHTML.includes('声卡选购') && !nodes.list.innerHTML.includes('筹备新专辑'), '按名字搜索');
+    ui.setQuery(''); ui.last.list = '';
+  }
+
   console.log('ui groups: grouping, parent_call merge, solo split, expand/collapse, tasks, filter/search and xss escaping passed');
 })().catch(e => {
   console.error(e);

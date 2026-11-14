@@ -37,7 +37,7 @@ class API(unittest.TestCase):
                         ' time.sleep(30)\n'
                         'print(json.dumps({"event":"result","result":{"status":"SUCCESS","response":"测试回答"}}))\n' % sys.executable)
         fake.chmod(0o755)
-        (cls.home/'config.json').write_text(json.dumps({'bins': {'agy': str(fake)}, 'planner':'gemini',
+        (cls.home/'config.json').write_text(json.dumps({'bins': {'agy': str(fake)}, 'planner':'gemini', 'auto_title':'',
             'agents': {'ds': ['agy:fake-ds'], 'claude': ['agy:fake-claude']}}))
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); cls.port = sock.getsockname()[1]
@@ -289,6 +289,21 @@ class API(unittest.TestCase):
         self.assertEqual(m[0]['images'],[name])
         self.assertIn(name, m[0]['prompt'])
         self.assertIn('read_image', m[0]['prompt'])
+
+
+    def test_rename(self):
+        self.assertEqual(self.request('/api/rename',{'key':'call:c_abc','name':'  我的项目  '})[0],200)
+        st = json.loads(self.request('/api/state?c=t')[1])
+        self.assertEqual(st['names'].get('call:c_abc'),'我的项目')
+        for bad in ({'key':'../x','name':'a'},{'key':'call:c_abc','name':'x'*61},{'key':'call:c_abc'}):
+            self.assertEqual(self.request('/api/rename',bad)[0],400,bad)
+        self.assertEqual(self.request('/api/config',{'auto_title':'nobody'})[0],400)
+        self.assertEqual(self.request('/api/config',{'auto_title':''})[0],200)
+
+
+    def test_handoff_api(self):
+        for bad in ({'from':{'type':'call','id':'c_nope'},'to':{'type':'call','id':'c_nope2'}},{'from':'x','to':'y'},{}):
+            self.assertEqual(self.request('/api/handoff',bad)[0],400,bad)
 
 
     def test_archive(self):

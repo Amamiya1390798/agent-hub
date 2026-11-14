@@ -50,6 +50,9 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 - **旁问**（`mode: "side"`）：`hub ask <成员> --side [--spec 模型] [--effort 档位] [--web]`。只读；记录的 `kind` 为 `side`，不进左栏主线。`--web` 时 GPT 加 `-c web_search="live"`，Claude 加 `--allowedTools WebSearch WebFetch`，并在提示词末尾附 `WEB_NOTE`。
 - **分叉**：提交时 `fork: true` 加 `context`，记录带 `fork: true`。面板把分叉作为独立项目组，追问链在分叉处断开；后端带上到分叉点为止的上下文，并且不续接原会话。
 - **图片**：`/api/upload` 收 `{data: base64}`，按文件头只认 PNG/JPEG/WebP/GIF（≤10MB），存到 `<HUB_HOME>/workspace/attachments/att-时间-随机.扩展名`；提交时 `images: [文件名]`（≤6 张）。`image_note()` 把图片路径写进提示词；GPT 另以 `--image=路径` 直接附图，Gemini/Claude 加 `--add-dir` 放行附件目录，DeepSeek 用自带的 `read_image` 工具读。`/api/attachment?id=` 只返回位图。
+- **项目组名字**：`names.json` 存 `{记录键: {name, auto}}`，键是项目组第一条记录（`call:…` / `run:…`）。面板服务在 `ui_state()` 里用 `start_auto_titles()` 在后台给做完的新项目组起名：直接调用配置 `auto_title` 那位成员的后端（不经过 `ask()`，不写调用记录），手动名字（`/api/rename`）不会被自动名覆盖。`since` 之前的旧项目组只有调用 `/api/title/backfill` 才起名，归档的不起。离线测试必须设 `HUB_NO_AUTOTITLE=1`，否则会真的调用模型。
+- **交接**：`/api/handoff {from, to, title}` 由 `make_handoff()` 在目标那条线后面写一条 `kind: "handoff"` 的记录：`follows` 指向目标最后一轮，`answer` 是来源最近几轮的 `follow_context` 文本，`handoff.from` 指向来源。面板据此把两组合并显示；之后的追问通过 `follow_context` 同时带上两边。来源未做完（running / planning / synthesizing）时拒绝。交接后的追问不会续接原生会话。
+- **追问进行中的记录**：上一轮还在做时也可以带 `context` 提交，`follow_context` 只会带上已有的内容。
 - **上下文范围**：提交时 `context_scope` 为 `full`（`follow_context` 最多 8 轮）或 `one`（只带那一轮）。
 - **共享进度板**：`board_text` / `write_board_md` 生成每个项目组的看板。成员回复末尾的进度/遗留段由 `parse_report` 解析后写回看板。
 - **额度**：`quota_agy`（`agy --print=/usage`）、`quota_codex`（读最近的 Codex 会话日志）、`quota_ds`（DeepSeek 余额接口，需要用户自己提供密钥）。Claude 的额度读不到。`quota_skip` 在剩余低于 15% 时跳过该成员，用户可以在配置里把 `quota_guard` 设为 `false` 关掉这个跳过。
@@ -65,6 +68,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 | `runs/<YYYYmmdd-HHMMSS>/` | 一个项目组：`run.json`、`plan.json`、`board.md`、`t1.md`…（成员原文）、`final.md`。 |
 | `quota.json`、`health.json`、`models.json` | 额度缓存、体检结果、可选模型清单。 |
 | `workspace/attachments/` | 用户贴进来的图片。 |
+| `names.json` | 项目组名字（自动起的和手动改的）。 |
 | `archived.json` | 已归档记录的名单 `{"keys": ["run:…", "call:…"]}`；只影响面板显示，记录本身不删。 |
 | `pair.json` | 手机配对码（敏感，不要打印）。 |
 | `ui.pid` | 面板服务进程号。 |
@@ -76,7 +80,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 `hub ui` 启动 `ThreadingHTTPServer`，默认只监听 `127.0.0.1:8765`。
 
 - GET：`/`、`/api/state?c=<客户端id>`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
-- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
+- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
 - `/api/bye` 不需要令牌，只用于页面关闭时登记。
 
 安全措施：检查 Host 头；图片接口只返回位图（不返回 SVG，防止 XSS）；设置 CSP 和 `X-Frame-Options`。局域网模式（`lan_access`）默认关闭，开启后只接受私有网段，需要配对码加 HttpOnly cookie，配对码输错有限速；设置、登录、开关局域网这些操作只能在本机做（见 `gate()` 和 `REMOTE_POSTS`）。

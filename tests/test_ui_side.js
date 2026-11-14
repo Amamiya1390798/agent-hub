@@ -8,7 +8,7 @@ const posts=[];
 const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []},body:{classList:{add(){},remove(){},toggle(){},contains(){return false}}}},window:{},localStorage:{getItem(){return null},setItem(){}},sessionStorage:{getItem(){return null},setItem(){},removeItem(){}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},setTimeout:()=>1,clearTimeout(){},getSelection:()=>null,fetch:()=>new Promise(()=>{})};
 vm.createContext(ctx);
 vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);',
-  'globalThis.ui={set:s=>S=s,items,renderSide,sideCtlHtml,sideState,renderComposer,open:v=>{sideOpen=v;},setSel:v=>{sel=v;ctx=v;},setCtx:v=>{ctx=v;},setSide:o=>{if("base" in o)sideBase=o.base;if("follow" in o)sideFollow=o.follow;if("agent" in o)sideAgent=o.agent;if("effort" in o)sideEffort=o.effort;},api:f=>{api=f;},sendSide,last,groups,chainOf,findItem,send,fork:(t,i)=>{ctx={type:t,id:i};forking=true;},isForking:()=>forking,setScope:v=>{sideScope=v;},pendImgs,thumbsHtml};'),ctx);
+  'globalThis.ui={set:s=>S=s,items,renderSide,sideCtlHtml,sideState,renderComposer,open:v=>{sideOpen=v;},setSel:v=>{sel=v;ctx=v;},setCtx:v=>{ctx=v;},setSide:o=>{if("base" in o)sideBase=o.base;if("follow" in o)sideFollow=o.follow;if("agent" in o)sideAgent=o.agent;if("effort" in o)sideEffort=o.effort;},api:f=>{api=f;},sendSide,last,groups,chainOf,findItem,send,fork:(t,i)=>{ctx={type:t,id:i};forking=true;},isForking:()=>forking,setScope:v=>{sideScope=v;},pendImgs,thumbsHtml,viewChat,handPicker,setArm:v=>{handoffArm=v;}};'),ctx);
 const agents=[{name:'gemini',chain:['agy:gemini-4-carbon-medium'],profile:'x'},{name:'gpt',chain:['codex'],profile:'x'},{name:'ds',chain:['dsh'],profile:'x'}];
 const backends=['low','medium','high'].map(l=>({spec:'agy:gemini-4-carbon-'+l,label:'Gemini 4 Carbon ('+l[0].toUpperCase()+l.slice(1)+')'}))
   .concat([{spec:'codex',label:'GPT',efforts:[{id:'low',desc:''},{id:'ultra',desc:''}]},{spec:'codex:gpt-6-luna',label:'Luna',efforts:[{id:'low',desc:''}]},{spec:'dsh',label:'DS'}]);
@@ -96,5 +96,34 @@ assert.ok(/value="follow" selected>接着旁问：旁问一下/.test(h));
   const th=ctx.ui.thumbsHtml(['att-1.png" onerror="x']);
   assert.ok(!th.includes('" onerror="') && th.includes('/api/attachment?id='),'缩略图地址转义');
   assert.equal(ctx.ui.thumbsHtml([]),'');
+  // 交接：两组合成一组，组名用接收的那组；对话里有交接卡片；能选交接到哪
+  {
+    const hc=[
+      {id:'c_a1',kind:'chat',agent:'claude',status:'ok',start:100,end:101,display:'我想学生图'},
+      {id:'c_a2',kind:'chat',agent:'claude',status:'ok',start:110,end:111,display:'controlnet 是什么',follows:{type:'call',id:'c_a1'}},
+      {id:'c_b1',kind:'ask',agent:'gemini',status:'ok',start:50,end:60,display:'总结B站视频'},
+      {id:'c_h',kind:'handoff',agent:'-',status:'ok',start:120,end:120,display:'交接：把「B站」的结果交到这里',follows:{type:'call',id:'c_a2'},handoff:{from:{type:'call',id:'c_b1'},name:'B站'}},
+      {id:'c_x',kind:'ask',agent:'ds',status:'ok',start:5,end:6,display:'别的事'}];
+    ctx.ui.set(Object.assign({},state,{calls:hc,names:{'call:c_a1':'生图扫盲'}}));
+    const gs=ctx.ui.groups();
+    const merged=gs.projects.find(p=>p.items.some(i=>i.id==='c_h'));
+    assert.ok(merged.items.some(i=>i.id==='c_b1'),'来源那组并进来了');
+    assert.equal(merged.id,'call:c_a1'); assert.equal(merged.title,'生图扫盲','组名用接收的那组');
+    const v=ctx.ui.viewChat(ctx.ui.findItem({type:'call',id:'c_h'}));
+    assert.ok(v.includes('交接进来') && v.includes('打开来源那一组') && v.includes('我想学生图'),'对话里有交接卡片和原来的对话');
+    ctx.ui.setSel({type:'call',id:'c_x'}); ctx.ui.setArm('c_x');
+    const pk=ctx.ui.handPicker(ctx.ui.findItem({type:'call',id:'c_x'}));
+    assert.ok(pk.includes('value="call:c_h"') && pk.includes('生图扫盲'),'交接目标是那一组现在的最后一轮');
+  }
+  // 上一轮还在做也能接着追问，并提示
+  {
+    const rc=[{id:'c_r',kind:'chat',agent:'claude',status:'running',start:1,display:'还在做的对话'}];
+    ctx.ui.set(Object.assign({},state,{calls:rc}));
+    ctx.ui.setSel({type:'call',id:'c_r'}); ctx.ui.renderComposer();
+    assert.ok(nodes.ctx.innerHTML.includes('上一轮还在做'),'提示只带已完成的部分');
+    posts.length=0; nodes.txt.value='追加材料';
+    await ctx.ui.send();
+    assert.deepEqual(posts[0][1].context,{type:'call',id:'c_r'},'照样带上上文');
+  }
   console.log('ui side: excluded from list, context choices, model levels, send body and ctx restore passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});

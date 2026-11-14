@@ -63,6 +63,7 @@ DEFAULT_CONFIG = {
     "council_agents": ["gemini", "gpt", "ds"],  # 会审默认参加的成员；Claude 默认不参加，可在设置里勾选
     "max_parallel": 3,
     "timeout": 900,
+    "auto_title": "ds",        # 项目组做完后由谁起个短名字；""=不自动起名
     "pressure_prompt": "",     # 高压模式：DeepSeek 拆任务前先读到的这段话，由用户在设置里自己写
     "quota_guard": True,       # True：5 小时额度低于 15% 的成员自动跳过；False：照样让他干活（用户可在设置里关）
     "lan_access": False,       # 手机通过局域网访问面板；默认关闭，只能在电脑上打开
@@ -1870,6 +1871,10 @@ def call_preferred(c):
 
 def ui_state(cfg):
     calls, runs = load_calls(), load_runs()
+    try:
+        start_auto_titles(cfg, calls, runs)
+    except Exception as e:  # 起名出问题不能影响面板
+        eprint("[hub] 自动起名出错：%s" % e)
     now = time.time()
     lt = time.localtime(now)
     midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
@@ -1903,7 +1908,7 @@ def ui_state(cfg):
     for c in calls[:200]:
         d = {k: c.get(k) for k in ("id", "parent", "run", "task", "kind", "title", "agent", "backend", "status",
                                    "start", "end", "secs", "write", "cwd", "error", "follows", "display", "submission_id",
-                                   "chat", "dispatch", "side", "fork", "resumed", "images")}
+                                   "chat", "dispatch", "side", "fork", "resumed", "images", "handoff")}
         d["preferred_backend"] = call_preferred(c)
         d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
         d["answer_preview"] = _preview(c.get("answer"))
@@ -1927,12 +1932,13 @@ def ui_state(cfg):
     health = read_json(HEALTH_PATH) or {}
     return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls,
             "archived": load_archived(),
+            "names": load_names(), "naming": _names_running.is_set(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
                        "running": bool(_health_running.is_set())},
             "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout")},
                            council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
                            council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
-                           quota_guard=quota_guard_on(), pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1],
+                           quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "", pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1],
                            effort={n: agent_effort(cfg, n, (cfg["agents"][n] or [""])[0]) for n in cfg["agents"]}),
             "workspace": UI_WORKSPACE, "backends": backend_choices(cfg),
             "ui_version": int(os.path.getmtime(UI_HTML)) if os.path.exists(UI_HTML) else 0}
@@ -2128,6 +2134,163 @@ def follow_context(kind, rid, depth=8):
         return ""
     return ("===== 之前的对话（背景）=====\n" + "\n\n".join(reversed(turns)) +
             "\n\n===== 用户现在的追问 =====\n")
+
+
+def make_handoff(src, dst, title=""):
+    """把一个项目组做出来的东西交接到另一个项目组：在目标那条线后面加一条「交接」记录，
+    内容是来源那组最近几轮的要求和结果（不调用模型）。之后在目标组接着问，就会带上它。"""
+    for ref in (src, dst):
+        if not isinstance(ref, dict) or ref.get("type") not in ("call", "run") or not _ARCHIVE_KEY.match("%s:%s" % (ref.get("type"), ref.get("id"))):
+            raise ValueError("记录不对")
+    if (src["type"], src["id"]) == (dst["type"], dst["id"]):
+        raise ValueError("不能交接给自己")
+    s, d = ui_record(src["type"], src["id"]), ui_record(dst["type"], dst["id"])
+    if not s or not d:
+        raise ValueError("找不到要交接的记录")
+    if s.get("status") in ("running", "planning", "synthesizing"):
+        raise ValueError("来源那组还没做完，做完再交接")
+    body = follow_context(src["type"], src["id"], 8)
+    body = body.replace("===== 之前的对话（背景）=====\n", "", 1).rsplit("\n\n===== 用户现在的追问 =====", 1)[0].strip()
+    if not body:
+        raise ValueError("来源那组还没有可交接的内容")
+    name = re.sub(r"[\x00-\x1f\x7f]", "", str(title or ""))[:60] or (s.get("display") or s.get("goal") or "")[:40]
+    cid = "c_" + uuid.uuid4().hex[:10]
+    now = time.time()
+    write_json(os.path.join(CALLS_DIR, cid + ".json"), {
+        "id": cid, "parent": None, "run": None, "task": None, "kind": "handoff", "title": "交接：" + name,
+        "agent": "-", "backend": "-", "preferred_backend": "-", "status": "ok", "start": now, "end": now, "secs": 0,
+        "write": False, "cwd": d.get("cwd") or UI_WORKSPACE, "prompt": "", "error": None, "attempts": [], "pid": None,
+        "display": "交接：把「%s」的结果交到这里" % name,
+        "answer": "以下是从另一个项目组「%s」交接过来的要求和结果，供后面参考：\n\n%s" % (name, body),
+        "follows": {"type": dst["type"], "id": dst["id"]},
+        "handoff": {"from": {"type": src["type"], "id": src["id"]}, "name": name}})
+    return cid
+
+
+NAMES_PATH = os.path.join(HUB_HOME, "names.json")
+_names_lock = threading.Lock()
+_names_running = threading.Event()
+TITLE_PROMPT = ("根据下面这段对话，给它起一个简短的中文标题，像文件夹名一样：4～12 个字，"
+                "不要标点和引号，不要以「关于」开头。只输出标题本身。\n\n【用户】\n%s\n\n【回答】\n%s")
+
+
+def load_names_raw():
+    d = read_json(NAMES_PATH)
+    if not isinstance(d, dict):
+        d = {}
+    if not isinstance(d.get("names"), dict):
+        d["names"] = {}
+    if not isinstance(d.get("failed"), dict):
+        d["failed"] = {}
+    return d
+
+
+def load_names():
+    """{记录键: 名字}；手动起的名字优先于自动的。"""
+    return {k: v["name"] for k, v in load_names_raw()["names"].items()
+            if isinstance(v, dict) and isinstance(v.get("name"), str) and v["name"]}
+
+
+def clean_title(t):
+    t = (t or "").strip().splitlines()[0] if (t or "").strip() else ""
+    t = re.sub(r"[\x00-\x1f\x7f]", "", t).strip(" \t\"'“”‘’「」『』《》【】。，、：:；;！!？?.#*`")
+    return t[:24]
+
+
+def set_name(key, name, auto=False):
+    if not isinstance(key, str) or not _ARCHIVE_KEY.match(key):
+        raise ValueError("记录不对")
+    if not isinstance(name, str) or len(name) > 60:
+        raise ValueError("名字最多 60 个字")
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
+    with _names_lock:
+        d = load_names_raw()
+        cur = d["names"].get(key) if isinstance(d["names"].get(key), dict) else None
+        if auto and cur and not cur.get("auto"):
+            return  # 自动起名不覆盖你手动改的
+        if name:
+            d["names"][key] = {"name": name, "auto": bool(auto), "ts": time.time()}
+        else:
+            d["names"].pop(key, None)
+        d.setdefault("since", time.time())
+        write_json(NAMES_PATH, d)
+
+
+def title_candidates(calls, runs):
+    """还没名字、已经做完、是一个项目组开头的记录（新对话或分叉；旁问、画图、团队内部调用不算），最新的在前。"""
+    d = load_names_raw()
+    since = d.get("since")
+    if since is None:  # 第一次：只给以后的新项目组起名，旧的要在设置里点「给已有的起名」
+        set_name_since(time.time())
+        return []
+    archived = set(load_archived())
+    out = []
+    for kind, recs in (("call", calls), ("run", runs)):
+        for r in recs:
+            key = "%s:%s" % (kind, r.get("id"))
+            if key in d["names"] or d["failed"].get(key, 0) >= 2 or key in archived:
+                continue
+            if r.get("status") in ("running", "planning", "synthesizing", None) or (r.get("start") or 0) < since:
+                continue
+            if (r.get("follows") and not r.get("fork")) or r.get("parent_call"):
+                continue
+            if kind == "call" and (r.get("parent") or r.get("run") or r.get("kind") not in ("ask", "chat")):
+                continue
+            out.append((r.get("start") or 0, key))
+    return [k for _, k in sorted(out, reverse=True)]
+
+
+def set_name_since(ts):
+    with _names_lock:
+        d = load_names_raw()
+        d["since"] = ts
+        write_json(NAMES_PATH, d)
+
+
+def auto_title_one(cfg, key):
+    """叫一位成员给一个项目组起名。直接调后端，不写调用记录，免得名字本身又变成一条记录。"""
+    who = cfg.get("auto_title") or ""
+    chain = cfg["agents"].get(who) or []
+    kind, _, rid = key.partition(":")
+    r = ui_record(kind, rid) or {}
+    q = r.get("display") or r.get("goal") or r.get("prompt") or ""
+    a = r.get("final") or r.get("answer") or ""
+    if not q or not chain:
+        return
+    prompt = TITLE_PROMPT % (q[:1500], a[:1500])
+    for spec in chain[:2]:
+        bk, _, mdl = spec.partition(":")
+        fn = BACKENDS.get(bk)
+        if not fn:
+            continue
+        try:
+            t = clean_title(fn(dict(cfg, _effort=""), mdl, prompt, tempfile.gettempdir(), False, 180))
+        except (BackendError, OSError):
+            continue
+        if t:
+            set_name(key, t, auto=True)
+            return
+    with _names_lock:
+        d = load_names_raw()
+        d["failed"][key] = d["failed"].get(key, 0) + 1
+        write_json(NAMES_PATH, d)
+
+
+def start_auto_titles(cfg, calls, runs):
+    if not cfg.get("auto_title") or _names_running.is_set() or os.environ.get("HUB_NO_AUTOTITLE") == "1":  # 离线测试里不真的叫模型
+        return
+    keys = title_candidates(calls, runs)[:20]
+    if not keys:
+        return
+    _names_running.set()
+
+    def work():
+        try:
+            for k in keys:
+                auto_title_one(cfg, k)
+        finally:
+            _names_running.clear()
+    threading.Thread(target=work, daemon=True).start()
 
 
 ARCHIVE_PATH = os.path.join(HUB_HOME, "archived.json")
@@ -2470,7 +2633,7 @@ class PairLimiter(object):
             self.fails.clear()
 
 
-REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
+REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/rename", "/api/handoff", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
 
 
 def gate(ip, host, sock_ip, port, path, cookie, lan_on):
@@ -2966,6 +3129,10 @@ def serve_ui(port, me):
             if not isinstance(pp, str) or len(pp) > 20000:
                 raise ValueError("高压模式提示词必须是文字，最多 2 万字")
             raw["pressure_prompt"] = pp
+        if "auto_title" in body:
+            if body["auto_title"] != "" and body["auto_title"] not in c["agents"]:
+                raise ValueError("没有这位成员")
+            raw["auto_title"] = body["auto_title"]
         if "quota_guard" in body:
             if not isinstance(body["quota_guard"], bool):
                 raise ValueError("开关格式不对")
@@ -3169,6 +3336,12 @@ def serve_ui(port, me):
                     except (ValueError, binascii.Error):
                         raise ValueError("图片数据坏了，请重新贴")
                     return self.send(200, {"ok": True, "id": save_attachment(raw)})
+                elif self.path == "/api/handoff":  # 把一组的结果交接到另一组
+                    return self.send(200, {"ok": True, "id": make_handoff(body.get("from"), body.get("to"), body.get("title"))})
+                elif self.path == "/api/rename":
+                    set_name(body.get("key"), body.get("name"))
+                elif self.path == "/api/title/backfill":  # 给开启自动起名之前的项目组也起名（归档的不起）
+                    set_name_since(0)
                 elif self.path == "/api/archive":
                     set_archived(body.get("keys"), body.get("on"))
                 elif self.path == "/api/health":

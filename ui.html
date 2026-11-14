@@ -213,6 +213,11 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .ctx button:hover{background:var(--sel)}
 .ctx.off{color:var(--faint);background:transparent;border:1px dashed var(--line)}
 .ctx.fork{color:var(--ink);background:var(--sel)}
+.handcard{border:1px dashed var(--line);border-radius:12px;padding:10px 12px;margin:10px 0;background:var(--panel)}
+.handcard .who{font-size:13px;font-weight:600;margin-bottom:6px}
+.handcard details{margin-top:6px;font-size:13px}.handcard summary{cursor:pointer;color:var(--muted)}
+.handpick{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:8px 0;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:var(--panel);font-size:13px}
+.handpick select{font:13px var(--sans);color:var(--ink);background:var(--hover);border:1px solid transparent;border-radius:7px;padding:3px 6px;max-width:100%}
 .att{display:flex;flex-wrap:wrap;gap:6px}
 .att:empty{display:none}
 #att{margin-bottom:6px}
@@ -465,6 +470,7 @@ const beginSubmit = () => { pendingSubmission = null; followLatest = true; };
 let filter = "all", query = "";
 let mode = "chat", allowWrite = false, showCwd = false, ctx = null;
 let forking = false;
+let handoffArm = null;                // 正在选「交接到哪一组」的那条记录 id
 const pendImgs = {main: [], side: []};   // 还没发出去的图片 {id} 或 {up:true} 上传中                // 正在从 ctx 那条分叉出一条新线
 let sideScope = "full";             // 旁问带上文的范围：full 完整上下文 / one 只带这一条
 let sideOpen = false, sideAgent = null, sideSpec = "", sideEffort = "", sideWeb = true, sideBase = "main", sideFollow = null, sideSending = false;
@@ -609,7 +615,7 @@ function items(){
     agents:[r.planner].concat(r.tasks.filter(t => !t.skip_reason).map(t => t.agent), r.tasks.length > 1 ? [r.synthesizer] : []), rec:r});
   for (const c of S.calls) if (!c.run && !c.parent && c.kind !== "side") out.push({type:"call", id:c.id, start:c.start, end:c.end, status:c.status, error:c.error,
     title:c.display || (c.kind === "image" && c.title) || c.prompt_preview, follows:c.follows, fork:!!c.fork, image:c.kind === "image",
-    agents:[c.agent].concat(kids(c.id).map(x => x.agent)), rec:c});
+    agents:c.kind === "handoff" ? [] : [c.agent].concat(kids(c.id).map(x => x.agent)), rec:c});
   out.sort((a,b) => b.start - a.start);
   return out;
 }
@@ -619,13 +625,14 @@ const uniq = a => a.filter((x,i) => x && a.indexOf(x) === i);
 const ARCH_ICON = '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="2.5" width="12.4" height="3.2" rx=".8"/><path d="M2.8 5.7v7a1 1 0 0 0 1 1h8.4a1 1 0 0 0 1-1v-7M6.3 8.6h3.4"/></svg>';
 const akey = i => i.type + ":" + i.id;
 const isArch = i => !!(S && S.archived && S.archived.indexOf(akey(i)) >= 0);
+const nameOf = i => (S && S.names && S.names[akey(i)]) || i.title;   // 自动起的或你改的名字，没有就用第一句话
 function groupOf(it){            // 这条记录所在的项目组（或它自己这一条单独提问）
   if (!it) return null;
   const {projects, solos} = groups();
   const g = projects.find(p => p.items.some(i => i.type === it.type && i.id === it.id));
-  if (g) return {items: g.items, archived: g.archived, running: !!RUNNING[g.status]};
+  if (g) return {items: g.items, archived: g.archived, running: !!RUNNING[g.status], key: g.id, title: g.title, named: !!(S.names || {})[g.id], latest: g.latest};
   const s = solos.find(i => i.type === it.type && i.id === it.id) || it;
-  return {items: [s], archived: isArch(s), running: !!RUNNING[s.status]};
+  return {items: [s], archived: isArch(s), running: !!RUNNING[s.status], key: akey(s), title: nameOf(s), named: !!(S.names || {})[akey(s)], latest: s};
 }
 
 function groups(){
@@ -638,6 +645,7 @@ function groups(){
     if (i.follows && i.follows.type && i.follows.id && !i.fork) union(k, i.follows.type + ":" + i.follows.id);   // 分叉另起一组
     if (i.type === "run" && i.rec && i.rec.parent_call) union(k, "call:" + i.rec.parent_call);
     if (i.type === "call" && i.rec && i.rec.dispatch && i.rec.dispatch.run) union(k, "run:" + i.rec.dispatch.run);
+    if (i.type === "call" && i.rec && i.rec.handoff && i.rec.handoff.from) union(k, i.rec.handoff.from.type + ":" + i.rec.handoff.from.id);   // 交接过来的那组并进来
   }
   for (const i of all){
     const r = find(i.type + ":" + i.id);
@@ -667,7 +675,14 @@ function groups(){
       return d;
     };
     list.sort((a, b) => (a.start - b.start) || (depth(a) - depth(b)) || String(a.id).localeCompare(String(b.id)));
-    const first = list[0], latest = list[list.length - 1];
+    let first = list[0];
+    const latest = list[list.length - 1];
+    const hand = list.find(i => i.rec && i.rec.handoff);
+    if (hand){                          // 有交接：组名和开头以接收的那一组为准
+      let cur = hand; const seen = new Set();
+      while (cur && prevKey(cur) && inSet[prevKey(cur)] && !seen.has(cur)){ seen.add(cur); cur = inSet[prevKey(cur)]; }
+      if (cur && cur !== hand) first = cur;
+    }
     let runIt = null;
     for (let k = list.length - 1; k >= 0; k--) if (RUNNING[list[k].status]){ runIt = list[k]; break; }
     const runs = list.filter(i => i.type === "run");
@@ -678,7 +693,7 @@ function groups(){
     }
     projects.push({
       id: first.type + ":" + first.id,
-      title: first.title,
+      title: nameOf(first),
       status: runIt ? runIt.status : latest.status,
       error: runIt ? runIt.error : latest.error,
       agents: uniq(ags),
@@ -715,8 +730,8 @@ function renderList(){
   }
   const q = (query || "").trim().toLowerCase();
   if (q){
-    projects = projects.filter(g => g.items.some(i => (i.title || "").toLowerCase().indexOf(q) >= 0));
-    solos = solos.filter(i => (i.title || "").toLowerCase().indexOf(q) >= 0);
+    projects = projects.filter(g => (g.title || "").toLowerCase().indexOf(q) >= 0 || g.items.some(i => (i.title || "").toLowerCase().indexOf(q) >= 0));
+    solos = solos.filter(i => (nameOf(i) + " " + (i.title || "")).toLowerCase().indexOf(q) >= 0);
   }
   let h = "";
   if (projects.length){
@@ -731,6 +746,7 @@ function renderList(){
         '<div class="t">' + esc(g.title || "（无内容）") + "</div>" +
         '<div class="m"><span class="dots">' + g.agents.map(a => '<i class="dot" style="background:' + agc(a) + '" title="' + esc(a) + '"></i>').join("") + "</span>" +
         esc(g.kind) + " · " + g.count + " 件 · " + shortTime(g.time) + "</div></button>" +
+        '<button class="garch" data-act="rename" data-key="' + esc(g.id) + '" data-name="' + esc(g.title || "") + '" title="重命名这个项目组" aria-label="重命名">✎</button>' +
         (RUNNING[g.status] ? "" : '<button class="garch" data-act="archive" data-keys="' + esc(g.items.map(akey).join(" ")) + '" data-on="' + (g.archived ? "0" : "1") + '" title="' + (g.archived ? "取消归档，放回列表" : "归档这个项目组") + '" aria-label="' + (g.archived ? "取消归档" : "归档") + '">' + (g.archived ? "↩" : ARCH_ICON) + "</button>") +
         "</div>";
       if (isOpen){
@@ -767,7 +783,7 @@ function renderList(){
       const ia = isArch(i);
       h += '<div class="iwrap"><button class="item' + (sel && sel.type === i.type && sel.id === i.id ? " sel" : "") + '" data-act="select" data-type="' + esc(i.type) + '" data-id="' + esc(i.id) + '">' +
         '<span class="st">' + icon(si.k) + "</span>" +
-        '<div class="t">' + (i.image ? "🎨 " : "") + esc(i.title || "（无内容）") + "</div>" +
+        '<div class="t">' + (i.image ? "🎨 " : "") + esc(nameOf(i) || "（无内容）") + "</div>" +
         '<div class="m"><span class="dots">' + uniq(i.agents).map(a => '<i class="dot" style="background:' + agc(a) + '" title="' + esc(a) + '"></i>').join("") + "</span>" +
         (i.image ? "画图" : esc(i.rec.agent || "")) + " · " + shortTime(i.start) + " · " + tick(i.start, i.end, i.rec.secs) + "</div></button>" +
         (RUNNING[i.status] ? "" : '<button class="iarch" data-act="archive" data-keys="' + esc(akey(i)) + '" data-on="' + (ia ? "0" : "1") + '" title="' + (ia ? "取消归档，放回列表" : "归档这条") + '" aria-label="' + (ia ? "取消归档" : "归档") + '">' + (ia ? "↩" : ARCH_ICON) + "</button>") +
@@ -1029,6 +1045,7 @@ function settingsHtml(){
     field('谁来拆任务', '<select data-cfg="planner">' + optA(cfg.planner) + '</select>', '收到目标后，由它决定分几步、交给谁。建议日常用 Gemini，复杂目标再选更擅长规划的成员；拆任务也会花它的额度。') +
     field('谁来汇总', '<select data-cfg="synthesizer">' + optA(cfg.synthesizer) + '</select>', '把大家的回答整理成一份结果；会审时由它比较共同点和分歧。建议用 Gemini；只有一个子任务时直接交回结果。') +
     field('谁参加会审', '<span class="council-pick">' + S.agents.map(a => '<label style="display:inline-flex;gap:4px;margin-right:10px"><input type="checkbox" data-council="' + esc(a.name) + '"' + ((cfg.council_agents || []).indexOf(a.name) >= 0 ? " checked" : "") + '>' + esc(a.name) + '</label>').join("") + '</span>', '会审时勾选的成员同时各自作答，互相看不到答案，再由汇总的人比较。默认 Gemini、GPT、DeepSeek；Claude 默认不参加，想让它参加就勾上。') +
+    field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + S.agents.map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
     field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
     field('最多同时做几件', '<input type="number" min="1" max="8" data-cfg="max_parallel" value="' + esc(cfg.max_parallel) + '">', '不是只能两位合作：最多可同时做 8 件，也可由同一位做多件。建议先用 3；依赖前一步结果的任务仍要等。') +
     field('每一步最多等几分钟', '<input type="number" min="1" max="120" data-cfg="timeout" data-scale="60" value="' + Math.round(cfg.timeout/60) + '">', '超过时间会停止这次尝试，有备用模型时再交给它。建议 15 分钟；长任务可调大。' + (cfg.timeout < (cfg.min_timeout || 900) ? '<br><b class="stuck" style="color:var(--bad)">现在少于 15 分钟：读资料、审查、写长文常常需要 5～15 分钟，时间太短成员容易什么都交不出来。</b>' : '')) + '</section>' +
@@ -1161,15 +1178,37 @@ function headHtml(it, extraMeta){
   const si = stInfo(it.status, it.error), running = RUNNING[it.status];
   let h = '<div class="head"><h2>' + esc(it.title || "") + "</h2></div><div class=\"meta\">" + badge(si.k, si.t) +
     "<span>" + dayLabel(it.start) + " " + clock(it.start) + "</span><span>用时 " + tick(it.start, it.end, it.type === "call" ? it.rec.secs : null) + "</span>" + extraMeta;
+  const grp = groupOf(it);
+  if (grp && grp.named) h += '<span>项目组：' + esc(grp.title) + '</span>';
   if (it.follows){
     const f = findItem(it.follows);
     h += '<span>' + (it.fork ? "⑂ 分叉自" : "追问自") + ' <a href="#" data-act="select" data-type="' + esc(it.follows.type) + '" data-id="' + esc(it.follows.id) + '">' + esc(f ? (f.title || "").slice(0, 24) : "上一条") + "</a></span>";
   }
   h += '</div><div class="acts">' +
     (running ? (stopArm === it.id ? '<button class="btn danger" data-act="stop" data-sure="1" style="background:var(--bad);color:#fff">再点一次确认停止</button>' : '<button class="btn danger" data-act="stop">■ 停止</button>') : '<button class="btn" data-act="retry">↻ 重新执行</button><button class="btn" data-act="fork" data-type="' + esc(it.type) + '" data-id="' + esc(it.id) + '" title="带上到这里为止的上下文，另开一条线接着做，原来这条不受影响">⑂ 从这里分叉</button>') +
-    (isRemote() ? '' : '<button class="btn" data-act="opendir" title="' + esc(it.rec.cwd || "") + '">打开工作目录</button>') + archBtn(it) + '</div>';
+    (isRemote() ? '' : '<button class="btn" data-act="opendir" title="' + esc(it.rec.cwd || "") + '">打开工作目录</button>') + renBtn(it) + handBtn(it) + archBtn(it) + '</div>' + handPicker(it);
   if (it.rec && it.rec.images && it.rec.kind !== "chat") h += thumbsHtml(it.rec.images);   // 对话页在每轮气泡里显示
   return h;
+}
+const chainEnd = it => { const c = chainOf(it); return c[c.length - 1] || it; };   // 一条线现在的最后一轮
+function handBtn(it){
+  const g = groupOf(it);
+  if (!g) return "";
+  return g.running ? '<button class="btn" disabled title="这一组还在做，做完才能交接">⇢ 交接到…</button>'
+    : '<button class="btn" data-act="handoff-arm" data-id="' + esc(it.id) + '" title="把这一组做出来的东西交给另一个项目组，之后在那边接着问就能用上">⇢ 交接到…</button>';
+}
+function handPicker(it){
+  if (handoffArm !== it.id) return "";
+  const me = groupOf(it), {projects, solos} = groups();
+  const targets = projects.filter(p => p.id !== me.key && !p.archived).concat(solos.filter(x => akey(x) !== me.key && !isArch(x)).map(x => ({id: akey(x), title: nameOf(x), latest: x})));
+  if (!targets.length) return '<div class="handpick small">没有别的项目组可以交接。<button class="btn" data-act="handoff-cancel">取消</button></div>';
+  return '<div class="handpick"><span>把「' + esc((me.title || "").slice(0, 20)) + '」的结果交接到：</span><select data-handoff="' + esc(it.id) + '" aria-label="交接到哪个项目组"><option value="">选一个项目组…</option>' +
+    targets.map(t => { const e = chainEnd(t.latest); return '<option value="' + esc(e.type + ":" + e.id) + '" data-title="' + esc(t.title || "") + '">' + esc((t.title || "（无内容）").slice(0, 40)) + '</option>'; }).join("") +
+    '</select><button class="btn" data-act="handoff-cancel">取消</button></div>';
+}
+function renBtn(it){
+  const g = groupOf(it);
+  return g ? '<button class="btn" data-act="rename" data-key="' + esc(g.key) + '" data-name="' + esc(g.title || "") + '" title="给' + (g.items.length > 1 ? "这个项目组" : "这条记录") + '改个名字">✎ 重命名</button>' : "";
 }
 function archBtn(it){
   const g = groupOf(it);
@@ -1312,6 +1351,14 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
   let h = headHtml(it, '<span>和对接人的对话 · ' + turns.length + ' 轮</span>' + (it.rec.chat && it.rec.chat.write ? '<span class="badge plain">可改文件</span>' : "")) + '<div class="chat">';
   for (const t of turns){
     const r = t.rec;
+    if (r.kind === "handoff"){
+      const full = need("call", r.id, "ok") || {}, hf = r.handoff || {}, key = "hand:" + r.id;
+      if (full.answer) copyStore[key] = full.answer;
+      h += '<div class="handcard"><div class="who">⇢ 交接进来：「' + esc(hf.name || "") + '」的结果</div>' +
+        (hf.from ? '<button class="job" data-act="select" data-type="' + esc(hf.from.type) + '" data-id="' + esc(hf.from.id) + '">打开来源那一组</button>' : "") +
+        '<details><summary>看交接的内容</summary>' + (full.answer ? '<div class="md">' + md(full.answer) + '</div>' : '<div class="small">载入中…</div>') + '</details></div>';
+      continue;
+    }
     h += '<div class="me">' + esc(t.title || "") + thumbsHtml(r.images) + "</div>";
     if (t.type === "run"){
       h += '<div class="them"><div class="who">团队（' + (r.mode === "council" ? "会审" : r.pressure ? "高压" : "自动分工") + '）</div><button class="job" data-act="select" data-type="run" data-id="' + esc(r.id) + '">打开这个项目组看过程 · ' + esc(stInfo(r.status, r.error).t) + "</button></div>";
@@ -1352,7 +1399,7 @@ function renderView(){
   if (!S) return;
   const it = findItem(sel);
   if (sel && !it){ sel = null; }
-  const h = '<div class="wrap">' + (it ? (it.type === "run" ? viewRun(it) : it.rec.kind === "chat" ? viewChat(it) : viewCall(it)) : viewNew()) + "</div>";
+  const h = '<div class="wrap">' + (it ? (it.type === "run" ? viewRun(it) : it.rec.kind === "chat" || it.rec.kind === "handoff" ? viewChat(it) : viewCall(it)) : viewNew()) + "</div>";
   $("tb-title").textContent = it ? (it.title || "").slice(0, 30) : "新任务";
   if (h === last.view) return;
   const s = getSelection();
@@ -1396,11 +1443,12 @@ function renderComposer(){
   $("dtog").textContent = (showCwd ? "▾" : "▸") + " 目录";
   let it = ctx && findItem(ctx);
   if (ctx && !it) ctx = null;
-  if (it && (RUNNING[it.status] || mode === "image")) it = null;   // 没做完的、或画图时，不带上文
-  const back = !it && sel && !ctx && findItem(sel) && !RUNNING[findItem(sel).status] && mode !== "image";   // 叉掉了还能改回来
+  if (it && mode === "image") it = null;   // 画图时不带上文
+  const partial = it && RUNNING[it.status];   // 上一轮还在做：照样接着，只带上已经完成的部分
+  const back = !it && sel && !ctx && findItem(sel) && mode !== "image";   // 叉掉了还能改回来
   if (!it) forking = false;
   $("ctx").innerHTML = it && forking ? '<div class="ctx fork"><span>⑂ 从「' + esc((it.title || "").slice(0, 30)) + '」分叉：另开一条线，带上到这里为止的上下文</span><button data-act="noctx" title="取消分叉">✕</button></div>'
-    : it ? '<div class="ctx"><span>↩ 接着这条追问：' + esc((it.title || "").slice(0, 40)) + '</span><button data-act="noctx" title="不带上文，作为新任务">✕</button></div>'
+    : it ? '<div class="ctx"><span>↩ 接着这条追问：' + esc((it.title || "").slice(0, 40)) + (partial ? "（上一轮还在做，只带上已完成的部分）" : "") + '</span><button data-act="noctx" title="不带上文，作为新任务">✕</button></div>'
     : back ? '<div class="ctx off"><span>作为新任务发送，不带上文</span><button data-act="yesctx" title="重新接着当前这条追问">↩ 改回接着追问</button></div>' : "";
   $("txt").placeholder = it && forking ? "在新的分叉里说点什么…" : it ? "接着说，会带上前面的对话和结果…" : mode === "image" ? "描述想要的画面…" : mode === "chat" ? "跟对接人说说你想做什么…" : "想让团队做什么？";
   $("send").disabled = sending || !$("txt").value.trim();
@@ -1417,7 +1465,7 @@ function autosize(){ const t = $("txt"); t.style.height = "auto"; t.style.height
 async function send(){
   const text = $("txt").value.trim();
   if (!text || sending) return;
-  const cit = ctx && findItem(ctx), useCtx = cit && !RUNNING[cit.status] && mode !== "image";
+  const cit = ctx && findItem(ctx), useCtx = cit && mode !== "image";
   const typedCwd = showCwd ? $("cwd").value.trim() : "";
   const body = {mode: mode === "run" || mode === "pressure" || mode === "image" || mode === "council" || mode === "chat" ? mode : "ask", agent: mode === "chat" ? contact : mode, text,
     cwd: typedCwd || (useCtx && cit.rec.cwd && cit.rec.cwd !== S.workspace ? cit.rec.cwd : ""), write: allowWrite && mode !== "image" && mode !== "council"};
@@ -1496,7 +1544,7 @@ function syncTabs(){
   document.querySelectorAll("#mtabs button").forEach(x => x.classList.toggle("on", x.dataset.v === v));
 }
 function select(type, id){
-  sel = type ? {type, id} : null; ctx = sel; forking = false; followLatest = false; stopArm = null; clearTimeout(stopTimer);
+  sel = type ? {type, id} : null; ctx = sel; forking = false; handoffArm = null; followLatest = false; stopArm = null; clearTimeout(stopTimer);
   document.body.classList.remove("side-open", "rail-open"); syncTabs();
   renderList(); renderView(); renderComposer();
   if (!sel) $("txt").focus();
@@ -1545,6 +1593,19 @@ document.addEventListener("click", async e => {
     else if (act === "yesctx"){ ctx = sel; renderComposer(); $("txt").focus(); }
     else if (act === "sidewin"){ sideOpen = !sideOpen; last.side = last.sideCtl = last.rail = ""; renderSide(); renderRail(); if (sideOpen) $("sw-txt").focus(); }
     else if (act === "side-send") await sendSide();
+    else if (act === "handoff-arm"){ handoffArm = el.dataset.id; last.view = ""; renderView(); }
+    else if (act === "handoff-cancel"){ handoffArm = null; last.view = ""; renderView(); }
+    else if (act === "rename"){
+      const v = prompt("给它起个名字（清空就恢复成自动的名字）", el.dataset.name || "");
+      if (v === null) return;
+      const name = v.trim().slice(0, 60);
+      await api("/api/rename", {key: el.dataset.key, name});
+      S.names = Object.assign({}, S.names); if (name) S.names[el.dataset.key] = name; else delete S.names[el.dataset.key];
+      last.list = last.view = ""; renderList(); renderView();
+      toast(name ? "已改名" : "已恢复自动名字");
+      if (!name) poll();
+    }
+    else if (act === "title-backfill"){ await api("/api/title/backfill", {}); toast("开始给已有的项目组起名，起好会陆续显示"); poll(); }
     else if (act === "att-pick") $(el.dataset.w === "side" ? "file-side" : "file-main").click();
     else if (act === "att-del"){ pendImgs[el.dataset.w].splice(+el.dataset.i, 1); renderAtt(el.dataset.w); }
     else if (act === "side-follow"){ sideFollow = {type:"call", id:el.dataset.id}; sideBase = "follow"; last.sideCtl = ""; renderSide(); $("sw-txt").focus(); }
@@ -1641,6 +1702,16 @@ document.addEventListener("change", async e => {
     const p = el.dataset.chain.split(":");
     try { await api("/api/config", {chain:{agent:p[0], index:+p[1], spec:el.value}}); toast(el.dataset.gem ? p[0] + " 的思考等级已改成「" + el.options[el.selectedIndex].text + "」，下次干活生效" : p[0] + " 的" + (+p[1] ? "后备" : "首选") + "已换成 " + el.options[el.selectedIndex].text); el.blur(); last.rail = ""; poll(); }
     catch(err){ toast(err.message); el.blur(); last.rail = ""; poll(); }
+    return;
+  }
+  if (el.dataset && el.dataset.handoff && el.value){
+    const it = findItem(sel), me = it && groupOf(it), src = me && chainEnd(me.latest);
+    const opt = el.options[el.selectedIndex], dstTitle = opt.dataset.title || opt.text, [type, id] = el.value.split(":");
+    if (!src || !confirm("把「" + (me.title || "") + "」做出来的结果交接到「" + dstTitle + "」？\n之后在那一组接着问，就会带上这些内容；两组会在左边合成一组。")){ el.value = ""; return; }
+    try {
+      const r = await api("/api/handoff", {from: {type: src.type, id: src.id}, to: {type, id}, title: me.title || ""});
+      handoffArm = null; toast("已交接到「" + dstTitle + "」，在那边接着问就能用上"); await poll(); select("call", r.id);
+    } catch(err){ toast(err.message || "没交接成功"); el.value = ""; }
     return;
   }
   if (el.dataset && el.dataset.sw){
