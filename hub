@@ -1,0 +1,3134 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+hub —— 本机多 Agent 调度器（Claude / GPT / Gemini / DeepSeek 互相调用、分工协作）
+
+  hub ask <agent> "问题"        让某个 agent 回答/干活（agent: gemini | claude | gpt | ds）
+  hub run "目标"                规划者拆任务 -> 各 agent 并行执行 -> 汇总
+  hub council "问题"            会审：几位各自独立作答 -> 一位比较共同点和分歧
+  hub chat "话"                 跟联络人说话：它自己答，或替你排工/会审，结果交回对话
+  hub image "描述" -o out.png   让 GPT 画图
+  hub ui                        打开网页面板：看谁在干什么、协作过程与内容
+  hub quota                     各 agent 的剩余额度
+  hub agents                    体检：每个 agent 是否可用
+  hub log                       最近的调用记录
+
+只用 Python 标准库；各 agent 复用它们官方客户端自己的登录，不保存任何密钥。
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+HOME = os.path.expanduser("~")
+HUB_HOME = os.environ.get("HUB_HOME", os.path.join(HOME, ".agent-hub"))
+CONFIG_PATH = os.path.join(HUB_HOME, "config.json")
+LOG_PATH = os.path.join(HUB_HOME, "calls.jsonl")
+RUNS_DIR = os.path.join(HUB_HOME, "runs")
+DSH_PATCH = os.path.join(HUB_HOME, "dsh.patch.yml")
+CALLS_DIR = os.path.join(HUB_HOME, "calls")      # 每次调用一份完整记录（面板用）
+UI_HTML = os.path.join(HUB_HOME, "ui.html")
+UI_WORKSPACE = os.path.join(HUB_HOME, "workspace")  # 面板下任务时的默认工作目录
+_ctx = threading.local()                          # 当前线程正在进行的调用 id
+MAX_DEPTH = 2  # agent 调 agent 的最大嵌套层数，防止互相无限踢皮球
+
+DEFAULT_CONFIG = {
+    # 每个角色是一条“后备链”：前一个失败（限额/未登录/超时）就自动换下一个，并在结果里注明。
+    "agents": {
+        "gemini": ["agy:gemini-4-carbon-high", "agy:gemini-3.8-flash-high"],
+        # Claude 只走本机 Claude CLI（需自行登录）；不可用时退到 Gemini。
+        # 注意：Antigravity 里的 Claude 等模型额度通常很少，默认 agy 只跑 Gemini。
+        "claude": ["claude:opus", "agy:gemini-4-carbon-high"],
+        "gpt": ["codex", "agy:gemini-4-carbon-high"],
+        "ds": ["dsh", "agy:gemini-3.8-flash-high"],
+    },
+    "planner": "gemini",       # 负责拆任务（排工）；额度充裕，复杂目标可在设置里换成更擅长规划的成员
+    "synthesizer": "gemini",   # 负责最后汇总（额度无限，省 Claude/GPT）
+    "default_worker": "gemini",
+    "council_agents": ["gemini", "gpt", "ds"],  # 会审默认参加的成员；Claude 默认不参加，可在设置里勾选
+    "max_parallel": 3,
+    "timeout": 900,
+    "pressure_prompt": "",     # 高压模式：DeepSeek 拆任务前先读到的这段话，由用户在设置里自己写
+    "quota_guard": True,       # True：5 小时额度低于 15% 的成员自动跳过；False：照样让他干活（用户可在设置里关）
+    "lan_access": False,       # 手机通过局域网访问面板；默认关闭，只能在电脑上打开
+    "gpt_full_access": False,  # True：GPT 在「允许改文件」的任务里不受沙箱限制，才能调用 hub 指挥队友、联网
+    "codex_effort": "",        # GPT 的思考强度：留空=跟随 Codex 自己的设置；low / medium / high / max
+    "profiles": {
+        "gemini": "额度最充裕（每周和每 5 小时仍有上限），能力中上。团队主力干活的人：阅读、搜索、整理、写初稿、写代码、批量改写等执行类的活默认都给它。",
+        "claude": "最聪明，额度有限。岗位是拍板和把关：定方案、做关键决定、审查重要成果，不做体力活。",
+        "gpt": "综合能力强，额度有限。岗位是拍板和审查：定方案、审查代码和结论；另外只有它能画图。执行类的活优先给 Gemini。",
+        "ds": "DeepSeek API，按量计费、响应快。适合零碎的小任务：翻译、格式转换、简短问答、小段代码。",
+    },
+    "bins": {
+        "agy": "agy",
+        "dsh": "dsh",
+        "codex": "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+        "claude": "",  # 留空则自动寻找
+    },
+}
+
+OLD_PROFILES = {
+    "gemini": "额度最充裕（每周和每 5 小时仍有上限），能力中上。默认主力：大量阅读、搜索、整理、写初稿、批量改写、跑腿等一切辛苦活都优先给它。",
+    "claude": "最聪明，适合规划、架构设计、疑难推理、最终审查。额度有限，只给真正需要高智力的任务。",
+    "gpt": "综合能力强，能画图/生成图片，擅长写代码和实际动手执行。额度有限，用于有难度的实现或需要画图的任务。",
+}
+
+DSH_PATCH_CONTENT = """# 让 dsh headless 复用桌面版已登录的 DeepSeek 账号（不复制任何密钥）
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false
+- id: agent-default-model
+  config:
+    provider: deepseek-account
+    model: deepseek-flash
+"""
+
+_print_lock = threading.Lock()
+
+
+def eprint(*a):
+    with _print_lock:
+        print(*a, file=sys.stderr, flush=True)
+
+
+def deep_merge(base, over):
+    out = dict(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config():
+    os.makedirs(HUB_HOME, exist_ok=True)
+    if not os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+    if not os.path.exists(DSH_PATCH):
+        with open(DSH_PATCH, "w", encoding="utf-8") as f:
+            f.write(DSH_PATCH_CONTENT)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg = deep_merge(DEFAULT_CONFIG, json.load(f))
+        for k, v in OLD_PROFILES.items():  # 旧版自动写进配置、用户没改过的角色说明，换成新的分工原则
+            if cfg.get("profiles", {}).get(k) == v:
+                cfg["profiles"][k] = DEFAULT_CONFIG["profiles"][k]
+        return cfg
+    except Exception as e:  # 配置坏了也别挂
+        eprint("[hub] 配置文件读取失败，使用默认配置：%s" % e)
+        return DEFAULT_CONFIG
+
+
+def find_bin(cfg, name):
+    p = cfg["bins"].get(name) or ""
+    if p and os.path.sep in p:
+        return p if (os.path.isfile(p) and os.access(p, os.X_OK)) else None
+    found = shutil.which(p or name) or shutil.which(name, path=os.path.join(HOME, ".local/bin"))
+    if found:
+        return found
+    if name == "claude":
+        cands = sorted(glob.glob(os.path.join(
+            HOME, "Library/Application Support/Claude/claude-code/*/*/claude.app/Contents/MacOS/claude")))
+        return cands[-1] if cands else None
+    return None
+
+
+def shq(v):
+    import shlex
+    return shlex.quote(str(v))
+
+
+def hub_depth():
+    try:
+        return int(os.environ.get("HUB_DEPTH") or 0)
+    except ValueError:
+        return 0
+
+
+def clean_env(extra=None):
+    """子进程环境：去掉当前 Claude 会话注入的变量，避免子 agent 误继承；并传递嵌套层数。"""
+    env = {k: v for k, v in os.environ.items()
+           if not (k.startswith("CLAUDE") or k.startswith("ANTHROPIC_"))}
+    env["HUB_DEPTH"] = str(hub_depth() + 1)
+    env.pop("HUB_META", None)
+    if getattr(_ctx, "call_id", None):
+        env["HUB_PARENT"] = _ctx.call_id
+    if getattr(_ctx, "run_id", None):
+        env["HUB_RUN"] = _ctx.run_id
+    env["PATH"] = os.path.join(HOME, ".local/bin") + os.pathsep + env.get("PATH", "")
+    if os.environ.get("HUB_READONLY") == "1" or not getattr(_ctx, "write", True):
+        env["HUB_READONLY"] = "1"  # 只读任务里队友再调 hub 也只能只读（会审等不能被绕成可写）
+    if extra:
+        env.update(extra)
+    return env
+
+
+class BackendError(Exception):
+    pass
+
+
+_children = set()  # 正在运行的子进程，收到停止信号时一并结束
+_stopping = threading.Event()  # 收到停止信号后不再启动任何新进程（包括后备模型）
+
+
+def _kill_tree(p):
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except OSError:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+
+def _kill_tree_hard(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+def _on_stop(signum, frame):
+    _stopping.set()
+    deadline = time.time() + 3
+    seen = set()
+    while time.time() < deadline:
+        procs = list(_children)  # 每轮重新取：别的线程可能刚刚启动了进程
+        for p in procs:
+            if p not in seen:
+                _kill_tree(p)
+                seen.add(p)
+        if not any(p.poll() is None for p in procs):
+            break
+        time.sleep(0.1)
+    for p in list(_children) + list(seen):
+        _kill_tree_hard(p)
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    os._exit(130 if signum == signal.SIGINT else 143)
+
+
+class Live(object):
+    """把进行中的输出实时写到 calls/<id>.live，供面板显示。"""
+
+    def __init__(self):
+        cid = getattr(_ctx, "call_id", None)
+        self.path = os.path.join(CALLS_DIR, cid + ".live") if cid else None
+        self.text, self.steps, self.last = "", [], 0.0
+        self.lock = threading.RLock()
+        self.timer = None
+        self.closed = False
+
+    def add(self, delta):
+        self.text += delta
+        self.flush()
+
+    def step(self, line):
+        line = " ".join(str(line).split())[:200]
+        if line and (not self.steps or self.steps[-1] != line):
+            self.steps.append(line)
+            self.steps = self.steps[-40:]
+            self.flush(True)
+
+    def flush(self, force=False):
+        with self.lock:
+            if self.closed or not self.path:
+                return
+            if force or time.time() - self.last > 0.6:
+                self.last = time.time()
+                write_json(self.path, {"text": self.text[-20000:], "steps": self.steps})
+            elif self.timer is None or not self.timer.is_alive():
+                self.timer = threading.Timer(0.6, lambda: self.flush(True))
+                self.timer.daemon = True
+                self.timer.start()
+
+    def close(self):
+        with self.lock:
+            if self.text.strip():
+                _ctx.partial = self.text[-20000:]  # 失败或超时时，已经写出来的部分回答留给记录
+            self.closed = True
+            if self.timer:
+                self.timer.cancel()
+            if self.path:
+                try:
+                    os.unlink(self.path)
+                except OSError:
+                    pass
+
+
+def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None):
+    if _stopping.is_set():
+        raise BackendError("已手动停止")
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, text=True, errors="replace",
+                             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as e:
+        raise BackendError("无法启动 %s：%s" % (os.path.basename(cmd[0]), e))
+    _children.add(p)
+    outs, errs = [], []
+
+    def pump(stream, chunks, callback=None):
+        try:
+            for line in stream:
+                chunks.append(line)
+                if callback:
+                    try:
+                        callback(line)
+                    except Exception:
+                        pass
+        finally:
+            stream.close()
+
+    def feed():
+        try:
+            p.stdin.write(stdin_text)
+        except (OSError, ValueError):
+            pass
+        finally:
+            p.stdin.close()
+
+    ths = [threading.Thread(target=pump, args=(p.stdout, outs, on_line), daemon=True),
+           threading.Thread(target=pump, args=(p.stderr, errs), daemon=True)]
+    if stdin_text is not None:
+        ths.append(threading.Thread(target=feed, daemon=True))
+    deadline = time.monotonic() + timeout
+    for t in ths:
+        t.start()
+    try:
+        p.wait(timeout=max(0, deadline - time.monotonic()))
+        for t in ths:
+            t.join(max(0, deadline - time.monotonic()))
+        if any(t.is_alive() for t in ths):
+            raise subprocess.TimeoutExpired(cmd, timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(p)
+        try:
+            p.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+        # 组长退出不等于子孙退出；继承输出管道的子进程也必须回收。
+        _kill_tree_hard(p)
+        p.wait()
+        for t in ths:
+            t.join(2)
+        raise BackendError("超时（%ss）" % timeout)
+    finally:
+        _children.discard(p)
+    return p.returncode, "".join(outs), "".join(errs)
+
+
+def spec_label(spec):
+    """后端写法 → 给人看的名字，例如 agy:gemini-4-carbon-medium → Gemini Carbon·中等。"""
+    kind, _, mdl = (spec or "").partition(":")
+    m = mdl.lower()
+    if kind == "agy":
+        name = "Gemini Carbon" if "carbon" in m else "Gemini Flash" if "flash" in m else "Gemini " + mdl
+        level = next((v for k, v in (("high", "高"), ("medium", "中等"), ("low", "低")) if m.endswith(k)), "")
+        return name + ("·" + level if level else "")
+    if kind == "codex":
+        return "GPT" + ("（%s）" % mdl if mdl else "")
+    if kind == "dsh":
+        return "DeepSeek"
+    if kind == "claude":
+        return "Claude" + (" " + mdl.capitalize() if mdl else "")
+    return spec or "未知模型"
+
+
+ERROR_KINDS = [  # (匹配原始报错的关键词, 一句人话, 一句建议)；按顺序先匹配先用
+    (("已手动停止", "signal 15", "sigterm"), "被手动停止了", "需要的话可以点「重新执行」"),
+    (("print timeout", "超时", "timed out", "timeout", "deadline exceeded"), "{t}内没做完，被掐断了",
+     "可能任务太大：可以拆小一点，或在设置里放宽「每一步最多等几分钟」"),
+    (("rate limit", "rate_limit", "quota", "exhausted", "429", "usage limit", "额度", "insufficient", "credit", "余额"),
+     "额度用完了（或被限速）", "等额度刷新后再试，或换一位成员"),
+    (("not logged", "login", "unauthorized", "401", "403", "auth", "credential", "未登录", "登录"),
+     "没有登录（或登录过期了）", "在设置 →「检查与登录」里点「去登录」"),
+    (("无法启动", "no such file", "command not found", "找不到", "enoent", "not found"),
+     "找不到这个模型对应的程序", "确认那个命令行软件装好了，或在设置里换一个模型"),
+    (("unable to connect", "connection", "econn", "network", "socket", "ssl", "dns", "502", "503", "504", "proxy"),
+     "网络连接中断了", "检查网络或代理后再试"),
+]
+
+
+def explain_error(raw):
+    """原始报错（常是英文 JSON）→ (一句中文原因, 一句建议)。原文另外保留，不丢。"""
+    low = (raw or "").lower()
+    for keys, reason, advice in ERROR_KINDS:
+        if any(k.lower() in low for k in keys):
+            if "{t}" in reason:
+                mm = re.search(r"after (\d+)m(\d+)s|after (\d+)s|超时（(\d+)s）", raw or "")
+                secs = None
+                if mm:
+                    secs = int(mm.group(1)) * 60 + int(mm.group(2)) if mm.group(1) else int(mm.group(3) or mm.group(4))
+                reason = reason.replace("{t}", "%d 分钟" % max(1, round(secs / 60)) if secs else "规定时间")
+            return reason, advice
+    return "出错了（原因见技术细节）", "可以重新执行一次；反复出现的话把技术细节发给我们看看"
+
+
+def failure_text(agent, tries):
+    """tries：[(后端, 原始报错)] → 说清楚先用谁、又换谁、各自为什么没成功。"""
+    if not tries:
+        return "%s 没有可用的模型" % agent
+    parts = []
+    for i, (spec, raw) in enumerate(tries):
+        reason = explain_error(raw)[0]
+        lead = "先用" if i == 0 else "又换"
+        parts.append("%s %s 试了，%s" % (lead, spec_label(spec), reason) if len(tries) > 1
+                     else "用 %s 试了，%s" % (spec_label(spec), reason))
+    tail = "都没成功" if len(tries) > 1 else "没成功"
+    return "%s 没能完成：%s。%s。建议：%s。" % (agent, "；".join(parts), tail, explain_error(tries[-1][1])[1])
+
+
+def _tail(s, n=400):
+    s = s.strip()
+    return s[-n:] if len(s) > n else s
+
+
+# ---------------------------------------------------------------- 各后端适配器
+
+def backend_agy(cfg, model, prompt, cwd, write, timeout):
+    exe = find_bin(cfg, "agy")
+    if not exe:
+        raise BackendError("未安装 agy（Antigravity CLI）")
+    tmp = None
+    if len(prompt.encode("utf-8")) > 60000:  # 太长就落盘到工作目录，让它自己读
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".md", prefix=".hub-prompt-", dir=cwd)
+        except OSError:  # 工作目录不可写就放到系统临时目录
+            fd, tmp = tempfile.mkstemp(suffix=".md", prefix="hub-prompt-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        prompt = "完整任务说明在文件 %s 中，请先完整阅读该文件，再严格按其中要求完成任务（不要修改或删除该文件）。" % tmp
+    cmd = [exe, "--print=" + prompt, "--output-format", "stream-json", "--print-timeout", "%ds" % timeout]
+    if model:
+        cmd += ["--model", model]
+    if write:
+        cmd += ["--mode", "accept-edits", "--dangerously-skip-permissions"]
+    live = Live()
+    box = {"data": None, "step": None, "tok": {"in": 0, "out": 0, "cache": 0}}
+
+    def on_line(line):
+        line = line.strip()
+        if not line.startswith("{"):
+            return
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            return
+        if ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+            box["data"] = ev["result"]
+            return
+        su = ev.get("step_update")
+        if not isinstance(su, dict):
+            return
+        u = su.get("usage")
+        if isinstance(u, dict):
+            box["tok"]["in"] += int(u.get("input_tokens") or 0)
+            box["tok"]["out"] += int(u.get("output_tokens") or 0)
+            box["tok"]["cache"] += int(u.get("cache_read_tokens") or 0)
+        if su.get("step_type") == "agent_response" and su.get("text_delta"):
+            if box["step"] is not None and box["step"] != su.get("step_index") and live.text:
+                live.add("\n\n")
+            box["step"] = su.get("step_index")
+            live.add(su["text_delta"])
+        elif su.get("step_type") == "tool" and su.get("state") == "ACTIVE":
+            params = (su.get("tool_info") or {}).get("parameters") or {}
+            arg = next((str(v) for v in params.values() if isinstance(v, (str, int, float)) and str(v).strip()), "")
+            live.step("%s %s" % (su.get("tool_name") or "tool", arg))
+
+    try:
+        rc, out, err = _run(cmd, cwd, clean_env(), timeout + 30, on_line=on_line)
+    finally:
+        live.close()
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    data = box["data"]
+    if not isinstance(data, dict):
+        raise BackendError("agy 没有给出结果 rc=%s：%s" % (rc, _tail(err or out)))
+    if data.get("status") != "SUCCESS" or not (data.get("response") or "").strip():
+        raise BackendError("agy 状态 %s：%s" % (data.get("status"), _tail(json.dumps(data, ensure_ascii=False))))
+    _ctx.tokens = box["tok"]
+    if data.get("conversation_id"):
+        _ctx.session = {"id": data["conversation_id"], "app": "Antigravity 命令行",
+                        "resume": "cd %s && agy --conversation %s" % (shq(cwd), shq(data["conversation_id"]))}
+    return data["response"].strip()
+
+
+def backend_codex(cfg, model, prompt, cwd, write, timeout):
+    exe = find_bin(cfg, "codex")
+    if not exe:
+        raise BackendError("未找到 codex CLI")
+    fd, outfile = tempfile.mkstemp(suffix=".txt", prefix="hub-codex-")
+    os.close(fd)
+    cmd = [exe, "exec", "--skip-git-repo-check", "-C", cwd,
+           "-s", ("danger-full-access" if cfg.get("gpt_full_access") else "workspace-write") if write else "read-only",
+           "-o", outfile]
+    if model:
+        cmd += ["-m", model]
+    if cfg.get("codex_effort"):
+        cmd += ["-c", 'model_reasoning_effort="%s"' % cfg["codex_effort"]]
+    cmd += ["--json", "-"]
+    live = Live()
+    box = {}
+
+    def on_line(line):  # 事件流只用于实时显示；最终回答仍读 -o 文件
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            return
+        if isinstance(ev, dict) and (ev.get("thread_id") or ev.get("session_id")) and not box.get("sid"):
+            box["sid"] = str(ev.get("thread_id") or ev.get("session_id"))
+        item = ev.get("item") if isinstance(ev, dict) else None
+        if not isinstance(item, dict):
+            return
+        typ, kind = str(ev.get("type") or ""), str(item.get("type") or item.get("item_type") or "")
+        if kind == "agent_message" and typ.endswith("completed") and item.get("text"):
+            live.add(str(item["text"]) + "\n\n")
+        elif kind == "command_execution" and typ.endswith("started"):
+            live.step(str(item.get("command") or "运行命令"))
+        elif kind not in ("agent_message", "reasoning", "command_execution") and typ.endswith("started"):
+            live.step(kind)
+
+    try:
+        try:
+            rc, out, err = _run(cmd, cwd, clean_env(), timeout, stdin_text=prompt, on_line=on_line)
+        finally:
+            live.close()
+        with open(outfile, encoding="utf-8", errors="replace") as f:
+            answer = f.read().strip()
+    finally:
+        try:
+            os.unlink(outfile)
+        except OSError:
+            pass
+    if rc != 0 or not answer:
+        raise BackendError("codex rc=%s：%s" % (rc, _tail(err or out)))
+    if box.get("sid"):
+        _ctx.session = {"id": box["sid"], "app": "Codex 命令行",
+                        "resume": "cd %s && %s resume %s" % (shq(cwd), shq(exe), shq(box["sid"]))}
+    return answer
+
+
+def backend_dsh(cfg, model, prompt, cwd, write, timeout):
+    exe = find_bin(cfg, "dsh")
+    if not exe:
+        raise BackendError("未安装 dsh")
+    env = clean_env({"DSH_PERMISSION_MODE": "danger-full-access" if write else "read-only"})
+    cmd = [exe, "--patch", DSH_PATCH, "--profile", "headless", "--json", "-"]
+    live = Live()
+
+    def on_line(line):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(ev, dict):
+            return
+        typ = str(ev.get("type") or "")
+        if typ == "text" and isinstance(ev.get("text"), str):
+            live.add(ev["text"])
+        elif "tool" in typ:
+            live.step("%s %s" % (ev.get("name") or ev.get("tool") or typ,
+                                  json.dumps(ev.get("input") or ev.get("args") or "", ensure_ascii=False)[:120]))
+
+    try:
+        rc, out, err = _run(cmd, cwd, env, timeout, stdin_text=prompt, on_line=on_line)
+    finally:
+        live.close()
+    final, tok, sid = None, {"in": 0, "out": 0, "cache": 0}, None
+    for line in out.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "session" and ev.get("sessionId"):
+            sid = str(ev["sessionId"])
+        if ev.get("type") == "final" and isinstance(ev.get("text"), str):
+            final = ev["text"]
+        u = ev.get("usage")
+        if isinstance(u, dict):
+            tok["in"] += int(u.get("inputTokens") or 0)
+            tok["out"] += int(u.get("outputTokens") or 0)
+            tok["cache"] += int(u.get("cacheReadTokens") or 0)
+    if rc != 0 or not (final or "").strip():
+        raise BackendError("dsh rc=%s：%s" % (rc, _tail(err or out)))
+    _ctx.tokens = tok
+    if sid:
+        _ctx.session = {"id": sid, "app": "DeepSeek Harness 命令行",
+                        "resume": "cd %s && dsh --patch %s tui --resume %s" % (shq(cwd), shq(DSH_PATCH), shq(sid))}
+    return final.strip()
+
+
+def backend_claude(cfg, model, prompt, cwd, write, timeout):
+    exe = find_bin(cfg, "claude")
+    if not exe:
+        raise BackendError("未找到 claude CLI")
+    cmd = [exe, "-p", "--model", model or "opus",
+           "--permission-mode", "acceptEdits" if write else "plan"]
+    rc, out, err = _run(cmd, cwd, clean_env(), timeout, stdin_text=prompt)
+    text = out.strip()
+    not_logged = len(text) < 200 and ("Not logged in" in text or "Please run /login" in text)
+    if rc != 0 or not text or not_logged:
+        hint = "（未登录：请在终端运行一次 claude 并执行 /login）" if not_logged else ""
+        raise BackendError("claude rc=%s%s：%s" % (rc, hint, _tail((err + "\n" + text).strip())))
+    return text
+
+
+BACKENDS = {"agy": backend_agy, "codex": backend_codex, "dsh": backend_dsh, "claude": backend_claude}
+
+
+# ---------------------------------------------------------------- 统一调用入口
+
+def log_call(rec):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def write_json(path, obj):
+    """原子写入，避免面板读到写了一半的文件。"""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+QUOTA_PATH = os.path.join(HUB_HOME, "quota.json")
+
+
+def _iso_to_epoch(sv):
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(sv.strip().replace("Z", "+00:00"))
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def quota_agy(cfg):
+    """Antigravity 自带的额度查询（不消耗模型额度）。"""
+    exe = find_bin(cfg, "agy")
+    if not exe:
+        return None
+    try:
+        rc, out, err = _run([exe, "--print=/usage", "--print-timeout", "40s"], tempfile.gettempdir(), clean_env(), 60)
+    except BackendError:
+        return None
+    if rc != 0:
+        return None
+    wins = []
+    for line in out.splitlines():
+        p = [x.strip() for x in line.split("\t")]
+        if len(p) >= 4 and p[0].lower().startswith("gemini") and p[2].endswith("%"):
+            try:
+                pct = float(p[2].rstrip("%"))
+                if not 0 <= pct <= 100:
+                    continue
+            except ValueError:
+                continue
+            wins.append({"label": "5 小时" if "five" in p[1].lower() else "本周" if "week" in p[1].lower() else p[1],
+                         "remaining": pct, "resets": _iso_to_epoch(p[3])})
+    wins.sort(key=lambda w: 0 if w["label"] == "5 小时" else 1)
+    return {"windows": wins, "ts": time.time()} if wins else None
+
+
+def quota_codex():
+    """读最近会话里的真实限额事件，忽略空限额和坏行。"""
+    files = glob.glob(os.path.join(HOME, ".codex/sessions/*/*/*/*.jsonl"))
+    files.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+    latest = None
+    for p in files[:8]:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            mtime = os.path.getmtime(p)
+        except OSError:
+            continue
+        for line in reversed(lines):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+                payload = event.get("payload") or event
+                rl = payload.get("rate_limits")
+                if not isinstance(rl, dict):
+                    continue
+                ts = _iso_to_epoch(event.get("timestamp")) or mtime
+                wins, now = [], time.time()
+                for key in ("primary", "secondary"):
+                    w = rl.get(key)
+                    if not isinstance(w, dict) or w.get("used_percent") is None:
+                        continue
+                    used = float(w["used_percent"])
+                    if not 0 <= used <= 100:
+                        continue
+                    mins = int(w.get("window_minutes") or 0)
+                    resets = float(w["resets_at"]) if w.get("resets_at") else None
+                    remaining = 100.0 if resets and resets < now else 100.0 - used
+                    wins.append({"label": "5 小时" if mins == 300 else "本周" if mins == 10080 else "%d 分钟" % mins,
+                                 "remaining": remaining, "resets": resets if resets and resets > now else None})
+                if wins:
+                    if latest is None or ts > latest["ts"]:
+                        latest = {"windows": wins, "ts": ts}
+                    break
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                continue
+    return latest
+
+
+def quota_ds():
+    """DeepSeek 官方余额接口。密钥只在本机读取、只发给 api.deepseek.com。"""
+    import urllib.error
+    import urllib.request
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    for p in (os.path.join(HUB_HOME, ".env"), os.path.join(HOME, ".dsh", ".env")):
+        if key:
+            break
+        try:
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip().startswith("DEEPSEEK_API_KEY="):
+                        key = line.split("=", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            pass
+    if not key:
+        return {"note": "按量付费。想在这里看余额：把 DEEPSEEK_API_KEY=你的密钥 写进 ~/.agent-hub/.env"}
+    try:
+        req = urllib.request.Request("https://api.deepseek.com/user/balance",
+                                     headers={"Authorization": "Bearer " + key, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"note": "余额读不到：现有的 DeepSeek 密钥已失效。把新的写进 ~/.agent-hub/.env 即可。"}
+        return {"note": "余额读不到（HTTP %s）" % e.code}
+    except (OSError, ValueError) as e:
+        return {"note": "余额读不到：%s" % str(e)[:80]}
+    infos = d.get("balance_infos") or []
+    sym = {"CNY": "¥", "USD": "$"}
+    bal = "  ".join("%s%s" % (sym.get(i.get("currency"), (i.get("currency") or "") + " "), i.get("total_balance"))
+                    for i in infos if isinstance(i, dict))
+    return {"balance": bal or "0", "available": bool(d.get("is_available")), "ts": time.time()}
+
+
+def fetch_quota(cfg):
+    q = {}
+    g = quota_agy(cfg)
+    if g:
+        q["gemini"] = g
+    c = quota_codex()
+    if c:
+        q["gpt"] = c
+    q["claude"] = {"note": "读不到：Claude 命令行未提供额度查询。可在 Claude App 的 设置 → 用量 里看。"}
+    q["ds"] = quota_ds()
+    out = {"ts": time.time(), "agents": q}
+    write_json(QUOTA_PATH, out)
+    return out
+
+
+def quota_text(name):
+    """给规划者看的一句话额度。"""
+    q = ((read_json(QUOTA_PATH) or {}).get("agents") or {}).get(name) or {}
+    wins = q.get("windows") or []
+    if not wins or time.time() - (q.get("ts") or 0) > 6 * 3600:
+        return ""
+    return "（当前剩余额度：%s）" % "，".join("%s %d%%" % (w["label"], round(w["remaining"])) for w in wins)
+
+
+def top_meta():
+    """面板下任务时附带的信息（追问的是哪一条、给人看的原始输入）。"""
+    try:
+        d = json.loads(os.environ.get("HUB_META") or "{}")
+        return d if isinstance(d, dict) else {}
+    except ValueError:
+        return {}
+
+
+def team_note(cfg, me):
+    others = [a for a in cfg["agents"] if a != me]
+    return ("\n\n---\n[协作说明] 你是多 Agent 团队中的「%s」。如果遇到明显更适合队友的子任务，"
+            "可以在终端执行 `hub ask <agent> \"问题\"` 向队友求助（可选：%s；加 --write 允许对方改文件；长内容用 `hub ask <agent> -` 从标准输入传）。"
+            "不需要就别用。直接给出最终结果，不要反问。" % (me, " / ".join(others)))
+
+
+def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, quiet=False, note=True, meta=None):
+    """调用某个角色。返回 (回答文本, 实际使用的后端描述)。全部后备都失败则抛 BackendError。"""
+    if agent not in cfg["agents"]:
+        raise BackendError("未知 agent：%s（可选：%s）" % (agent, ", ".join(cfg["agents"])))
+    if hub_depth() >= MAX_DEPTH:
+        raise BackendError("agent 互相调用已达 %d 层上限，请自己完成这个任务。" % MAX_DEPTH)
+    if write and os.environ.get("HUB_READONLY") == "1":
+        raise BackendError("上级任务是只读的（例如会审），不能在里面再让队友改文件。")
+    if _stopping.is_set():
+        raise BackendError(STOP_MSG)
+    cwd = os.path.abspath(cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        raise BackendError("工作目录不存在：%s" % cwd)
+    timeout = timeout or cfg["timeout"]
+    chain = list(cfg["agents"][agent])
+    if not chain:
+        raise BackendError("%s 没有配置任何后端" % agent)
+    if model:
+        chain[0] = chain[0].split(":")[0] + ":" + model
+    # 只有当对方还能再找队友时才告诉它可以求助，免得它试了碰壁
+    full_prompt = prompt + (team_note(cfg, agent) if note and hub_depth() + 1 < MAX_DEPTH else "")
+    errors = []
+    meta = meta or {}
+    cid = "c_" + uuid.uuid4().hex[:10]
+    rec = {"id": cid, "parent": os.environ.get("HUB_PARENT") or None,
+           "run": meta.get("run") or os.environ.get("HUB_RUN") or None,
+           "task": meta.get("task"), "kind": meta.get("kind") or "ask", "title": meta.get("title"),
+           "agent": agent, "backend": chain[0], "preferred_backend": chain[0], "status": "running", "start": time.time(), "end": None,
+           "secs": None, "write": bool(write), "cwd": cwd, "prompt": prompt, "answer": None,
+           "error": None, "attempts": [], "pid": os.getpid(),
+           "image": meta.get("image"), "follows": None, "display": None, "chat": meta.get("chat")}
+    if rec["kind"] in ("ask", "image", "chat") and not rec["parent"]:
+        ext = top_meta()
+        rec["follows"], rec["display"] = ext.get("follows"), ext.get("display") or meta.get("display")
+        rec["submission_id"] = ext.get("submission_id")
+    cpath = os.path.join(CALLS_DIR, cid + ".json")
+    write_json(cpath, rec)
+    if meta.get("on_start"):
+        meta["on_start"](cid)
+    previous = (getattr(_ctx, "call_id", None), getattr(_ctx, "run_id", None), getattr(_ctx, "write", True))
+    _ctx.call_id = cid
+    _ctx.run_id = rec["run"]
+    _ctx.write = bool(write)
+
+    def finish(**kw):
+        rec.update(kw)
+        rec["end"] = time.time()
+        rec["secs"] = round(rec["end"] - rec["start"], 1)
+        write_json(cpath, rec)
+        _ctx.call_id, _ctx.run_id, _ctx.write = previous
+
+    for i, spec in enumerate(chain):
+        if _stopping.is_set():
+            break
+        kind, _, mdl = spec.partition(":")
+        fn = BACKENDS.get(kind)
+        if not fn:
+            errors.append((spec, "未知后端（找不到）"))
+            rec["attempts"].append({"backend": spec, "error": "未知后端", "reason": "配置里写了不认识的模型：%s" % spec})
+            continue
+        t0 = time.time()
+        rec["backend"] = spec
+        write_json(cpath, rec)
+        _ctx.tokens = None
+        _ctx.session = None
+        _ctx.partial = None
+        try:
+            text = fn(cfg, mdl, full_prompt, cwd, write, timeout)
+            dt = time.time() - t0
+            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec, "ok": True,
+                      "secs": round(dt, 1), "write": write, "cwd": cwd,
+                      "prompt": prompt[:200], "answer_chars": len(text)})
+            if i > 0 and not quiet:
+                eprint("[hub] 注意：%s 的首选模型没成功，这次由备用的 %s 完成。" % (agent, spec_label(spec)))
+            if meta.get("defer"):  # 调用方还要接着处理（例如对接人派活），先别标「完成」
+                finish(status="running", tokens=getattr(_ctx, "tokens", None), session=getattr(_ctx, "session", None))
+                rec["end"] = rec["secs"] = None
+                write_json(cpath, rec)
+            else:
+                finish(status="ok", answer=text, tokens=getattr(_ctx, "tokens", None),
+                       session=getattr(_ctx, "session", None))
+            return text, spec
+        except (BackendError, OSError) as e:
+            errors.append((spec, str(e)))
+            att = {"backend": spec, "error": str(e)[:800], "reason": "%s：%s" % (spec_label(spec), explain_error(str(e))[0])}
+            if getattr(_ctx, "partial", None):
+                att["partial"] = _ctx.partial
+                rec["partial"] = _ctx.partial  # 超时等情况下已经写出来的部分，标「未完成」给人看
+            rec["attempts"].append(att)
+            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec, "ok": False,
+                      "secs": round(time.time() - t0, 1), "error": str(e)[:500], "prompt": prompt[:200]})
+            if not quiet:
+                nxt = chain[i + 1] if i + 1 < len(chain) else None
+                eprint("[hub] %s 没成功（%s）%s" % (spec_label(spec), explain_error(str(e))[0],
+                                                 "，换 %s 再试…" % spec_label(nxt) if nxt else "。"))
+    msg = failure_text(agent, errors)
+    finish(status="fail", error=msg, error_detail="\n\n".join("[%s] %s" % (sp, raw) for sp, raw in errors))
+    raise BackendError(msg)
+
+
+# ---------------------------------------------------------------- 规划 + 并行执行
+
+PLAN_PROMPT = """你在给一个多 Agent 小团队排工。团队成员是平等的队友：按各自长处和剩余额度分配工作，写清依赖和预计耗时，而不是单向下命令。
+
+团队成员：
+{roster}
+
+排工规则：
+1. 简单目标（翻译一句话、回答一个小问题）只排 1 个任务，交给最合适的一位，不要为了热闹浪费额度。
+2. 目标里有几块互相独立的工作时，拆成 2～4 个可以同时做的任务，尽量分给不同成员，发挥各自长处；不要把同一份工作复制给几个人。
+3. 关键成果（方案、代码、要交给用户的结论）值得的话，再排一个由另一位成员做的「审查」任务，用 depends_on 接在它后面。
+4. 像一家小公司分岗位：执行类的活（查资料、写初稿、写代码、整理）默认给 gemini；claude / gpt 主要负责拍板和审查（定方案、审查关键成果），画图给 gpt；零碎小活给 ds。{quota_rule}gemini 额度不足时再让别人顶上，并在 why 里写明。
+5. 每个任务的 prompt 必须自包含：队员看不到用户原话，把需要的背景、约束、输出格式都写进去。确实依赖其他任务结果的用 depends_on 标出，执行时会自动把前置结果附给它。
+6. why 写一句为什么派给这位（长处或额度）；eta_min 写预计需要几分钟（整数）。每位成员一次最多有 {timeout_min} 分钟。
+7. 任务数 1~{max_tasks} 个。write=true 表示该任务需要创建/修改文件{write_hint}；不要让两个写任务改同一个文件。
+
+例子（只示意结构）：
+- 「把这句话翻译成英文」→ 1 个任务给 ds。
+- 「比较三家云盘并给出建议」→ t1 gemini 查资料、t2 ds 整理价格表（同时进行）→ t3 gpt 审查结论并拍板（depends_on t1、t2）。
+
+工作目录：{cwd}
+
+用户目标：
+{goal}
+
+只输出一个 JSON 对象，不要任何其他文字、不要代码块标记：
+{{"summary": "一句话方案", "tasks": [{{"id": "t1", "agent": "gemini", "title": "简短标题", "why": "为什么派给它", "eta_min": 5, "prompt": "给队员的完整指令", "depends_on": [], "write": false}}]}}"""
+
+SYNTH_PROMPT = """下面是一个多 Agent 团队为完成用户目标各自交回的结果。请整合成一份给用户的最终答复：
+直接给结论与成果，去掉重复，指出各结果之间的矛盾（如有），标明哪些任务失败了。用简体中文。
+
+用户目标：
+{goal}
+
+各任务结果：
+{results}"""
+
+COUNCIL_PROMPT = """请独立回答下面的问题。几位队友在同时、各自独立作答，你看不到他们的答案，他们也看不到你的；之后会有人比较大家的共同点和分歧。
+请给出你自己的判断和理由；不确定的地方直说不确定，不要编造。用简体中文。
+
+问题：
+{question}"""
+
+COUNCIL_SYNTH_PROMPT = """几位成员各自独立回答了同一个问题。请比较他们的回答，用简体中文按下面四节输出：
+## 建议
+## 共同点
+## 分歧与各自理由
+## 还需要确认的信息
+
+要求：不要因为多数人这么说就当成事实；每条分歧写清是谁的观点、理由是什么；如果有成员缺席或失败，在开头注明。{note}
+
+问题：
+{question}
+
+各位的回答：
+{results}"""
+
+QUOTA_SKIP_PCT = 15
+MIN_TIMEOUT = 900  # 给被派活的一方的合理时限（秒）
+
+
+def quota_guard_on():
+    """设置里「额度低时自动跳过」是否打开（默认打开）。直接读配置文件，改完立即生效。"""
+    raw = read_json(CONFIG_PATH)
+    return not (isinstance(raw, dict) and raw.get("quota_guard") is False)
+
+
+def quota_skip(name, now=None):
+    """会审选人：5 小时额度低于 15% 就跳过（用户关掉「自动跳过」时照样参加）。数据过期/未知不当成 0。返回 (跳过原因或 None, 给人看的额度说明)。"""
+    now = now or time.time()
+    q = ((read_json(QUOTA_PATH) or {}).get("agents") or {}).get(name) or {}
+    if now - (q.get("ts") or 0) > 6 * 3600:
+        return None, "额度未知"
+    fresh = []  # 所有还没过重置时间的窗口（5 小时、本周……），任一低于 15% 都跳过
+    for w in q.get("windows") or []:
+        if not isinstance(w, dict) or (w.get("resets") and w["resets"] < now):
+            continue
+        try:
+            fresh.append((str(w.get("label") or ""), float(w.get("remaining"))))
+        except (TypeError, ValueError):
+            continue
+    if not fresh:
+        return None, "额度未知"
+    fresh.sort(key=lambda x: 0 if x[0] == "5 小时" else 1)
+    for label, pct in fresh:
+        if pct < QUOTA_SKIP_PCT:
+            if not quota_guard_on():
+                return None, "%s剩 %d%%（已设为额度低也照样干活）" % (label, int(pct))
+            return "%s额度只剩 %d%%，低于 %d%%，这次自动跳过" % (label, int(pct), QUOTA_SKIP_PCT), "%s剩 %d%%" % (label, int(pct))
+    return None, "剩 %d%%" % int(fresh[0][1])
+
+
+def timeout_warning(secs):
+    if secs and secs < MIN_TIMEOUT:
+        return ("时限只有 %d 分钟，少于 15 分钟。读代码、审查、写长文的活常常需要 5～15 分钟，"
+                "时间太短对方容易什么都交不出来。" % max(1, round(secs / 60)))
+    return None
+
+
+def extract_json(text):
+    dec = json.JSONDecoder()
+    for m in re.finditer(r"\{", text):
+        try:
+            obj, _ = dec.raw_decode(text[m.start():])
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and "tasks" in obj:
+            return obj
+    raise ValueError("规划输出里没有合法的 JSON 方案")
+
+
+def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None, inject=""):
+    roster = "\n".join("- %s：%s%s" % (k, v, quota_text(k)) for k, v in cfg["profiles"].items() if k in cfg["agents"])
+    prompt = PLAN_PROMPT.format(
+        quota_rule=("标注剩余额度低于 15% 的成员不要派活；" if quota_guard_on() else "用户设置了额度低也照样派活，不必因为额度低避开谁；"),
+        roster=roster, max_tasks=max_tasks, cwd=cwd, goal=goal, timeout_min=max(1, round(cfg["timeout"] / 60)),
+        write_hint="" if write else "（本次运行为只读模式，所有任务 write 都填 false，成果以文字形式交回）")
+    if inject.strip():  # 高压模式：用户自己写的话放在排工说明前面
+        prompt = "【用户给排工者的特别要求，请先读并照办】\n" + inject.strip() + "\n\n――――――――\n\n" + prompt
+    last = None
+    for attempt in range(2):
+        text, spec = ask(cfg, planner, prompt, cwd=cwd, note=False,
+                         meta={"run": run_id, "kind": "plan", "title": "排工：" + (title or goal)[:40]})
+        try:
+            plan = extract_json(text)
+            tasks = (plan.get("tasks") or [])[:max_tasks]
+            if not tasks:
+                raise ValueError("任务列表为空")
+            ids = set()
+            for i, t in enumerate(tasks):
+                if not isinstance(t, dict):
+                    raise ValueError("任务格式不对")
+                tid = re.sub(r"[^A-Za-z0-9_-]", "_", str(t.get("id") or "t%d" % (i + 1)))
+                if tid in ids:
+                    raise ValueError("任务 id 重复：%s" % tid)
+                t["id"] = tid
+                if t.get("agent") not in cfg["agents"]:
+                    t["agent"] = cfg["default_worker"]
+                t["title"] = str(t.get("title") or tid)
+                t["why"] = str(t.get("why") or "")[:200]
+                try:
+                    t["eta_min"] = max(1, min(600, int(t.get("eta_min"))))
+                except (TypeError, ValueError):
+                    t["eta_min"] = None
+                deps = t.get("depends_on") or []
+                if isinstance(deps, str):
+                    deps = [deps]
+                t["depends_on"] = [re.sub(r"[^A-Za-z0-9_-]", "_", str(d)) for d in deps]
+                t["write"] = bool(t.get("write")) and write
+                if not t.get("prompt"):
+                    raise ValueError("任务 %s 缺少 prompt" % tid)
+                t["prompt"] = str(t["prompt"])
+                ids.add(tid)
+            for t in tasks:
+                if any(d not in ids or d == t["id"] for d in t["depends_on"]):
+                    raise ValueError("任务依赖不存在或依赖自身")
+            resolved = set()
+            while len(resolved) < len(tasks):
+                ready = {t["id"] for t in tasks if t["id"] not in resolved
+                         and all(d in resolved for d in t["depends_on"])}
+                if not ready:
+                    raise ValueError("任务之间存在循环依赖")
+                resolved.update(ready)
+            plan["tasks"] = tasks
+            plan["planner_backend"] = spec
+            return plan
+        except (ValueError, TypeError, AttributeError) as e:
+            last = e
+            prompt += "\n\n（上次输出不是合法 JSON：%s。这次只输出 JSON。）" % e
+    raise BackendError("规划失败：%s" % last)
+
+
+# ---- 共享进度板：每位成员开工前看到整体目标、分工、别人已完成的摘要；做完写回自己的进度和遗留
+
+BOARD_STATUS = {"pending": "待开始", "running": "正在做", "ok": "已完成", "fail": "没完成", "skipped": "跳过"}
+
+
+def parse_report(text):
+    """从回答末尾取「【进度】」「【遗留】」两行；没写就用开头一段当进度。"""
+    prog = left = None
+    for line in (text or "").splitlines()[::-1][:30]:
+        m = re.match(r"\s*[*#>\-\s]*【(进度|遗留)】[*\s]*[:：]?[*\s]*(.*)", line)
+        if m:
+            if m.group(1) == "进度" and prog is None:
+                prog = m.group(2).strip()[:300]
+            elif m.group(1) == "遗留" and left is None:
+                left = m.group(2).strip()[:300]
+    prog = (prog or "").rstrip("*` ").strip()
+    left = (left or "").rstrip("*` ").strip()
+    if not prog:
+        prog = re.sub(r"\s+", " ", strip_report(text or "").strip())[:120]
+    if left in ("", "无", "没有", "无。", "没有。"):
+        left = None
+    return prog, left
+
+
+def strip_report(text):
+    """直接交给用户的结果里去掉末尾写给进度板的【进度】【遗留】两行。"""
+    lines = (text or "").rstrip().splitlines()
+    while lines and (re.match(r"\s*[*#>\-\s]*【(进度|遗留)】", lines[-1]) or not lines[-1].strip()):
+        lines.pop()
+    return "\n".join(lines)
+
+
+def board_text(state, me, share_results=True, footer=True):
+    goal = state.get("display") or state["goal"]  # 追问时 goal 前面带着历史背景，看板上只写这次的要求
+    lines = ["===== 共享进度板（项目看板，全队都能看到）=====", "整体目标：%s" % goal[:2000]]
+    if state.get("summary"):
+        lines.append("方案：%s" % state["summary"])
+    lines.append("分工：")
+    for t in state["tasks"]:
+        st = BOARD_STATUS.get(t.get("status"), t.get("status") or "")
+        bits = ["- %s [%s] %s —— %s" % (t["id"], t["agent"], t["title"], st)]
+        if t.get("eta_min"):
+            bits.append("预计 %s 分钟" % t["eta_min"])
+        if t.get("depends_on"):
+            bits.append("接在 %s 之后" % "、".join(t["depends_on"]))
+        if share_results and t["id"] != me and t.get("progress"):
+            bits.append("进度：%s" % t["progress"][:200])
+        if share_results and t["id"] != me and t.get("leftover"):
+            bits.append("遗留：%s" % t["leftover"][:200])
+        lines.append("；".join(bits))
+    if not footer:
+        return "\n".join(lines)
+    lines.append("你负责：%s。时限约 %d 分钟。" % (me, max(1, round(state.get("timeout", 900) / 60))))
+    if not share_results:
+        lines.append("（这是会审：其他人在同时独立作答，你看不到他们的答案。）")
+    lines.append("做完后请在回答最后单独写两行，方便写回进度板：\n【进度】一句话说明做到哪\n【遗留】没做完或需要别人注意的事（没有就写 无）")
+    return "\n".join(lines)
+
+
+def write_board_md(run_dir, state):
+    try:
+        with open(os.path.join(run_dir, "board.md"), "w", encoding="utf-8") as f:
+            f.write("# 共享进度板（项目看板）\n\n" + board_text(state, "-", True, footer=False) + "\n")
+    except OSError:
+        pass
+
+
+def _open_run(cfg, goal, cwd, write, **fields):
+    cwd = os.path.abspath(cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        raise BackendError("工作目录不存在：%s" % cwd)
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    while True:
+        run_dir = os.path.join(RUNS_DIR, run_id)
+        try:
+            os.makedirs(run_dir)
+            break
+        except FileExistsError:
+            run_id += "x"
+    state = {"id": run_id, "mode": "run", "goal": goal, "status": "planning", "summary": "", "start": time.time(),
+             "end": None, "cwd": cwd, "planner": None, "synthesizer": None, "tasks": [], "final": None,
+             "error": None, "pid": os.getpid(), "write": bool(write), "timeout": cfg["timeout"],
+             "follows": top_meta().get("follows"), "display": top_meta().get("display"),
+             "submission_id": top_meta().get("submission_id")}
+    state.update(fields)
+    slock = threading.RLock()
+
+    def save(**kw):
+        with slock:
+            state.update(kw)
+            write_json(os.path.join(run_dir, "run.json"), state)
+            write_board_md(run_dir, state)
+    save.lock = slock  # 执行任务时所有对 state 的改动都用同一把锁
+
+    warn = timeout_warning(cfg["timeout"])
+    if warn:
+        eprint("[hub] 提醒：" + warn + "可以在设置里调大「每一步最多等几分钟」。")
+        state["timeout_warning"] = warn
+    save()
+    return run_id, run_dir, state, save
+
+
+def _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel, share_results=True):
+    """按依赖并行执行 state["tasks"]（状态为 pending 的），返回 {任务 id: 结果}。"""
+    cwd = state["cwd"]
+    tasks = {t["id"]: t for t in state["tasks"]}
+    results, done, running = {}, set(), {}
+    for t in state["tasks"]:
+        if t.get("status") == "skipped":
+            results[t["id"]] = {"ok": False, "skipped": True, "text": t.get("answer") or "", "backend": "-", "secs": 0}
+            done.add(t["id"])
+
+    def do(t):
+        bad = [d for d in t["depends_on"] if d in results and not results[d]["ok"]]
+        if bad:
+            return {"ok": False, "skipped": True, "text": "【已跳过】前置任务 %s 失败。" % ",".join(bad),
+                    "backend": "-", "secs": 0}
+        p = t["prompt"]
+        deps = [d for d in t["depends_on"] if d in results]
+        if deps:
+            p += "\n\n===== 前置任务的结果（供参考）=====\n" + "\n\n".join(
+                "【%s %s】\n%s" % (d, tasks[d]["title"], results[d]["text"]) for d in deps)
+        if t["write"]:
+            p += "\n\n（工作目录：%s，可以在其中创建/修改文件；完成后简要说明改动了哪些文件。）" % cwd
+        with lock:
+            p += "\n\n" + board_text(state, t["id"], share_results)
+
+        def started(cid):
+            with lock:
+                t["call_id"] = cid
+                save()
+
+        t0 = time.time()
+        try:
+            text, spec = ask(cfg, t["agent"], p, cwd=cwd, write=t["write"], quiet=True, note=share_results,
+                             meta={"run": run_id, "task": t["id"], "kind": "task", "title": t["title"],
+                                   "on_start": started})
+            return {"ok": True, "text": text, "backend": spec, "secs": round(time.time() - t0, 1)}
+        except BackendError as e:
+            crec = read_json(os.path.join(CALLS_DIR, "%s.json" % t.get("call_id"))) or {} if t.get("call_id") else {}
+            with lock:  # 技术细节和超时前写出的部分回答也留在任务上，面板能看
+                t["error_detail"], t["partial"] = crec.get("error_detail"), crec.get("partial")
+            return {"ok": False, "text": "【任务失败】%s" % e, "backend": "-", "secs": round(time.time() - t0, 1)}
+
+    lock = save.lock
+    with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+        while len(done) < len(tasks):
+            for tid, t in tasks.items():
+                if (len(running) < max_parallel and tid not in done and tid not in running
+                        and all(d in done for d in t["depends_on"])):
+                    eprint("[hub] ▶ %s [%s] %s" % (tid, t["agent"], t["title"]))
+                    with lock:
+                        t["status"] = "running"
+                        t["started"] = time.time()
+                        save()
+                    running[tid] = pool.submit(do, t)
+            save()
+            if not running:
+                save(status="failed", end=time.time(), error="任务依赖无法执行")
+                raise BackendError("任务依赖无法执行")
+            fut = next(as_completed(list(running.values())))
+            tid = [k for k, v in running.items() if v is fut][0]
+            del running[tid]
+            r = fut.result()
+            results[tid] = r
+            done.add(tid)
+            prog, left = parse_report(r["text"]) if r["ok"] else (r["text"][:200], None)
+            with lock:
+                tasks[tid].update(status="ok" if r["ok"] else ("skipped" if r.get("skipped") else "fail"),
+                                  backend=r["backend"], secs=r["secs"], answer=r["text"], progress=prog,
+                                  leftover=left, preferred_backend=call_preferred(read_json(os.path.join(
+                                      CALLS_DIR, str(tasks[tid].get("call_id")) + ".json")) or {}))
+            save()
+            with open(os.path.join(run_dir, "%s.md" % tid), "w", encoding="utf-8") as f:
+                f.write("# %s [%s -> %s]\n\n%s\n" % (tasks[tid]["title"], tasks[tid]["agent"], r["backend"], r["text"]))
+            eprint("[hub] %s %s 用时 %ss（%s）" % ("✔" if r["ok"] else "✘", tid, r["secs"], r["backend"]))
+    return results
+
+
+def _sub_fields(goal, parent_call):
+    """由联络人派出的活：挂在那一轮对话下面，不再自己算一条追问。"""
+    return {"parent_call": parent_call, "follows": None, "display": goal, "submission_id": None} if parent_call else {}
+
+
+def run_goal(cfg, goal, cwd, write, planner, synthesizer, max_parallel, max_tasks, dry, on_open=None, parent_call=None,
+             pressure=False):
+    max_parallel, max_tasks = max(1, int(max_parallel)), max(1, int(max_tasks))
+    inject = str(cfg.get("pressure_prompt") or "") if pressure else ""
+    run_id, run_dir, state, save = _open_run(cfg, goal, cwd, write, planner=planner, synthesizer=synthesizer,
+                                             pressure=bool(pressure), pressure_prompt=inject or None,
+                                             **_sub_fields(goal, parent_call))
+    if on_open:
+        on_open(run_id)
+    cwd = state["cwd"]
+    eprint("[hub] 排工中（%s）…" % planner)
+    try:
+        plan = make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id, title=state.get("display"), inject=inject)
+    except BackendError as e:
+        save(status="failed", end=time.time(), error=str(e))
+        raise
+    write_json(os.path.join(run_dir, "plan.json"), dict(plan, goal=goal, cwd=cwd))
+    if dry:
+        save(status="done", end=time.time(), tasks=plan["tasks"],
+             summary="（只出方案）" + str(plan.get("summary", "")))
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        return 0
+    eprint("[hub] 方案：%s" % plan.get("summary", ""))
+    for t in plan["tasks"]:
+        eprint("   - %s [%s]%s %s%s" % (t["id"], t["agent"], "✎" if t["write"] else "", t["title"],
+                                         ("  ⇐ " + ",".join(t["depends_on"])) if t["depends_on"] else ""))
+        t.update(status="pending", backend=None, secs=None, call_id=None, answer=None)
+    save(status="running", summary=str(plan.get("summary", "")), tasks=plan["tasks"])
+    results = _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel)
+    tasks = {t["id"]: t for t in state["tasks"]}
+
+    ok_count = sum(1 for r in results.values() if r["ok"])
+    synth_ok = True
+    if len(tasks) == 1:
+        final = strip_report(list(results.values())[0]["text"])
+    else:
+        blob = "\n\n".join("### %s %s（%s）\n%s" % (tid, tasks[tid]["title"], tasks[tid]["agent"], results[tid]["text"])
+                           for tid in tasks)
+        try:
+            eprint("[hub] 汇总中（%s）…" % synthesizer)
+            save(status="synthesizing")
+            final, _ = ask(cfg, synthesizer, SYNTH_PROMPT.format(goal=goal, results=blob), cwd=cwd, note=False,
+                           quiet=True, meta={"run": run_id, "kind": "synth", "title": "汇总：" + (state.get("display") or goal)[:40]})
+        except BackendError as e:
+            synth_ok = False
+            final = "（汇总失败：%s）\n\n%s" % (e, blob)
+    with open(os.path.join(run_dir, "final.md"), "w", encoding="utf-8") as f:
+        f.write(final + "\n")
+    all_ok = ok_count == len(tasks) and synth_ok
+    save(status="done" if all_ok else "failed", end=time.time(), final=final,
+         error=None if all_ok else ("汇总失败" if not synth_ok else "%d 个任务没有完成" % (len(tasks) - ok_count)))
+    print(final)
+    eprint("[hub] 完成 %d/%d 个任务。过程记录：%s" % (ok_count, len(tasks), run_dir))
+    return 0 if all_ok else 1
+
+
+def council_members(cfg, members=None):
+    names = members if members is not None else cfg.get("council_agents") or []
+    if not isinstance(names, (list, tuple)):
+        names = []
+    out = []
+    for n in names:
+        if isinstance(n, str) and n in cfg["agents"] and n not in out:
+            out.append(n)
+    return out
+
+
+def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None, parent_call=None):
+    """会审：每位成员同时独立回答同一问题（只读），再由一位比较共同点和分歧。"""
+    members = council_members(cfg, members)
+    if not members:
+        raise BackendError("会审没有可选的成员，请在设置里勾选参加会审的成员")
+    tasks, skipped = [], []
+    for i, name in enumerate(members):
+        reason, qnote = quota_skip(name)
+        t = {"id": "m%d" % (i + 1), "agent": name, "title": "%s 的独立意见" % name, "depends_on": [],
+             "write": False, "prompt": COUNCIL_PROMPT.format(question=question), "why": "会审成员（%s）" % qnote,
+             "eta_min": None, "status": "pending", "backend": None, "secs": None, "call_id": None, "answer": None}
+        if reason:
+            t.update(status="skipped", answer="【已跳过】" + reason, skip_reason=reason)
+            skipped.append({"agent": name, "reason": reason})
+        tasks.append(t)
+    active = [t for t in tasks if t["status"] == "pending"]
+    synth = synthesizer or cfg["synthesizer"]
+    if synth not in cfg["agents"] or quota_skip(synth)[0]:
+        synth = active[0]["agent"] if active else None
+    run_id, run_dir, state, save = _open_run(
+        cfg, question, cwd, False, mode="council", planner=None, synthesizer=synth, participants=members,
+        skipped=skipped, status="running", tasks=tasks, **_sub_fields(question, parent_call),
+        summary="会审：%s 各自独立作答，%s比较共同点和分歧" % ("、".join(t["agent"] for t in active) or "无人",
+                                                     (synth + " ") if synth else ""))
+    if on_open:
+        on_open(run_id)
+    if not active:
+        msg = "没有成员可以参加这次会审（%s）" % "；".join("%s：%s" % (s["agent"], s["reason"]) for s in skipped)
+        save(status="failed", end=time.time(), error=msg, final=msg)
+        raise BackendError(msg)
+    eprint("[hub] 会审：%s 同时作答%s" % ("、".join(t["agent"] for t in active),
+                                     "；跳过 " + "、".join(s["agent"] for s in skipped) if skipped else ""))
+    results = _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel=len(active), share_results=False)
+    ok = [t for t in tasks if results.get(t["id"], {}).get("ok")]
+    failed = [t for t in active if t not in ok]
+    absent = ["%s：%s" % (t["agent"], (t.get("skip_reason") or (t.get("answer") or "")[:200])) for t in tasks if t not in ok]
+    by_backend = {}
+    for t in ok:
+        by_backend.setdefault(t.get("backend"), []).append(t["agent"])
+    same = ["%s 实际都由同一个模型 %s 作答，不算不同模型的独立意见" % ("、".join(v), k)
+            for k, v in by_backend.items() if len(v) > 1]
+    notes = absent and ["缺席或失败：" + "；".join(absent)] or []
+    notes += same
+    synth_ok = True
+    if not ok:
+        final = "会审没有得到任何回答。\n\n" + "\n".join(absent)
+    elif len(ok) == 1:
+        final = ("**注意：仅 %s 一位给出了回答，没有形成多方会审。**\n\n" % ok[0]["agent"] + strip_report(ok[0]["answer"]) +
+                 ("\n\n---\n" + "\n".join(notes) if notes else ""))
+    else:
+        if any(t["agent"] == synth for t in failed):  # 综合者刚才自己都没答上来，换一位已答复的成员
+            synth = ok[0]["agent"]
+            notes.append("原定的综合者没有答复，改由 %s 综合" % synth)
+            save(synthesizer=synth)
+        blob = "\n\n".join("### %s（实际模型 %s）\n%s" % (t["agent"], t.get("backend"), t["answer"]) for t in ok)
+        note = ("\n额外说明：" + "；".join(notes)) if notes else ""
+        try:
+            eprint("[hub] 比较意见中（%s）…" % synth)
+            save(status="synthesizing")
+            final, _ = ask(cfg, synth, COUNCIL_SYNTH_PROMPT.format(question=question, results=blob, note=note),
+                           cwd=state["cwd"], note=False, quiet=True,
+                           meta={"run": run_id, "kind": "synth", "title": "会审综合：" + (state.get("display") or question)[:40]})
+            if same:
+                final = "> 注意：" + "；".join(same) + "\n\n" + final
+        except BackendError as e:
+            synth_ok = False
+            final = "（综合失败：%s）\n\n%s" % (e, blob)
+    with open(os.path.join(run_dir, "final.md"), "w", encoding="utf-8") as f:
+        f.write(final + "\n")
+    all_ok = not failed and synth_ok and len(ok) >= 2  # 因额度跳过的成员已注明，不算失败
+    if all_ok:
+        err = ("跳过了 " + "、".join(s["agent"] for s in skipped)) if skipped else None
+    elif not ok:
+        err = "没有成员给出回答"
+    elif not synth_ok:
+        err = "综合失败"
+    elif failed:
+        err = "%d 位没有答复" % len(failed) + ("，仅一位答复，未形成多方会审" if len(ok) == 1 else "")
+    else:
+        err = "仅一位参加，未形成多方会审"
+    save(status="done" if all_ok else "failed", end=time.time(), final=final, error=err, same_backend=same)
+    print(final)
+    eprint("[hub] 会审结束：%d/%d 位答复。过程记录：%s" % (len(ok), len(tasks), run_dir))
+    return 0 if all_ok else 1
+
+
+# ---------------------------------------------------------------- 主联络窗口：用户只跟一位「联络人」说话
+
+CHAT_PROMPT = """你是用户在 Hub 这家小公司里的「对接人」（项目经理）。用户只跟你说话；团队里还有：{team}。
+你可以自己直接回答；如果这件事明显需要几位一起做（要拆成几块并行、要动手做较大的活、要查很多资料），或者需要几位独立给意见再比较，
+就不要自己硬做，只输出下面两种格式之一（单独一段，不要别的文字），Hub 会替你派活，做完把结果交回这个对话：
+【派活】自动分工：<写清楚交给团队的完整目标，包括用户的要求和背景>
+【派活】会审：<写清楚要几位独立回答并比较的问题>
+简单的问题（闲聊、翻译、小问答、解释）自己直接答，不要为了热闹派活。用简体中文，说人话。
+{phase_note}
+用户说：
+{message}"""
+
+PHASES = {
+    "plan": ("定方案", "理解需求、决定怎么做"),
+    "build": ("动手", "写代码、改文件、画图这类动手的活"),
+    "wrap": ("整理", "总结、整理、翻译、改写这类整理的活"),
+}
+PHASE_WORDS = {
+    "build": ("代码", "程序", "脚本", "实现", "修复", "修改", "改一下", "bug", "报错", "画", "图片", "生成图", "部署", "写个", "函数"),
+    "wrap": ("总结", "整理", "汇总", "归纳", "翻译", "改写", "润色", "提炼", "摘要", "要点"),
+}
+# 每个阶段谁来当对接人最合适（先到先得，只选额度读得到、且不低于 15% 的成员）：
+# 定方案时请擅长拍板的 GPT（Claude 额度读不到，自动模式不选）；动手和整理是执行类的活，交给 Gemini。
+PHASE_PREFS = {"plan": ["gpt", "gemini"], "build": ["gemini", "gpt"], "wrap": ["gemini", "gpt"]}  # ds 只有余额、没有百分比额度，不自动当对接人
+
+
+def chat_phase(message):
+    m = (message or "").lower()
+    for ph in ("build", "wrap"):
+        if any(w in m for w in PHASE_WORDS[ph]):
+            return ph
+    return "plan"
+
+
+def quota_known_ok(name, now=None):
+    """自动选人时只认读得到、且 5 小时剩余不低于 15% 的成员。返回 (可用, 说明)。"""
+    reason, note = quota_skip(name, now)
+    if reason:
+        return False, reason
+    if note == "额度未知":
+        return False, "额度读不到"
+    return True, "5 小时额度" + note
+
+
+def quota_stale(now=None):
+    d = read_json(QUOTA_PATH) or {}
+    return (now or time.time()) - (d.get("ts") or 0) > 3600
+
+
+def choose_contact(cfg, message, contact=None):
+    """返回 (联络人, 阶段, 理由)。contact 为成员名表示用户指定；None/'auto' 表示自动按阶段选。"""
+    phase = chat_phase(top_meta().get("display") or message)  # 只看这一轮说的话，不被历史背景带偏
+    if (not contact or contact == "auto") and quota_stale():
+        try:
+            fetch_quota(cfg)  # 额度数据太旧就先读一次（只读数据，不花模型额度）
+        except Exception:
+            pass
+    if contact and contact != "auto":
+        if contact not in cfg["agents"]:
+            raise BackendError("没有这个成员：%s" % contact)
+        return contact, phase, "你指定的联络人"
+    skipped = []
+    for name in PHASE_PREFS[phase]:
+        if name not in cfg["agents"]:
+            continue
+        ok, why = quota_known_ok(name)
+        if ok:
+            stage = "现在是「%s」阶段（%s）" % (PHASES[phase][0], PHASES[phase][1])
+            if skipped:
+                reason = "%s，本来该找 %s，但 %s，所以改由 %s（%s）" % (
+                    stage, PHASE_PREFS[phase][0], "；".join(skipped), name, why)
+            else:
+                reason = "%s，%s 最合适（%s）" % (stage, name, why)
+            return name, phase, reason
+        skipped.append("%s（%s）" % (name, why))
+    raise BackendError("自动模式找不到额度读得到且充足的成员（%s）。请在输入框上方手动指定联络人。" % "；".join(skipped))
+
+
+def previous_contact():
+    follows = top_meta().get("follows") or {}
+    if follows.get("type") == "run" and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", str(follows.get("id"))):
+        pc = (read_json(os.path.join(RUNS_DIR, follows["id"], "run.json")) or {}).get("parent_call")
+        follows = {"type": "call", "id": pc} if pc else {}
+    if follows.get("type") != "call":
+        return None
+    c = read_json(os.path.join(CALLS_DIR, "%s.json" % follows.get("id"))) if re.fullmatch(r"c_[0-9a-f]+", str(follows.get("id"))) else None
+    return (c or {}).get("agent") if (c or {}).get("kind") == "chat" else None
+
+
+def pick_ok(cfg, preferred, others=("gemini", "gpt")):
+    """排工/汇总的人如果额度不足，换一位额度读得到且充足的；都不行就仍用原来的。返回 (成员, 说明或 None)。"""
+    if not quota_skip(preferred)[0]:
+        return preferred, None
+    for n in others:
+        if n != preferred and n in cfg["agents"] and quota_known_ok(n)[0]:
+            return n, "%s 额度不足，改由 %s" % (preferred, n)
+    return preferred, None
+
+
+def _chat_fail_record(cfg, message, error, info):
+    """对接人还没开口就失败（例如自动模式选不出人）：也留一条记录，免得用户的话凭空消失。"""
+    ext = top_meta()
+    now = time.time()
+    cid = "c_" + uuid.uuid4().hex[:10]
+    write_json(os.path.join(CALLS_DIR, cid + ".json"), {
+        "id": cid, "parent": None, "run": None, "task": None, "kind": "chat", "title": "联络：" + (ext.get("display") or message)[:40],
+        "agent": "-", "backend": "-", "preferred_backend": "-", "status": "fail", "start": now, "end": now, "secs": 0,
+        "write": False, "cwd": os.getcwd(), "prompt": message, "answer": None, "error": error, "attempts": [],
+        "pid": os.getpid(), "follows": ext.get("follows"), "display": ext.get("display"),
+        "submission_id": ext.get("submission_id"), "chat": info})
+
+
+def run_chat(cfg, message, cwd=None, write=False, contact=None):
+    info = {"mode": "auto" if not contact or contact == "auto" else "manual", "write": bool(write)}
+    try:
+        name, phase, reason = choose_contact(cfg, message, contact)
+    except BackendError as e:
+        _chat_fail_record(cfg, message, str(e), info)
+        raise
+    prev = previous_contact()
+    handoff = None
+    if prev and prev != name:
+        handoff = "现在由 %s 接手（上一轮是 %s）：%s" % (name, prev, reason)
+    elif not prev:
+        handoff = "这次由 %s 联络：%s" % (name, reason)
+    if handoff:
+        eprint("[hub] " + handoff)
+    team = "、".join(n for n in cfg["agents"] if n != name)
+    note = "（当前阶段：%s。）" % PHASES[phase][0]
+    info.update(phase=phase, reason=reason, handoff=handoff)
+    cid_box = []
+    shown = top_meta().get("display") or message
+    text, spec = ask(cfg, name, CHAT_PROMPT.format(team=team, phase_note=note, message=message), cwd=cwd,
+                     write=False, note=False,
+                     meta={"kind": "chat", "title": "联络：" + shown[:40], "chat": info, "on_start": cid_box.append,
+                           "defer": True})
+    cpath = os.path.join(CALLS_DIR, cid_box[0] + ".json")
+
+    def update(**kw):
+        rec = read_json(cpath) or {}
+        rec.update(kw)
+        if kw.get("end"):
+            rec["secs"] = round(kw["end"] - (rec.get("start") or kw["end"]), 1)
+        write_json(cpath, rec)
+
+    m = re.match(r"\s*【派活】\s*(自动分工|会审)\s*[:：]\s*(\S[\s\S]*)", text)  # 只认开头就是【派活】的回答
+    if not m:
+        update(status="ok", answer=text, end=time.time())
+        print(text)
+        return 0
+    how, goal = m.group(1), m.group(2).strip()
+    lead = "%s 觉得这件事需要团队：交给团队%s。做完会把结果写在这里。" % (name, "一起做（自动分工）" if how == "自动分工" else "会审")
+
+    def opened(rid):
+        update(status="running", answer=lead, dispatch={"mode": "council" if how == "会审" else "run", "goal": goal, "run": rid})
+    eprint("[hub] %s 派活：%s" % (name, how))
+    err = None
+    try:
+        if how == "会审":
+            run_council(cfg, goal, cwd, synthesizer=pick_ok(cfg, cfg["synthesizer"])[0], on_open=opened, parent_call=cid_box[0])
+        else:
+            planner, n1 = pick_ok(cfg, cfg["planner"])
+            synth, n2 = pick_ok(cfg, cfg["synthesizer"])
+            for n in (n1, n2):
+                if n:
+                    eprint("[hub] " + n)
+            run_goal(cfg, goal, cwd, write, planner, synth, cfg["max_parallel"], 6, False,
+                     on_open=opened, parent_call=cid_box[0])
+    except BackendError as e:
+        err = str(e)
+        eprint("[hub] 失败：%s" % err)
+    rec = read_json(cpath) or {}
+    rid = (rec.get("dispatch") or {}).get("run")
+    run = (read_json(os.path.join(RUNS_DIR, str(rid), "run.json")) or {}) if rid else {}
+    ok = run.get("status") == "done" and not err  # 以项目组的最终状态为准，对话和项目组不会一个绿一个红
+    final = run.get("final") or ""
+    answer = lead + "\n\n---\n\n" + (final or "（团队没有交回结果：%s）" % (err or run.get("error") or "未知原因"))
+    update(status="ok" if ok else "fail", end=time.time(), answer=answer,
+           error=None if ok else (err or run.get("error") or "团队没有全部完成"))
+    print(answer)
+    return 0 if ok else 1
+
+
+# ---------------------------------------------------------------- 面板（本地网页）
+
+HEALTH_PATH = os.path.join(HUB_HOME, "health.json")
+UI_PID = os.path.join(HUB_HOME, "ui.pid")
+STOP_MSG = "已手动停止"
+DEAD_MSG = "已中断（进程不在了）"
+
+
+def pid_alive(pid):
+    try:
+        if int(pid) <= 1:
+            return False
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def load_calls(limit=400):
+    try:
+        names = [n for n in os.listdir(CALLS_DIR) if n.endswith(".json")]
+    except OSError:
+        return []
+    paths = [os.path.join(CALLS_DIR, n) for n in names]
+    paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+    out = []
+    for p in paths[:limit]:
+        c = read_json(p)
+        if not isinstance(c, dict) or "id" not in c:
+            continue
+        if c.get("status") == "running" and not pid_alive(c.get("pid")):
+            c.update(status="fail", error=DEAD_MSG, end=c.get("end") or os.path.getmtime(p))
+            write_json(p, c)  # 落盘，免得日后 PID 被别的进程复用时“复活”
+        out.append(c)
+    out.sort(key=lambda c: c.get("start") or 0, reverse=True)
+    return out
+
+
+def load_runs(limit=40):
+    try:
+        ids = sorted(os.listdir(RUNS_DIR), reverse=True)
+    except OSError:
+        return []
+    out = []
+    for rid in ids:
+        r = read_json(os.path.join(RUNS_DIR, rid, "run.json"))
+        if not isinstance(r, dict):
+            continue
+        if r.get("status") in ("planning", "running", "synthesizing") and not pid_alive(r.get("pid")):
+            r.update(status="failed", error=r.get("error") or DEAD_MSG, end=r.get("end") or r.get("start"))
+            for t in r.get("tasks") or []:
+                if t.get("status") in ("pending", "running"):
+                    t["status"] = "fail" if t["status"] == "running" else "skipped"
+            write_json(os.path.join(RUNS_DIR, rid, "run.json"), r)
+            write_board_md(os.path.join(RUNS_DIR, rid), r)
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _preview(s, n=200):
+    return (s or "").strip()[:n]
+
+
+def check_specs(cfg, names=None):
+    """对每个后端做一次真实的小调用。返回 {后端: {ok, msg}}。"""
+    names = names or list(cfg["agents"])
+
+    def check(spec):
+        kind, _, mdl = spec.partition(":")
+        t0 = time.time()
+        if kind not in BACKENDS:
+            return spec, {"ok": False, "msg": "未知后端"}
+        try:
+            BACKENDS[kind](cfg, mdl, "只回复两个字：收到", tempfile.gettempdir(), False, 120)
+            return spec, {"ok": True, "msg": "%.0fs" % (time.time() - t0)}
+        except BackendError as e:
+            return spec, {"ok": False, "msg": str(e).replace("\n", " ")[:160]}
+
+    specs = []
+    for n in names:
+        for sp in cfg["agents"][n]:
+            if sp not in specs:
+                specs.append(sp)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        return dict(pool.map(check, specs))
+
+
+def call_preferred(c):
+    """旧记录从失败尝试恢复当时的首选，不能拿今天的设置判断历史。"""
+    attempts = c.get("attempts") or []
+    return c.get("preferred_backend") or (attempts[0].get("backend") if attempts else c.get("backend"))
+
+
+def ui_state(cfg):
+    calls, runs = load_calls(), load_runs()
+    now = time.time()
+    lt = time.localtime(now)
+    midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    agents = []
+    qd = read_json(QUOTA_PATH) or {}
+    quota = qd.get("agents") or {}
+    if now - (qd.get("ts") or 0) > 300:
+        refresh_quota()
+    for name, chain in cfg["agents"].items():
+        mine = [c for c in calls if c.get("agent") == name]
+        cur = [c for c in mine if c.get("status") == "running"]
+        today = [c for c in mine if (c.get("start") or 0) >= midnight]
+        last = mine[0] if mine else None
+        agents.append({
+            "name": name, "profile": cfg["profiles"].get(name, ""), "chain": chain,
+            "busy": len(cur),
+            "current": [{"id": c["id"], "run": c.get("run"), "start": c.get("start"),
+                         "title": c.get("title") or _preview(c.get("display") or c.get("prompt"), 40)} for c in cur],
+            "calls_total": len(mine),
+            "fails_total": sum(1 for c in mine if c.get("status") == "fail"),
+            "calls_5h": sum(1 for c in mine if (c.get("start") or 0) >= now - 5 * 3600),
+            "calls_today": len(today),
+            "secs_today": round(sum(c.get("secs") or 0 for c in today)),
+            "fallback_today": sum(1 for c in today if c.get("status") == "ok" and c.get("backend") != call_preferred(c)),
+            "tokens_today": sum(((c.get("tokens") or {}).get("in") or 0) + ((c.get("tokens") or {}).get("out") or 0)
+                                for c in today),
+            "quota": quota.get(name),
+            "last_error": (last.get("error") or "")[:300] if last and last.get("status") == "fail" and last.get("error") != STOP_MSG else None,
+        })
+    lite_calls = []
+    for c in calls[:200]:
+        d = {k: c.get(k) for k in ("id", "parent", "run", "task", "kind", "title", "agent", "backend", "status",
+                                   "start", "end", "secs", "write", "cwd", "error", "follows", "display", "submission_id",
+                                   "chat", "dispatch")}
+        d["preferred_backend"] = call_preferred(c)
+        d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
+        d["answer_preview"] = _preview(c.get("answer"))
+        d["has_image"] = bool(c.get("image") and os.path.isfile(c["image"]))
+        d["live"] = live_len(c["id"]) if c.get("status") == "running" else 0
+        lite_calls.append(d)
+    lite_runs = []
+    for r in runs:
+        d = {k: r.get(k) for k in ("id", "goal", "status", "summary", "start", "end", "cwd", "planner",
+                                   "synthesizer", "error", "write", "follows", "display", "submission_id",
+                                   "participants", "skipped", "timeout_warning", "parent_call", "pressure")}
+        d["mode"] = r.get("mode") or "run"  # 旧记录没有 mode，都是自动分工
+        d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min",
+                                             "progress", "leftover", "skip_reason", "started",
+                                             "backend", "preferred_backend", "secs", "call_id")} for t in (r.get("tasks") or [])]
+        for t in d["tasks"]:
+            if not t.get("preferred_backend") and t.get("call_id"):
+                t["preferred_backend"] = call_preferred(read_json(os.path.join(
+                    CALLS_DIR, t["call_id"] + ".json")) or {})
+        lite_runs.append(d)
+    health = read_json(HEALTH_PATH) or {}
+    return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls,
+            "health": {"ts": health.get("ts"), "results": health.get("results") or {},
+                       "running": bool(_health_running.is_set())},
+            "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout")},
+                           council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
+                           council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
+                           quota_guard=quota_guard_on(), pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1]),
+            "workspace": UI_WORKSPACE, "backends": backend_choices(cfg),
+            "ui_version": int(os.path.getmtime(UI_HTML)) if os.path.exists(UI_HTML) else 0}
+
+
+MODELS_PATH = os.path.join(HUB_HOME, "models.json")
+_models_running = threading.Event()
+
+
+def refresh_models():
+    """从 Antigravity 取可用的 Gemini 模型清单（只留 Gemini，按用户要求不用它里面的 Claude/GPT）。"""
+    if _models_running.is_set():
+        return
+    _models_running.set()
+
+    def work():
+        try:
+            exe = find_bin(load_config(), "agy")
+            if not exe:
+                return
+            rc, out, err = _run([exe, "models"], tempfile.gettempdir(), clean_env(), 60)
+            ids = []
+            for line in out.splitlines():
+                p = line.split("\t")
+                if len(p) >= 2 and p[0].strip().startswith("gemini"):
+                    ids.append({"id": p[0].strip(), "name": p[1].strip()})
+            if ids:
+                write_json(MODELS_PATH, {"ts": time.time(), "agy": ids})
+        except BackendError:
+            pass
+        finally:
+            _models_running.clear()
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def codex_defaults():
+    """读 Codex 自己配置里的默认模型和思考强度。"""
+    model = effort = ""
+    try:
+        with open(os.path.join(HOME, ".codex", "config.toml"), encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("["):
+                    break
+                m = re.match(r'^\s*(model|model_reasoning_effort)\s*=\s*"([^"]*)"', line)
+                if m and m.group(1) == "model":
+                    model = m.group(2)
+                elif m:
+                    effort = m.group(2)
+    except OSError:
+        pass
+    return model, effort
+
+
+def backend_choices(cfg):
+    """面板里可选的后端：[{spec, label}]。"""
+    d = read_json(MODELS_PATH) or {}
+    if time.time() - (d.get("ts") or 0) > 86400:
+        refresh_models()
+    out = [{"spec": "agy:" + m["id"], "label": m.get("name") or m["id"]} for m in d.get("agy") or []]
+    cdef, ceff = codex_defaults()
+    out.append({"spec": "codex", "label": "GPT · 跟随 Codex 设置" + ("（现为 %s）" % cdef if cdef else "")})
+    cm = read_json(os.path.join(HOME, ".codex", "models_cache.json")) or {}
+    for m in cm.get("models") or []:
+        if isinstance(m, dict) and m.get("slug") and m.get("visibility") == "list":
+            out.append({"spec": "codex:" + m["slug"], "label": m.get("display_name") or m["slug"]})
+    out += [
+            {"spec": "dsh", "label": "DeepSeek（dsh）"},
+            {"spec": "claude:opus", "label": "Claude Opus（需登录）"},
+            {"spec": "claude:sonnet", "label": "Claude Sonnet（需登录）"},
+            {"spec": "claude:haiku", "label": "Claude Haiku（需登录）"}]
+    known = set(o["spec"] for o in out)
+    for chain in cfg["agents"].values():
+        for sp in chain:
+            if sp not in known:
+                known.add(sp)
+                out.append({"spec": sp, "label": sp})
+    return out
+
+
+_health_running = threading.Event()
+_quota_running = threading.Event()
+
+
+def refresh_quota():
+    if _quota_running.is_set():
+        return
+    _quota_running.set()
+
+    def work():
+        try:
+            fetch_quota(load_config())
+        finally:
+            _quota_running.clear()
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+
+def run_health():
+    if _health_running.is_set():
+        return
+    _health_running.set()
+
+    def work():
+        try:
+            write_json(HEALTH_PATH, {"ts": time.time(), "results": check_specs(load_config())})
+        finally:
+            _health_running.clear()
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def read_live(cid):
+    d = read_json(os.path.join(CALLS_DIR, "%s.live" % cid)) if cid else None
+    return d if isinstance(d, dict) else None
+
+
+def live_len(cid):
+    try:
+        st = os.stat(os.path.join(CALLS_DIR, "%s.live" % cid))
+        return "%s:%s" % (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return 0
+
+
+def ui_call(cid):
+    if not isinstance(cid, str) or not re.fullmatch(r"c_[0-9a-f]+", cid):
+        return None
+    c = read_json(os.path.join(CALLS_DIR, cid + ".json"))
+    if not isinstance(c, dict):
+        return None
+    if c.get("status") == "running" and not pid_alive(c.get("pid")):
+        c.update(status="fail", error=DEAD_MSG)
+    c["has_image"] = bool(c.get("image") and os.path.isfile(c["image"]))
+    if c.get("status") == "running":
+        c["live"] = read_live(cid)
+    return c
+
+
+def ui_run(rid):
+    if not isinstance(rid, str) or not re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", rid):
+        return None
+    for r in load_runs(limit=10 ** 6):
+        if r.get("id") == rid:
+            for t in r.get("tasks") or []:
+                if t.get("status") == "running":
+                    t["live"] = read_live(t.get("call_id"))
+                elif t.get("call_id"):
+                    t["session"] = (read_json(os.path.join(CALLS_DIR, "%s.json" % t["call_id"])) or {}).get("session")
+            for c in load_calls():
+                if c.get("run") == rid and c.get("kind") in ("plan", "synth"):
+                    r.setdefault(c["kind"] + "_calls", []).append(
+                        {k: c.get(k) for k in ("id", "agent", "backend", "status", "secs", "start", "attempts")})
+            return r
+    return None
+
+
+def ui_record(kind, rid):
+    return ui_run(rid) if kind == "run" else ui_call(rid) if kind == "call" else None
+
+
+def follow_context(kind, rid):
+    """保留最近多轮问答，按时间顺序提供；旧记录无需迁移。"""
+    turns, seen = [], set()
+    for _ in range(8):
+        if kind == "run" and isinstance(rid, str) and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", rid):
+            pc = (read_json(os.path.join(RUNS_DIR, rid, "run.json")) or {}).get("parent_call")
+            if pc:  # 对接人派出的项目组：上文是派它的那一轮对话（对话里已含项目组结果）
+                kind, rid = "call", pc
+        if (kind, rid) in seen:
+            break
+        seen.add((kind, rid))
+        r = ui_record(kind, rid)
+        if not r:
+            break
+        q = r.get("display") or r.get("goal") or r.get("prompt") or ""
+        a = r.get("final") or r.get("answer") or ""
+        if not a and kind == "run":
+            a = "\n\n".join("【%s】%s" % (t.get("title"), t.get("answer") or "") for t in r.get("tasks") or [])
+        turns.append("【用户当时的要求】\n%s\n\n【当时得到的结果】\n%s" % (q[:6000], a[:12000]))
+        follows = r.get("follows") or {}
+        kind, rid = follows.get("type"), follows.get("id")
+        if not rid:
+            break
+    if not turns:
+        return ""
+    return ("===== 之前的对话（背景）=====\n" + "\n\n".join(reversed(turns)) +
+            "\n\n===== 用户现在的追问 =====\n")
+
+
+def stop_record(kind, rid):
+    r = ui_record(kind, rid)
+    if not r:
+        return "没有这条记录"
+    pid = r.get("pid")
+    if r.get("status") not in ("running", "planning", "synthesizing") or not pid_alive(pid):
+        return "它已经不在运行了"
+    if int(pid) == os.getpid():
+        return "不能停止面板自己"
+    try:
+        cmdline = subprocess.check_output(["ps", "-o", "command=", "-p", str(pid)], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        cmdline = ""
+    if not re.search(r"(^|/)hub (run|ask|image|council|chat)\b", cmdline):
+        return "进程对不上，为安全起见没有停止"
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+    except OSError as e:
+        return "停止失败：%s" % e
+    for _ in range(50):
+        if not pid_alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        try:
+            os.kill(int(pid), signal.SIGKILL)
+        except OSError:
+            pass
+        time.sleep(0.3)
+    now = time.time()
+    if kind == "run":
+        p = os.path.join(RUNS_DIR, rid, "run.json")
+        d = read_json(p)
+        if d:
+            for t in d.get("tasks") or []:
+                if t.get("status") in ("pending", "running"):
+                    t["status"] = "fail" if t["status"] == "running" else "skipped"
+            d.update(status="failed", error=STOP_MSG, end=now)
+            write_json(p, d)
+            write_board_md(os.path.join(RUNS_DIR, rid), d)
+    else:  # 停止对话时，它派出的项目组（同一个进程）也标成「已停止」
+        try:
+            names = os.listdir(RUNS_DIR)
+        except OSError:
+            names = []
+        for name in names:
+            p = os.path.join(RUNS_DIR, name, "run.json")
+            d = read_json(p)
+            if (isinstance(d, dict) and d.get("pid") == pid
+                    and (d.get("status") in ("planning", "running", "synthesizing") or d.get("error") == DEAD_MSG)):
+                for t in d.get("tasks") or []:
+                    if t.get("status") in ("pending", "running"):
+                        t["status"] = "fail" if t["status"] == "running" else "skipped"
+                d.update(status="failed", error=STOP_MSG, end=now)
+                write_json(p, d)
+                write_board_md(os.path.join(RUNS_DIR, name), d)
+    for c in load_calls():
+        if c.get("pid") == pid and c.get("status") == "fail" and c.get("error") == DEAD_MSG:
+            d = read_json(os.path.join(CALLS_DIR, c["id"] + ".json"))
+            if d and d.get("status") == "fail" and d.get("error") == DEAD_MSG:
+                d.update(status="fail", error=STOP_MSG, end=now, secs=round(now - (d.get("start") or now), 1))
+                write_json(os.path.join(CALLS_DIR, c["id"] + ".json"), d)
+    return None
+
+
+def open_login(cfg, kind):
+    """打开一个终端窗口，进入对应命令行的登录流程。"""
+    if kind == "dsh":
+        if subprocess.call(["open", "-a", "DeepSeek Harness"]) != 0:
+            raise ValueError("无法打开 DeepSeek Harness")
+        return
+    exe = find_bin(cfg, kind)
+    if not exe:
+        raise ValueError("找不到 %s 的命令行程序" % kind)
+    tail = {"claude": " /login", "codex": " login", "agy": ""}.get(kind)
+    if tail is None:
+        raise ValueError("不知道怎么登录 %s" % kind)
+    os.makedirs(UI_WORKSPACE, exist_ok=True)
+    tips = {"claude": "前几步是首次设置：选配色按回车；问是否信任文件夹（只是 Hub 自己的空工作目录）选 Yes。然后选择用 Claude 订阅账号登录，浏览器里点同意后回到这里。"
+                      "登录成功后输入 /exit 退出，再回 Hub 点「检查全部」。"
+                      "如果显示 Unable to connect：多半是代理线路的问题，先关掉代理软件（或换一个节点）再点一次「去登录」。",
+            "codex": "浏览器里登录 ChatGPT 账号并同意。完成后可以关掉这个窗口，再回 Hub 点「检查全部」。",
+            "agy": "按提示选择 Google 账号登录。登录成功后输入 /exit 或按两次 Ctrl+C 退出，再回 Hub 点「检查全部」。"}[kind]
+    path = os.path.join(HUB_HOME, "login-%s.command" % kind)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\nclear\necho %s\necho\ncd %s\nexec %s%s\n" % (shq("【Hub】" + tips), shq(UI_WORKSPACE), shq(exe), tail))
+    os.chmod(path, 0o755)
+    if subprocess.call(["open", path]) != 0:
+        raise ValueError("无法打开登录窗口")
+
+
+def port_open(port):
+    import socket
+    sk = socket.socket()
+    sk.settimeout(0.5)
+    try:
+        return sk.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        sk.close()
+
+
+NATIVE_APP = os.path.join(HOME, "Applications", "Hub.app")
+
+
+def panel_app():
+    for app in ("Google Chrome", "Microsoft Edge"):
+        if os.path.isdir("/Applications/%s.app" % app):
+            return app
+    return None
+
+
+def open_windows(port):
+    """面板页面每隔一两秒会来取一次数据，据此判断是否已经有窗口开着。"""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/clients" % port, timeout=3) as r:
+            return int(json.loads(r.read().decode("utf-8")).get("n") or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def open_panel(url, browser=False):
+    app = None if browser else panel_app()
+    if app:  # 优先开成独立窗口，像一个单独的程序
+        subprocess.call(["open", "-na", app, "--args", "--app=" + url])
+    else:
+        subprocess.call(["open", url])
+
+
+def cmd_ui(cfg, args):
+    url = "http://127.0.0.1:%d/" % args.port
+    me = os.path.abspath(sys.argv[0])
+    if args.stop:
+        pid = (read_json(UI_PID) or {}).get("pid")
+        try:
+            cmdline = subprocess.check_output(["ps", "-o", "command=", "-p", str(pid)], text=True) if pid else ""
+        except (OSError, subprocess.CalledProcessError):
+            cmdline = ""
+        if pid and pid_alive(pid) and "ui --serve" in cmdline:
+            os.kill(int(pid), signal.SIGTERM)
+            eprint("[hub] 面板服务已停止。")
+        else:
+            eprint("[hub] 面板服务没有在运行。")
+        return 0
+    if not args.serve:
+        if not port_open(args.port):
+            logf = open(os.path.join(HUB_HOME, "ui-server.log"), "a", encoding="utf-8")
+            env = {k: v for k, v in os.environ.items() if not k.startswith("HUB_") or k == "HUB_HOME"}
+            subprocess.Popen([sys.executable, me, "ui", "--serve", "--port", str(args.port)],
+                             stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, env=env,
+                             cwd=HOME, start_new_session=True)
+            for _ in range(50):
+                if port_open(args.port):
+                    break
+                time.sleep(0.1)
+            else:
+                eprint("[hub] 面板服务没能启动，详见 %s" % os.path.join(HUB_HOME, "ui-server.log"))
+                return 1
+        if args.no_window:
+            return 0
+        if not args.browser and os.path.isdir(NATIVE_APP) and args.port == 8765:  # 有独立应用就用它（自带程序坞图标）
+            subprocess.call(["open", "-a", NATIVE_APP])
+            return 0
+        if open_windows(args.port) > 0:  # 已经有窗口了：只把它调到前面，不再新开
+            eprint("[hub] 面板窗口已经开着，已切到前台：%s" % url)
+            app = None if args.browser else panel_app()
+            if app:
+                subprocess.call(["open", "-a", app])
+            return 0
+        eprint("[hub] 面板：%s （在后台运行；停止用 hub ui --stop）" % url)
+        open_panel(url, args.browser)
+        return 0
+    return serve_ui(args.port, me)
+
+
+# ---------------------------------------------------------------- 手机（局域网）访问
+
+PAIR_PATH = os.path.join(HUB_HOME, "pair.json")
+PAIR_COOKIE = "hub_phone"
+PRIVATE_NETS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+
+
+def ip_kind(ip):
+    """'local'（本机）/ 'private'（家里或公司的局域网）/ 'other'（其它，一律拒绝）。"""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address((ip or "").split("%")[0])
+    except ValueError:
+        return "other"
+    if getattr(a, "ipv4_mapped", None):
+        a = a.ipv4_mapped
+    if a.is_loopback:
+        return "local"
+    if a.version == 4 and any(a in ipaddress.ip_network(n) for n in PRIVATE_NETS):
+        return "private"
+    return "other"
+
+
+_pair_lock = threading.RLock()
+
+
+def pair_load(create=True):
+    with _pair_lock:
+        d = read_json(PAIR_PATH)
+        if isinstance(d, dict) and isinstance(d.get("code"), str) and len(d["code"]) >= 20:
+            return d
+        return pair_reset() if create else None
+
+
+def pair_reset():
+    import secrets
+    with _pair_lock:
+        return _pair_write({"code": secrets.token_urlsafe(18), "created": time.time()})
+
+
+def _pair_write(d):
+    os.makedirs(HUB_HOME, exist_ok=True)
+    tmp = "%s.%d.%d.tmp" % (PAIR_PATH, os.getpid(), threading.get_ident())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
+        json.dump(d, f)
+    os.replace(tmp, PAIR_PATH)
+    return d
+
+
+def pair_cookie_value(code):
+    """手机配对后拿到的通行证：由配对码算出，重置配对码后旧手机全部失效。"""
+    import hashlib
+    import hmac
+    return hmac.new(code.encode("utf-8"), b"hub-phone-session-v1", hashlib.sha256).hexdigest()
+
+
+def cookie_ok(header):
+    """手动按 ; 拆 Cookie：同一 IP 别的端口种下的怪 Cookie 不会挡住它；同名的只要有一个对就行。"""
+    import hmac
+    d = pair_load(create=False)
+    if not d or not header:
+        return False
+    want = pair_cookie_value(d["code"]).encode()
+    ok = False
+    for part in header.split(";"):
+        k, sep, v = part.strip().partition("=")
+        if sep and k.strip() == PAIR_COOKIE:
+            ok = hmac.compare_digest(v.strip().strip('"').encode("utf-8", "replace"), want) or ok
+    return ok
+
+
+def lan_ips():
+    import socket
+    ips = []
+    for probe in ("192.168.255.255", "10.255.255.255", "172.31.255.255"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((probe, 9))  # UDP connect 不发任何数据，只用来问系统走哪个网卡
+            ip = s.getsockname()[0]
+            if ip_kind(ip) == "private" and ip not in ips:
+                ips.append(ip)
+        except OSError:
+            pass
+        finally:
+            s.close()
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip_kind(ip) == "private" and ip not in ips:
+                ips.append(ip)
+    except OSError:
+        pass
+    return ips
+
+
+class PairLimiter(object):
+    """配对码输错限速：同一来源 10 分钟最多错 5 次，所有来源合计最多错 30 次。"""
+
+    def __init__(self, per_ip=5, total=30, window=600):
+        self.per_ip, self.total, self.window = per_ip, total, window
+        self.fails, self.lock = {}, threading.Lock()
+
+    def _trim(self, now):
+        for k in list(self.fails):
+            self.fails[k] = [t for t in self.fails[k] if now - t < self.window]
+            if not self.fails[k]:
+                del self.fails[k]
+
+    def blocked(self, ip, now=None):
+        now = now or time.time()
+        with self.lock:
+            self._trim(now)
+            return len(self.fails.get(ip, [])) >= self.per_ip or sum(map(len, self.fails.values())) >= self.total
+
+    def fail(self, ip, now=None):
+        with self.lock:
+            self.fails.setdefault(ip, []).append(now or time.time())
+
+    def attempt(self, ip, check, now=None):
+        """检查是否锁定、核对、记失败，三步在同一把锁里做，并发猛试也绕不过次数上限。
+        返回 'blocked' / 'ok' / 'bad'。"""
+        now = now or time.time()
+        with self.lock:
+            self._trim(now)
+            if len(self.fails.get(ip, [])) >= self.per_ip or sum(map(len, self.fails.values())) >= self.total:
+                return "blocked"
+            if check():
+                return "ok"
+            self.fails.setdefault(ip, []).append(now)
+            return "bad"
+
+    def clear(self):
+        with self.lock:
+            self.fails.clear()
+
+
+REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
+
+
+def gate(ip, host, sock_ip, port, path, cookie, lan_on):
+    """每个请求先过这道门。返回 None 表示放行，否则返回 (状态码, 原因)。"""
+    kind = ip_kind(ip)
+    local_hosts = ("127.0.0.1:%d" % port, "localhost:%d" % port)
+    lan_host = "%s:%d" % (sock_ip, port) if lan_on and ip_kind(sock_ip) == "private" else None
+    if host not in local_hosts and host != lan_host:  # 防 DNS 重绑定：只认本机和本机局域网地址
+        return 403, "地址不对"
+    if kind == "local":
+        return None
+    if not lan_on or kind != "private":
+        return 403, "只接受同一局域网里的设备"
+    if path == "/pair":
+        return None
+    if not cookie_ok(cookie):
+        return 401, "这台设备还没配对"
+    return None
+
+
+PHONE_PAGE = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#1d1c19">
+<title>Hub · 配对</title><style>body{font:16px -apple-system,system-ui,sans-serif;max-width:420px;margin:12vh auto;padding:0 20px;color:#1d1c19;background:#f3f1ea}
+input,button{font-size:17px;padding:12px;border-radius:10px;border:1px solid #ccc;width:100%%;box-sizing:border-box;margin-top:10px}
+button{background:#1d1c19;color:#fff;border:0}p{line-height:1.7;color:#555}</style></head><body>
+<h2>%s</h2><p>%s</p>
+<form method="get" action="/pair"><input name="code" placeholder="配对码" autocomplete="off" autocapitalize="off" spellcheck="false">
+<button>配对</button></form></body></html>"""
+
+
+def phone_page(title, msg):
+    import html as _html
+    return (PHONE_PAGE % (_html.escape(title), _html.escape(msg))).encode("utf-8")
+
+
+# ---- 二维码（QR Code Model 2，字节模式，纠错等级 M）：纯标准库，给手机扫码配对用。
+# 初稿由 Gemini 写成，Claude 用 macOS 自带识别器验证了版本 1～10 的多种长度。
+
+# GF(256) 指数表与对数表（本原多项式 x^8 + x^4 + x^3 + x^2 + 1 = 0x11D）
+_qr_EXP = [0] * 512
+_qr_LOG = [0] * 256
+_qr_x = 1
+for _qr_i in range(255):
+    _qr_EXP[_qr_i] = _qr_EXP[_qr_i + 255] = _qr_x
+    _qr_LOG[_qr_x] = _qr_i
+    _qr_x = (_qr_x << 1) ^ (0x11D if _qr_x & 0x80 else 0)
+
+# 版本 1～15 纠错等级 M 参数表：(总码字数, RS 总块数, 每块纠错码字数)
+_qr_VERSION_M = [
+    (26, 1, 10),   (44, 1, 16),   (70, 1, 26),   (100, 2, 18),  (134, 2, 24),
+    (172, 4, 16),  (196, 4, 18),  (242, 4, 22),  (292, 5, 22),  (346, 5, 26),
+    (404, 5, 30),  (466, 8, 22),  (532, 9, 22),  (581, 9, 24),  (655, 10, 24),
+]
+
+_qr_MASK_FUNCS = (
+    lambda r, c: (r + c) % 2 == 0,
+    lambda r, c: r % 2 == 0,
+    lambda r, c: c % 3 == 0,
+    lambda r, c: (r + c) % 3 == 0,
+    lambda r, c: (r // 2 + c // 3) % 2 == 0,
+    lambda r, c: (r * c) % 2 + (r * c) % 3 == 0,
+    lambda r, c: ((r * c) % 2 + (r * c) % 3) % 2 == 0,
+    lambda r, c: ((r + c) % 2 + (r * c) % 3) % 2 == 0,
+)
+
+_qr_FINDER_PAT_1 = [True, False, True, True, True, False, True, False, False, False, False]
+_qr_FINDER_PAT_2 = [False, False, False, False, True, False, True, True, True, False, True]
+
+
+def _qr_gf_mul(a: int, b: int) -> int:
+    return _qr_EXP[_qr_LOG[a] + _qr_LOG[b]] if a and b else 0
+
+
+def _qr_rs_generator_poly(nsym: int) -> list[int]:
+    g = [1]
+    for i in range(nsym):
+        nxt = [0] * (len(g) + 1)
+        for j, c in enumerate(g):
+            nxt[j] ^= c
+            nxt[j + 1] ^= _qr_gf_mul(c, _qr_EXP[i])
+        g = nxt
+    return g
+
+
+def _qr_rs_encode(data: list[int], nsym: int) -> list[int]:
+    gen = _qr_rs_generator_poly(nsym)
+    res = list(data) + [0] * nsym
+    for i in range(len(data)):
+        coef = res[i]
+        if coef:
+            for j in range(1, nsym + 1):
+                res[i + j] ^= _qr_gf_mul(gen[j], coef)
+    return res[len(data):]
+
+
+def _qr_format_bits(ec_bits: int, mask: int) -> int:
+    d = (ec_bits << 3) | mask
+    rem = d << 10
+    for i in range(14, 9, -1):
+        if (rem >> i) & 1:
+            rem ^= 0x537 << (i - 10)
+    return ((d << 10) | rem) ^ 0x5412
+
+
+def _qr_version_bits(ver: int) -> int:
+    rem = ver << 12
+    for i in range(17, 11, -1):
+        if (rem >> i) & 1:
+            rem ^= 0x1F25 << (i - 12)
+    return (ver << 12) | rem
+
+
+def _qr_alignment_coords(ver: int) -> list[int]:
+    if ver < 2:
+        return []
+    n = 17 + 4 * ver
+    divs = ver // 7 + 1
+    step = ((n - 13 + 2 * divs - 1) // (2 * divs)) * 2
+    return [6] + [n - 7 - i * step for i in range(divs - 1, -1, -1)]
+
+
+def _qr_encode_codewords(payload: bytes) -> tuple[int, list[int]]:
+    for idx, (total_cw, num_blocks, ec_cw) in enumerate(_qr_VERSION_M):
+        ver = idx + 1
+        cc_bits = 8 if ver <= 9 else 16
+        data_cw = total_cw - num_blocks * ec_cw
+        cap_bits = data_cw * 8
+        if 4 + cc_bits + len(payload) * 8 <= cap_bits:
+            break
+    else:
+        raise ValueError(f"UTF-8 数据过长（{len(payload)} 字节），超出版本 1～{len(_qr_VERSION_M)} 容量")
+
+    fields = [(0b0100, 4), (len(payload), cc_bits)] + [(b, 8) for b in payload]
+    bits = [(val >> s) & 1 for val, w in fields for s in range(w - 1, -1, -1)]
+    bits.extend([0] * min(4, cap_bits - len(bits)))
+    bits.extend([0] * ((8 - len(bits) % 8) % 8))
+
+    data = [sum(bits[i + k] << (7 - k) for k in range(8)) for i in range(0, len(bits), 8)]
+    data.extend(0xEC if p % 2 == 0 else 0x11 for p in range(data_cw - len(data)))
+
+    # RS 分块与码字交织（Group 1: g1 块每块 k1 字节；Group 2: g2 块每块 k1+1 字节）
+    k1, g2 = divmod(data_cw, num_blocks)
+    g1 = num_blocks - g2
+    data_blocks, ec_blocks, pos = [], [], 0
+    for b in range(num_blocks):
+        blk = data[pos : pos + k1 + (b >= g1)]
+        pos += len(blk)
+        data_blocks.append(blk)
+        ec_blocks.append(_qr_rs_encode(blk, ec_cw))
+
+    out = [blk[c] for c in range(k1 + (g2 > 0)) for blk in data_blocks if c < len(blk)]
+    out.extend(ec[c] for c in range(ec_cw) for ec in ec_blocks)
+    return ver, out
+
+
+def _qr_place_format(grid: list[list[bool]], is_func: list[list[bool]], fmt: int) -> None:
+    n = len(grid)
+    pos1 = [
+        (0, 8), (1, 8), (2, 8), (3, 8), (4, 8), (5, 8), (7, 8), (8, 8),
+        (8, 7), (8, 5), (8, 4), (8, 3), (8, 2), (8, 1), (8, 0),
+    ]
+    pos2 = [(8, n - 1 - i) for i in range(8)] + [(n - 15 + i, 8) for i in range(8, 15)]
+    for i in range(15):
+        bit = bool((fmt >> i) & 1)
+        (r1, c1), (r2, c2) = pos1[i], pos2[i]
+        grid[r1][c1] = grid[r2][c2] = bit
+        is_func[r1][c1] = is_func[r2][c2] = True
+
+
+def _qr_penalty(grid: list[list[bool]]) -> int:
+    n = len(grid)
+    score = 0
+    for line in list(grid) + [[grid[r][c] for r in range(n)] for c in range(n)]:
+        run = 1
+        for i in range(1, n):
+            if line[i] == line[i - 1]:
+                run += 1
+            else:
+                score += run - 2 if run >= 5 else 0
+                run = 1
+        score += run - 2 if run >= 5 else 0
+        for i in range(n - 10):
+            seg = line[i : i + 11]
+            if seg == _qr_FINDER_PAT_1 or seg == _qr_FINDER_PAT_2:
+                score += 40
+
+    for r in range(n - 1):
+        r0, r1 = grid[r], grid[r + 1]
+        for c in range(n - 1):
+            if r0[c] == r0[c + 1] == r1[c] == r1[c + 1]:
+                score += 3
+
+    dark = sum(sum(row) for row in grid)
+    total = n * n
+    return score + (abs(dark * 20 - total * 10) // total) * 10
+
+
+def qr_matrix(text: str) -> list[list[bool]]:
+    """生成不含静区的 QR Code Model 2 布尔矩阵（True 为黑块）。"""
+    ver, codewords = _qr_encode_codewords(text.encode("utf-8"))
+    n = 17 + 4 * ver
+    grid = [[False] * n for _ in range(n)]
+    is_func = [[False] * n for _ in range(n)]
+
+    # 定位图案（7x7）与白色分隔符（外扩 1 格）
+    for cr, cc in ((3, 3), (3, n - 4), (n - 4, 3)):
+        for dr in range(-4, 5):
+            for dc in range(-4, 5):
+                r, c = cr + dr, cc + dc
+                if 0 <= r < n and 0 <= c < n:
+                    is_func[r][c] = True
+                    grid[r][c] = max(abs(dr), abs(dc)) in (0, 1, 3)
+
+    # 校正图案（版本 >= 2，避开三个定位角）
+    coords = _qr_alignment_coords(ver)
+    for cr in coords:
+        for cc in coords:
+            if (cr, cc) not in ((6, 6), (6, n - 7), (n - 7, 6)):
+                for dr in range(-2, 3):
+                    for dc in range(-2, 3):
+                        is_func[cr + dr][cc + dc] = True
+                        grid[cr + dr][cc + dc] = max(abs(dr), abs(dc)) in (0, 2)
+
+    # 定时图案、暗模块、格式预留位、版本信息（版本 >= 7）
+    for i in range(8, n - 8):
+        for r, c in ((6, i), (i, 6)):
+            if not is_func[r][c]:
+                is_func[r][c] = True
+                grid[r][c] = i % 2 == 0
+    is_func[n - 8][8] = grid[n - 8][8] = True
+    _qr_place_format(grid, is_func, 0)
+    if ver >= 7:
+        vbits = _qr_version_bits(ver)
+        for i in range(18):
+            bit = bool((vbits >> i) & 1)
+            r, c = n - 11 + i % 3, i // 3
+            grid[r][c] = grid[c][r] = bit
+            is_func[r][c] = is_func[c][r] = True
+
+    # 之字形填入数据与纠错比特，剩余位补 0
+    bit_stream = [bool((b >> s) & 1) for b in codewords for s in range(7, -1, -1)]
+    idx, col, up = 0, n - 1, True
+    while col > 0:
+        col -= 1 if col == 6 else 0
+        for r in (range(n - 1, -1, -1) if up else range(n)):
+            for c in (col, col - 1):
+                if not is_func[r][c]:
+                    grid[r][c] = bit_stream[idx] if idx < len(bit_stream) else False
+                    idx += 1
+        col, up = col - 2, not up
+
+    # 遍历 8 种掩码（M 级指示符为 0b00），按 4 条惩罚规则选最低分
+    best_grid, best_score = [], 1 << 30
+    for mask_id, fn in enumerate(_qr_MASK_FUNCS):
+        cand = [
+            [grid[r][c] ^ fn(r, c) if not is_func[r][c] else grid[r][c] for c in range(n)]
+            for r in range(n)
+        ]
+        _qr_place_format(cand, is_func, _qr_format_bits(0b00, mask_id))
+        sc = _qr_penalty(cand)
+        if sc < best_score:
+            best_score, best_grid = sc, cand
+    return best_grid
+
+
+def qr_svg(text: str, scale: int = 6, border: int = 4) -> str:
+    """生成完整 SVG 字符串（白底黑块，单个 path，默认 4 模块静区）。"""
+    if scale < 1 or border < 0:
+        raise ValueError("scale 须 >= 1 且 border 须 >= 0")
+    mat = qr_matrix(text)
+    full = len(mat) + 2 * border
+    px = full * scale
+    d = "".join(
+        f"M{c + border} {r + border}h1v1h-1z"
+        for r, row in enumerate(mat) for c, v in enumerate(row) if v
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{px}" height="{px}" '
+        f'viewBox="0 0 {full} {full}" shape-rendering="crispEdges">'
+        f'<rect width="{full}" height="{full}" fill="#fff"/>'
+        f'<path d="{d}" fill="#000"/></svg>'
+    )
+
+
+def png_bytes(rows):
+    """rows：每行是 (r, g, b) 元组列表。只用 zlib + struct 写一个 PNG。"""
+    import struct
+    import zlib
+    h, w = len(rows), len(rows[0])
+    raw = b"".join(b"\x00" + bytes(c for px in row for c in px) for row in rows)
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+_icon_cache = []
+
+
+def app_icon_png(size=180):
+    """主屏图标：深色底上四个彩色圆点（四位成员）。"""
+    if _icon_cache:
+        return _icon_cache[0]
+    bg, cols = (29, 28, 25), [(59, 124, 240), (210, 113, 79), (18, 163, 127), (123, 92, 245)]
+    r, centers = size * 0.16, [(size * 0.33, size * 0.33), (size * 0.67, size * 0.33),
+                              (size * 0.33, size * 0.67), (size * 0.67, size * 0.67)]
+    rows = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            px = bg
+            for (cx, cy), c in zip(centers, cols):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
+                    px = c
+            row.append(px)
+        rows.append(row)
+    _icon_cache.append(png_bytes(rows))
+    return _icon_cache[0]
+
+
+def _reexec_ui(port, me):
+    """局域网开关改动后，面板服务换一个监听地址重新启动（进程号不变）。"""
+    os.execv(sys.executable, [sys.executable, me, "ui", "--serve", "--port", str(port)])
+
+
+
+def serve_ui(port, me):
+    import mimetypes
+    import secrets
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlparse
+
+    token = secrets.token_hex(16)
+    os.makedirs(os.path.join(UI_WORKSPACE, "images"), exist_ok=True)
+    lan_on = bool(load_config().get("lan_access"))  # 打开了才监听局域网；否则只有本机能连
+    limiter = PairLimiter()
+    restart = {"on": False}
+    clients = {}  # 页面 id -> 最近一次来取数据的时间
+    clients_lock = threading.Lock()
+
+    def launch(cmd, cwd, text, meta):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HUB_") or k == "HUB_HOME"}
+        env["HUB_META"] = json.dumps(meta, ensure_ascii=False)
+        logf = open(os.path.join(HUB_HOME, "ui-submits.log"), "a", encoding="utf-8")
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=logf, cwd=cwd, env=env,
+                                 start_new_session=True)
+        finally:
+            logf.close()
+        try:
+            p.stdin.write(text.encode("utf-8"))
+        finally:
+            p.stdin.close()
+            threading.Thread(target=p.wait, daemon=True).start()
+
+    def do_submit(body, remote=False):
+        if remote and (body.get("write") or body.get("mode") == "image") and body.get("confirm_write") is not True:
+            raise ValueError("在手机上允许改文件（画图也会存文件），需要再确认一次")
+        if remote:  # 手机上不能指定电脑上的目录，一律用 Hub 自己的工作目录，也不回显电脑上的路径
+            body = dict(body, cwd="")
+        if not isinstance(body.get("text"), str):
+            raise ValueError("内容必须是文字")
+        if "cwd" in body and not isinstance(body["cwd"], str):
+            raise ValueError("工作目录格式不对")
+        if "write" in body and not isinstance(body["write"], bool):
+            raise ValueError("允许改文件必须是开或关")
+        text = body["text"].strip()
+        mode, agent = body.get("mode"), body.get("agent")
+        cwd = os.path.expanduser(str(body.get("cwd") or "").strip()) or UI_WORKSPACE
+        c = load_config()
+        if not text:
+            raise ValueError("内容是空的")
+        if mode not in ("run", "pressure", "ask", "image", "council", "chat"):
+            raise ValueError("方式不对")
+        if mode == "council" and body.get("write"):
+            raise ValueError("会审只读，不能允许改文件")
+        if mode == "ask" and agent not in c["agents"]:
+            raise ValueError("没有这个 agent")
+        if mode == "chat" and agent not in list(c["agents"]) + ["auto"]:
+            raise ValueError("没有这个联络人")
+        if not os.path.isdir(cwd):
+            raise ValueError("工作目录不存在：%s" % (body.get("cwd") or cwd))
+        meta = {"display": text, "submission_id": uuid.uuid4().hex}
+        ctx = body.get("context", {})
+        if not isinstance(ctx, dict):
+            raise ValueError("追问记录格式不对")
+        full = text
+        if ctx:
+            if ctx.get("type") not in ("call", "run") or not isinstance(ctx.get("id"), str):
+                raise ValueError("追问记录格式不对")
+            if ctx["type"] == "run" and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", ctx["id"]):
+                pc = (read_json(os.path.join(RUNS_DIR, ctx["id"], "run.json")) or {}).get("parent_call")
+                if pc:  # 在对接人派出的项目组里接着说，算接着那段对话
+                    ctx = {"type": "call", "id": pc}
+            pre = follow_context(ctx["type"], ctx["id"])
+            if not pre:
+                raise ValueError("找不到要追问的记录")
+            full = pre + text
+            meta["follows"] = {"type": ctx["type"], "id": ctx["id"]}
+        if mode == "image":
+            out = os.path.join(UI_WORKSPACE, "images", "img-%s-%s.png" % (time.strftime("%Y%m%d-%H%M%S"),
+                                                                           uuid.uuid4().hex[:4]))
+            cmd = [sys.executable, me, "image", "-o", out, "-"]
+            cwd = UI_WORKSPACE
+        elif mode == "council":
+            cmd = [sys.executable, me, "council", "-w", cwd]
+            ag, sy = body.get("agents"), body.get("synthesizer")
+            if ag is not None:  # 重新执行时沿用当时的成员和综合者
+                if not isinstance(ag, list) or not ag or not all(isinstance(x, str) and x in c["agents"] for x in ag):
+                    raise ValueError("会审成员不对")
+                cmd += ["--agents", ",".join(ag)]
+            if sy is not None:
+                if sy not in c["agents"]:
+                    raise ValueError("综合者不对")
+                cmd += ["--synthesizer", sy]
+            cmd.append("-")
+        elif mode == "pressure":
+            cmd = [sys.executable, me, "run", "--pressure", "-w", cwd] + (["--write"] if body.get("write") else []) + ["-"]
+        elif mode == "chat":
+            cmd = [sys.executable, me, "chat", "--contact", agent, "-w", cwd] + (["--write"] if body.get("write") else []) + ["-"]
+        else:
+            cmd = [sys.executable, me, mode] + ([agent] if mode == "ask" else []) + ["-w", cwd]
+            if body.get("write"):
+                cmd.append("--write")
+            cmd.append("-")
+        launch(cmd, cwd, full, meta)
+        return meta["submission_id"]
+
+    cfg_lock = threading.Lock()
+
+    def do_config(body):
+        with cfg_lock:
+            _do_config(body)
+
+    def _do_config(body):
+        c = load_config()
+        raw = read_json(CONFIG_PATH)
+        if not isinstance(raw, dict):
+            raise ValueError("配置文件 %s 读不出来（可能被改坏了），为免覆盖没有保存" % CONFIG_PATH)
+        for k in ("planner", "synthesizer", "default_worker"):
+            if k in body:
+                if body[k] not in c["agents"]:
+                    raise ValueError("没有这个 agent：%s" % body[k])
+                raw[k] = body[k]
+        if "council_agents" in body:
+            ca = body["council_agents"]
+            if not isinstance(ca, list) or not all(isinstance(x, str) and x in c["agents"] for x in ca):
+                raise ValueError("会审成员设置不对")
+            if len(dict.fromkeys(ca)) < 2:
+                raise ValueError("会审至少要选两位成员")
+            raw["council_agents"] = list(dict.fromkeys(ca))
+        if "pressure_prompt" in body:
+            pp = body["pressure_prompt"]
+            if not isinstance(pp, str) or len(pp) > 20000:
+                raise ValueError("高压模式提示词必须是文字，最多 2 万字")
+            raw["pressure_prompt"] = pp
+        if "quota_guard" in body:
+            if not isinstance(body["quota_guard"], bool):
+                raise ValueError("开关格式不对")
+            raw["quota_guard"] = body["quota_guard"]
+        if "codex_effort" in body:
+            if body["codex_effort"] not in ("", "low", "medium", "high", "max"):
+                raise ValueError("思考强度不对")
+            raw["codex_effort"] = body["codex_effort"]
+        ch = body.get("chain")
+        if "chain" in body and not isinstance(ch, dict):
+            raise ValueError("模型设置格式不对")
+        if isinstance(ch, dict):
+            name, spec = ch.get("agent"), ch.get("spec")
+            if name not in c["agents"]:
+                raise ValueError("没有这个 agent：%s" % name)
+            if spec not in set(o["spec"] for o in backend_choices(c)):
+                raise ValueError("不认识这个模型：%s" % spec)
+            chain = list(c["agents"][name])
+            idx = ch.get("index", 0)
+            if type(idx) is not int:
+                raise ValueError("位置必须是整数")
+            if not 0 <= idx < len(chain):
+                raise ValueError("位置不对")
+            chain[idx] = spec
+            raw.setdefault("agents", {})[name] = chain
+        for k, lo, hi in (("max_parallel", 1, 8), ("timeout", 60, 7200)):
+            if k in body:
+                v = body[k]
+                if type(v) is not int:
+                    raise ValueError("%s 必须是整数" % k)
+                if not lo <= v <= hi:
+                    raise ValueError("%s 需在 %d~%d 之间" % (k, lo, hi))
+                raw[k] = v
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(raw, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+
+    class H(BaseHTTPRequestHandler):
+        timeout = 15  # 只连不发的连接 15 秒后断开，免得把服务拖死
+
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, body, ctype="application/json; charset=utf-8"):
+            if not isinstance(body, bytes):
+                body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            if not ctype.startswith("text/html"):
+                self.send_header("Content-Security-Policy", "default-src 'none'; sandbox")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+
+        def check(self, path):  # 本机直接放行；局域网设备必须已配对；其它一律拒绝
+            try:
+                sock_ip = self.connection.getsockname()[0]
+            except OSError:
+                sock_ip = ""
+            return gate(self.client_address[0], self.headers.get("Host", ""), sock_ip, port, path,
+                        self.headers.get("Cookie", ""), lan_on)
+
+        def remote(self):
+            return ip_kind(self.client_address[0]) != "local"
+
+        def do_pair(self, q):
+            import hmac
+            ip = self.client_address[0]
+            html = "text/html; charset=utf-8"
+            code = q.get("code") or ""
+            if not code:  # 只是打开配对页，不算试错
+                return self.send(200, phone_page("和电脑配对", "请在电脑上打开 Hub → 设置 → 用手机控制，扫那里的二维码；或把配对码填在下面。"), html)
+            d = pair_load(create=False)  # 未配对的请求绝不触发生成或重置配对码
+            if not d:
+                return self.send(403, phone_page("还不能配对", "请先在电脑上打开「手机访问」。"), html)
+            r = limiter.attempt(ip, lambda: hmac.compare_digest(code.encode("utf-8", "replace"), d["code"].encode("utf-8")))
+            if r == "blocked":
+                return self.send(429, phone_page("试错太多次了", "为了安全，请 10 分钟后再试；或在电脑上重置配对码。"), html)
+            if r == "bad":
+                return self.send(403, phone_page("配对码不对", "请在电脑上打开 Hub → 设置 → 用手机控制，重新扫码或核对配对码。"), html)
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.send_header("Set-Cookie", "%s=%s; HttpOnly; SameSite=Lax; Path=/; Max-Age=31536000"
+                             % (PAIR_COOKIE, pair_cookie_value(d["code"])))
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.end_headers()
+
+        def do_GET(self):
+            u = urlparse(self.path)
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            err = self.check(u.path)
+            if err:
+                if err[0] == 401 and u.path in ("/", "/index.html"):
+                    return self.send(401, phone_page("这台手机还没配对", "请在电脑上打开 Hub → 设置 → 用手机控制，用手机扫那里的二维码；"
+                                                     "也可以把电脑上显示的配对码填在下面。"), "text/html; charset=utf-8")
+                return self.send(err[0], {"ok": False, "error": err[1]})
+            if u.path == "/pair":
+                return self.do_pair(q)
+            if u.path == "/api/pair":
+                if self.remote():
+                    return self.send(403, {"ok": False, "error": "配对信息只能在电脑上看"})
+                d, ips = pair_load(), lan_ips()
+                urls = ["http://%s:%d/pair?code=%s" % (ip, port, d["code"]) for ip in ips]
+                return self.send(200, {"enabled": bool(load_config().get("lan_access")), "listening": lan_on,
+                                       "code": d["code"], "urls": urls, "qr": qr_svg(urls[0]) if urls else None})
+            if u.path == "/icon.png":
+                return self.send(200, app_icon_png(), "image/png")
+            if u.path == "/":
+                try:
+                    here = os.path.join(os.path.dirname(os.path.realpath(me)), "ui.html")
+                    with open(UI_HTML if os.path.exists(UI_HTML) else here, encoding="utf-8") as f:
+                        html = f.read().replace("__HUB_TOKEN__", token)
+                except OSError:
+                    return self.send(500, "找不到界面文件 %s" % UI_HTML, "text/plain; charset=utf-8")
+                return self.send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+            if u.path == "/api/state":
+                # 没带编号的是旧版页面，也算一个窗口
+                with clients_lock:
+                    clients[q["c"] if re.fullmatch(r"[a-z0-9]{4,20}", q.get("c") or "") else "old"] = time.time()
+                st = ui_state(load_config())
+                st["client"] = {"remote": self.remote()}
+                st["lan"] = {"enabled": bool(load_config().get("lan_access")), "listening": lan_on}
+                return self.send(200, st)
+            if u.path == "/api/clients":
+                now = time.time()
+                with clients_lock:
+                    for k in [k for k, v in clients.items() if now - v > 75]:
+                        clients.pop(k, None)
+                    count = len(clients)
+                return self.send(200, {"n": count})
+            if u.path in ("/api/call", "/api/run"):
+                r = ui_record(u.path.rsplit("/", 1)[1], q.get("id"))
+                return self.send(200 if r else 404, r or {"ok": False, "error": "没有这条记录"})
+            if u.path == "/api/image":
+                c = ui_call(q.get("id"))
+                p = (c or {}).get("image")
+                ctype = mimetypes.guess_type(p or "")[0] or ""
+                if not p or not os.path.isfile(p) or ctype not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+                    return self.send(404, {"ok": False, "error": "没有图片"})
+                with open(p, "rb") as f:
+                    return self.send(200, f.read(), ctype)
+            return self.send(404, {"ok": False, "error": "not found"})
+
+        def do_POST(self):
+            u = urlparse(self.path)
+            err = self.check(u.path)
+            if err:
+                return self.send(err[0], {"ok": False, "error": err[1] if err[0] == 401 else "页面已过期，请刷新"})
+            remote = self.remote()
+            if remote and u.path not in REMOTE_POSTS:
+                return self.send(403, {"ok": False, "error": "这个操作只能在电脑上做"})
+            if u.path == "/api/bye":  # 页面关闭时的告别，不需要令牌
+                cid = parse_qs(u.query).get("c", [""])[0]
+                with clients_lock:
+                    clients.pop(cid, None)
+                return self.send(200, {"ok": True})
+            if not secrets.compare_digest((self.headers.get("X-Hub-Token") or "").encode("utf-8", "replace"), token.encode()):
+                return self.send(403, {"ok": False, "error": "页面已过期，请刷新"})
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 <= length <= 1024 * 1024:
+                    raise ValueError("请求内容过长")
+                body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if not isinstance(body, dict):
+                    raise ValueError("请求格式不对")
+                if self.path == "/api/submit":
+                    submission_id = do_submit(body, remote)
+                    return self.send(200, {"ok": True, "submission_id": submission_id})
+                elif self.path == "/api/stop":
+                    err = stop_record(body.get("type"), body.get("id"))
+                    if err:
+                        raise ValueError(err)
+                elif self.path == "/api/health":
+                    run_health()
+                elif self.path == "/api/quota":
+                    refresh_quota()
+                elif self.path == "/api/login":
+                    c = load_config()
+                    chain = c["agents"].get(body.get("agent")) or []
+                    if not chain:
+                        raise ValueError("没有这个 agent")
+                    open_login(c, chain[0].partition(":")[0])
+                elif self.path == "/api/notify":  # 原生窗口里没有网页通知，改由系统通知中心发
+                    subprocess.Popen(["osascript", "-e", "on run argv", "-e",
+                                      "display notification (item 2 of argv) with title (item 1 of argv)",
+                                      "-e", "end run", str(body.get("title") or "Hub")[:80],
+                                      str(body.get("body") or "")[:200]],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif self.path == "/api/config":
+                    do_config(body)
+                elif self.path == "/api/lan":  # 只能在电脑上开关（上面已拒绝手机）
+                    if not isinstance(body.get("enable"), bool):
+                        raise ValueError("开关格式不对")
+                    with cfg_lock:
+                        raw = read_json(CONFIG_PATH)
+                        if not isinstance(raw, dict):
+                            raise ValueError("配置文件读不出来，没有保存")
+                        raw["lan_access"] = body["enable"]
+                        tmp = CONFIG_PATH + ".tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(raw, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp, CONFIG_PATH)
+                    if body["enable"]:
+                        pair_load()
+                    if body["enable"] != lan_on:  # 换监听地址需要重启面板服务，页面会自动重连
+                        restart["on"] = True
+                        threading.Timer(0.5, srv.shutdown).start()
+                    return self.send(200, {"ok": True, "restarting": restart["on"]})
+                elif self.path == "/api/pair/reset":
+                    pair_reset()
+                    limiter.clear()  # 重置后给新配对码一个干净的开始
+                elif self.path == "/api/open":
+                    r = ui_record(body.get("type"), body.get("id"))
+                    if not r:
+                        raise ValueError("没有这条记录")
+                    if body.get("what") == "image" and r.get("image") and os.path.isfile(r["image"]):
+                        subprocess.call(["open", "-R", r["image"]])
+                    elif r.get("cwd") and os.path.isdir(r["cwd"]):
+                        subprocess.call(["open", r["cwd"]])
+                    else:
+                        raise ValueError("目录不存在")
+                else:
+                    return self.send(404, {"ok": False, "error": "not found"})
+                return self.send(200, {"ok": True})
+            except (ValueError, OSError, TypeError) as e:
+                return self.send(400, {"ok": False, "error": str(e)})
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def verify_request(self, request, client_address):  # 不是本机或家里局域网的连接，不开线程直接关
+            return ip_kind(client_address[0]) in (("local", "private") if lan_on else ("local",))
+
+    srv = Server(("0.0.0.0" if lan_on else "127.0.0.1", port), H)
+    write_json(UI_PID, {"pid": os.getpid(), "port": port})
+    eprint("[hub] 面板服务已启动：http://127.0.0.1:%d/%s" % (port, "（手机局域网访问已打开）" if lan_on else ""))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    srv.server_close()
+    if restart["on"]:
+        _reexec_ui(port, me)
+    return 0
+
+
+# ---------------------------------------------------------------- 命令行
+
+def read_prompt(parts):
+    text = " ".join(parts).strip()
+    if text in ("", "-"):
+        text = sys.stdin.read().strip()
+    if not text:
+        raise SystemExit("缺少内容")
+    return text
+
+
+def cmd_agents(cfg, args):
+    names = [args.agent] if args.agent else list(cfg["agents"])
+    status = check_specs(cfg, names)
+    for n in names:
+        print("%s —— %s" % (n, cfg["profiles"].get(n, "")))
+        for i, sp in enumerate(cfg["agents"][n]):
+            st = status[sp]
+            print("   %s %-28s %s %s" % ("首选" if i == 0 else "后备", sp, "✔" if st["ok"] else "✘", st["msg"]))
+    return 0
+
+
+def cmd_log(cfg, args):
+    if not os.path.exists(LOG_PATH):
+        print("还没有调用记录")
+        return 0
+    with open(LOG_PATH, encoding="utf-8") as f:
+        lines = f.readlines()[-args.n:]
+    for ln in lines:
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        print("%s %s %-7s %-26s %6ss  %s" % (r.get("ts"), "✔" if r.get("ok") else "✘", r.get("agent"),
+                                             r.get("backend"), r.get("secs"),
+                                             (r.get("error") or r.get("prompt") or "").replace("\n", " ")[:70]))
+    return 0
+
+
+def main():
+    cfg = load_config()
+    ap = argparse.ArgumentParser(prog="hub", description="本机多 Agent 调度器")
+    sub = ap.add_subparsers(dest="cmd")
+
+    a = sub.add_parser("ask", help="让某个 agent 回答/干活")
+    a.add_argument("agent", choices=list(cfg["agents"]))
+    a.add_argument("prompt", nargs="+", help="内容；写 - 则从标准输入读")
+    a.add_argument("-w", "--cwd", help="工作目录（默认当前目录）")
+    a.add_argument("--write", action="store_true", help="允许它创建/修改工作目录里的文件")
+    a.add_argument("--model", help="指定首选后端的模型")
+    a.add_argument("--timeout", type=int)
+
+    r = sub.add_parser("run", help="规划 -> 并行分工 -> 汇总")
+    r.add_argument("goal", nargs="+", help="目标；写 - 则从标准输入读")
+    r.add_argument("-w", "--cwd")
+    r.add_argument("--write", action="store_true", help="允许队员创建/修改文件")
+    r.add_argument("--planner", default=cfg["planner"], choices=list(cfg["agents"]))
+    r.add_argument("--synthesizer", default=cfg["synthesizer"], choices=list(cfg["agents"]))
+    r.add_argument("--max-parallel", type=int, default=cfg["max_parallel"])
+    r.add_argument("--max-tasks", type=int, default=6)
+    r.add_argument("--dry", action="store_true", help="只出方案不执行")
+    r.add_argument("--pressure", action="store_true",
+                   help="高压模式：由 ds 拆任务和汇总，拆任务前先注入设置里的「高压模式提示词」")
+
+    co = sub.add_parser("council", help="会审：几位各自独立作答，再比较共同点和分歧（只读）")
+    co.add_argument("question", nargs="+", help="问题；写 - 则从标准输入读")
+    co.add_argument("-w", "--cwd")
+    co.add_argument("--agents", help="参加的成员，用逗号分隔（默认看配置 council_agents）")
+    co.add_argument("--synthesizer", choices=list(cfg["agents"]), help="负责比较意见的成员（默认看配置 synthesizer）")
+
+    ch = sub.add_parser("chat", help="跟联络人说话：它自己答，或替你派活给团队")
+    ch.add_argument("message", nargs="+", help="内容；写 - 则从标准输入读")
+    ch.add_argument("--contact", default="auto", help="联络人：auto（按阶段自动选）或成员名")
+    ch.add_argument("-w", "--cwd")
+    ch.add_argument("--write", action="store_true", help="派给团队的活允许改文件")
+
+    im = sub.add_parser("image", help="让 GPT 画图")
+    im.add_argument("prompt", nargs="+")
+    im.add_argument("-o", "--out", default="hub-image.png")
+
+    g = sub.add_parser("agents", help="体检各 agent")
+    g.add_argument("agent", nargs="?", choices=list(cfg["agents"]))
+    ui = sub.add_parser("ui", help="打开网页面板：看谁在干什么、协作过程与内容")
+    ui.add_argument("--port", type=int, default=8765)
+    ui.add_argument("--serve", action="store_true", help="在前台运行面板服务（一般不需要）")
+    ui.add_argument("--stop", action="store_true", help="停止后台的面板服务")
+    ui.add_argument("--browser", action="store_true", help="用默认浏览器打开，而不是独立窗口")
+    ui.add_argument("--no-window", action="store_true", help="只确保面板服务在运行，不打开窗口")
+    sub.add_parser("quota", help="查看各 agent 的剩余额度")
+    lg = sub.add_parser("log", help="最近调用记录")
+    lg.add_argument("-n", type=int, default=20)
+
+    args = ap.parse_args()
+    signal.signal(signal.SIGTERM, _on_stop)
+    signal.signal(signal.SIGINT, _on_stop)
+    try:
+        if args.cmd == "ask":
+            warn = timeout_warning(args.timeout or cfg["timeout"])
+            if warn:
+                eprint("[hub] 提醒：" + warn)
+            text, _ = ask(cfg, args.agent, read_prompt(args.prompt), cwd=args.cwd, write=args.write,
+                          timeout=args.timeout, model=args.model)
+            print(text)
+            return 0
+        if args.cmd == "run":
+            planner, synth = args.planner, args.synthesizer
+            if args.pressure:
+                if "ds" not in cfg["agents"]:
+                    raise BackendError("高压模式需要 ds（DeepSeek）这位成员，配置里没有")
+                planner = synth = "ds"
+            return run_goal(cfg, read_prompt(args.goal), args.cwd, args.write, planner,
+                            synth, args.max_parallel, args.max_tasks, args.dry, pressure=args.pressure)
+        if args.cmd == "council":
+            members = [x.strip() for x in args.agents.split(",") if x.strip()] if args.agents else None
+            if members and any(m not in cfg["agents"] for m in members):
+                raise BackendError("不认识的成员：%s（可选：%s）" % (args.agents, ", ".join(cfg["agents"])))
+            return run_council(cfg, read_prompt(args.question), args.cwd, members, args.synthesizer)
+        if args.cmd == "chat":
+            return run_chat(cfg, read_prompt(args.message), args.cwd, args.write, args.contact)
+        if args.cmd == "image":
+            out = os.path.abspath(args.out)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            before = os.stat(out).st_mtime_ns if os.path.exists(out) else None
+            desc = read_prompt(args.prompt)
+            image_call = []
+            text, _ = ask(cfg, "gpt",
+                          "用你的图片生成能力生成一张图片，并把最终图片文件保存（复制）到 %s 。"
+                          "图片要求：%s\n完成后只回复保存路径。" % (out, desc),
+                          cwd=os.path.dirname(out), write=True, note=False,
+                          meta={"kind": "image", "title": "画图：" + desc[:40], "image": out, "display": desc,
+                                "on_start": image_call.append})
+            print(text)
+            if (not os.path.exists(out) or os.path.getsize(out) == 0
+                    or os.stat(out).st_mtime_ns == before):
+                error = "没有生成新的图片文件：%s" % out
+                if image_call:
+                    path = os.path.join(CALLS_DIR, image_call[0] + ".json")
+                    rec = read_json(path)
+                    if rec:
+                        rec.update(status="fail", error=error)
+                        write_json(path, rec)
+                eprint("[hub] " + error)
+                return 1
+            return 0
+        if args.cmd == "agents":
+            return cmd_agents(cfg, args)
+        if args.cmd == "quota":
+            for name, q in fetch_quota(cfg)["agents"].items():
+                if q.get("balance"):
+                    print("%-7s 余额 %s%s" % (name, q["balance"], "" if q.get("available") else "（余额不足）"))
+                elif q.get("windows"):
+                    print("%-7s %s" % (name, "   ".join("%s 剩 %d%%%s" % (
+                        w["label"], round(w["remaining"]),
+                        time.strftime("（%m-%d %H:%M 重置）", time.localtime(w["resets"])) if w.get("resets") else "")
+                        for w in q["windows"])))
+                else:
+                    print("%-7s %s" % (name, q.get("note", "")))
+            return 0
+        if args.cmd == "ui":
+            return cmd_ui(cfg, args)
+        if args.cmd == "log":
+            return cmd_log(cfg, args)
+        ap.print_help()
+        return 0
+    except BackendError as e:
+        eprint("[hub] 失败：%s" % e)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
