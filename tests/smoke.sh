@@ -21,6 +21,7 @@ python3 tests/test_pressure.py
 python3 tests/test_effort.py
 python3 tests/test_side.py
 python3 tests/test_resume.py
+python3 tests/test_images.py
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js

@@ -264,6 +264,33 @@ class API(unittest.TestCase):
         self.assertIn('分叉的起点', wait('带完整')['prompt'])
 
 
+    def test_upload_and_images(self):
+        import base64
+        png = b"\x89PNG\r\n\x1a\n" + b"\0" * 32
+        st, data, _ = self.request('/api/upload',{'data':'data:image/png;base64,'+base64.b64encode(png).decode()})
+        self.assertEqual(st,200)
+        name = json.loads(data)['id']
+        st, data, h = self.request('/api/attachment?id='+name)
+        self.assertEqual((st, data, h['Content-Type']), (200, png, 'image/png'))
+        self.assertEqual(self.request('/api/attachment?id=../config.json')[0],404)
+        for bad in ({'data':'not base64!!'},{'data':base64.b64encode(b'<svg/>').decode()}):
+            self.assertEqual(self.request('/api/upload',bad)[0],400,bad)
+        for bad in ({'mode':'ask','agent':'gemini','text':'x','images':['../x.png']},
+                    {'mode':'ask','agent':'gemini','text':'x','images':[name]*7},
+                    {'mode':'image','text':'x','images':[name]}):
+            self.assertEqual(self.request('/api/submit',bad)[0],400,bad)
+        self.assertEqual(self.request('/api/submit',{'mode':'side','agent':'gemini','text':'看图离线测试','images':[name]})[0],200)
+        for _ in range(100):
+            recs = [json.loads(p.read_text()) for p in (self.home/'calls').glob('*.json')]
+            m = [r for r in recs if r.get('display')=='看图离线测试']
+            if m and m[0]['status'] != 'running':
+                break
+            time.sleep(.05)
+        self.assertEqual(m[0]['images'],[name])
+        self.assertIn(name, m[0]['prompt'])
+        self.assertIn('read_image', m[0]['prompt'])
+
+
     def test_archive(self):
         self.assertEqual(self.request('/api/archive',{'keys':['run:20261114-010101','call:c_abc'],'on':True})[0],200)
         st = json.loads(self.request('/api/state?c=t')[1])

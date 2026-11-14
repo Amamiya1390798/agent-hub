@@ -213,6 +213,17 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .ctx button:hover{background:var(--sel)}
 .ctx.off{color:var(--faint);background:transparent;border:1px dashed var(--line)}
 .ctx.fork{color:var(--ink);background:var(--sel)}
+.att{display:flex;flex-wrap:wrap;gap:6px}
+.att:empty{display:none}
+#att{margin-bottom:6px}
+.att .th{position:relative;width:56px;height:56px;border-radius:8px;overflow:hidden;border:1px solid var(--line);background:var(--hover);flex:none}
+.att .th img{width:100%;height:100%;object-fit:cover;display:block}
+.att .th button{position:absolute;top:2px;right:2px;width:18px;height:18px;border-radius:9px;background:rgba(0,0,0,.6);color:#fff;font-size:11px;line-height:18px;padding:0}
+.att .th.up{display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted)}
+.thumbs{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.thumbs a{display:block;width:72px;height:72px;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+.thumbs img{width:100%;height:100%;object-fit:cover;display:block}
+.dropping{outline:2px dashed var(--faint);outline-offset:-4px}
 .ctx.off button{width:auto;height:auto;padding:1px 7px;color:var(--ink)}
 .sidewin{position:fixed;right:18px;bottom:18px;width:410px;max-width:calc(100vw - 24px);height:min(640px,calc(100vh - 36px));background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.28);display:flex;flex-direction:column;z-index:40}
 .sidewin[hidden]{display:none}
@@ -400,6 +411,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
     <div class="composer">
       <div class="cbox">
         <div id="ctx"></div>
+        <div class="att" id="att"></div>
         <textarea id="txt" rows="2" placeholder="想让团队做什么？"></textarea>
         <input class="cwd" id="cwd" style="display:none" spellcheck="false">
         <div class="crow">
@@ -407,6 +419,8 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
           <select id="contact" aria-label="谁来对接" style="display:none"></select>
           <button class="tog" id="wtog" data-act="write" title="允许团队成员在工作目录里创建、修改文件">✎ 允许改文件</button>
           <button class="tog" id="dtog" data-act="cwd" title="指定工作目录">▸ 目录</button>
+          <button class="tog" data-act="att-pick" data-w="main" title="附上图片（也可以直接粘贴或拖进来）">＋图片</button>
+          <input type="file" id="file-main" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
           <button class="send" id="send" data-act="send" disabled>发送</button>
         </div>
       </div>
@@ -420,8 +434,9 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
   <div class="sw-head"><b>旁问</b><p class="small">单独问个小问题，不进主线，也不打断团队</p><button class="iconbtn" data-act="sidewin" aria-label="关闭旁问">✕</button></div>
   <div class="sw-hist scroll" id="sw-hist"></div>
   <div class="sw-ctl" id="sw-ctl"></div>
-  <textarea id="sw-txt" rows="2" placeholder="问个小问题…（⌘/Ctrl + Enter 发送）"></textarea>
-  <div class="sw-row"><p class="small" id="sw-hint"></p><button class="send" id="sw-send" data-act="side-send">发送</button></div>
+  <div class="att" id="sw-att" style="margin:8px 12px 0"></div>
+  <textarea id="sw-txt" rows="2" placeholder="问个小问题…可以粘贴图片（⌘/Ctrl + Enter 发送）"></textarea>
+  <div class="sw-row"><p class="small" id="sw-hint"></p><button class="tog" data-act="att-pick" data-w="side" title="附上图片">＋图片</button><input type="file" id="file-side" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden><button class="send" id="sw-send" data-act="side-send">发送</button></div>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -449,7 +464,8 @@ let followLatest = false, pendingSubmission = null, pollSeq = 0, appliedPollSeq 
 const beginSubmit = () => { pendingSubmission = null; followLatest = true; };
 let filter = "all", query = "";
 let mode = "chat", allowWrite = false, showCwd = false, ctx = null;
-let forking = false;                // 正在从 ctx 那条分叉出一条新线
+let forking = false;
+const pendImgs = {main: [], side: []};   // 还没发出去的图片 {id} 或 {up:true} 上传中                // 正在从 ctx 那条分叉出一条新线
 let sideScope = "full";             // 旁问带上文的范围：full 完整上下文 / one 只带这一条
 let sideOpen = false, sideAgent = null, sideSpec = "", sideEffort = "", sideWeb = true, sideBase = "main", sideFollow = null, sideSending = false;
 let contact = localStorage.getItem("hub.contact") || "auto";   // 对接人：auto = 按阶段自动选
@@ -912,7 +928,7 @@ function sideItemHtml(c){
   const si = stInfo(c.status, c.error), sd = c.side || {};
   const full = need("call", c.id, c.status + "|" + (c.end || ""));
   const based = c.follows ? (findSide(c.follows.id) ? "接着旁问" : "基于主线记录") : "单独问";
-  let h = '<div class="sw-item"><div class="sw-q">' + esc(c.display || c.prompt_preview || "") + '</div><div class="sw-meta">' +
+  let h = '<div class="sw-item"><div class="sw-q">' + esc(c.display || c.prompt_preview || "") + '</div>' + thumbsHtml(c.images) + '<div class="sw-meta">' +
     esc(c.agent) + " · " + esc(c.backend === "codex" ? "GPT（本机默认模型）" : specLabel(c.backend)) + (sd.effort ? " · " + esc(sd.effort) : "") + (sd.web ? " · 联网" : "") + " · " + based + (c.resumed ? " · 续接原会话" : "") + " · " + tick(c.start, c.end, c.secs) + '</div>';
   if (RUNNING[c.status]) h += '<div class="small">' + esc(si.t) + '…</div>';
   else if (full && full.answer){ copyStore["side:" + c.id] = full.answer; h += '<div class="md">' + md(full.answer) + '</div>'; }
@@ -943,7 +959,9 @@ async function sendSide(){
   const text = $("sw-txt").value.trim();
   if (!text || sideSending || !S) return;
   const st = sideState();
+  if (uploading("side")){ toast("图片还在上传，稍等一下"); return; }
   const body = {mode:"side", agent:st.a.name, text, web:sideWeb, spec:st.sp, cwd:""};
+  if (readyImgs("side").length) body.images = readyImgs("side");
   if (sideEffort && st.kind !== "agy") body.effort = sideEffort;
   if (st.base){
     body.context = {type:st.base.type, id:st.base.id};
@@ -951,10 +969,53 @@ async function sendSide(){
     if (!isRemote() && st.base.rec && st.base.rec.cwd) body.cwd = st.base.rec.cwd;
   }
   sideSending = true; renderSide();
-  try { await api("/api/submit", body); $("sw-txt").value = ""; last.sideScrolled = false; toast("旁问已发出"); poll(); }
+  try { await api("/api/submit", body); $("sw-txt").value = ""; if (body.images){ pendImgs.side = []; renderAtt("side"); } last.sideScrolled = false; toast("旁问已发出"); poll(); }
   catch(err){ toast(err.message || "没发出去"); }
   finally { sideSending = false; renderSide(); }
 }
+/* ---------- 图片：粘贴、拖进来、选文件 ---------- */
+const attUrl = id => "/api/attachment?id=" + encodeURIComponent(id);
+function thumbsHtml(ids){
+  return ids && ids.length ? '<div class="thumbs">' + ids.map(id => '<a href="' + attUrl(id) + '" target="_blank" rel="noopener" title="点开看大图"><img src="' + attUrl(id) + '" alt="附图" loading="lazy"></a>').join("") + "</div>" : "";
+}
+function renderAtt(w){
+  const box = $(w === "side" ? "sw-att" : "att");
+  box.innerHTML = pendImgs[w].map((x, i) => x.up ? '<div class="th up">上传中…</div>'
+    : '<div class="th"><img src="' + attUrl(x.id) + '" alt="待发送的图片"><button data-act="att-del" data-w="' + w + '" data-i="' + i + '" aria-label="去掉这张图">✕</button></div>').join("");
+  if (w === "side") renderSide(); else renderComposer();
+}
+async function addImages(files, w){
+  const list = Array.from(files || []).filter(f => /^image\/(png|jpeg|webp|gif)$/.test(f.type));
+  if (!list.length) return false;
+  for (const f of list){
+    if (pendImgs[w].length >= 6){ toast("一次最多 6 张图"); break; }
+    if (f.size > 10 * 1024 * 1024){ toast("图片太大了（超过 10MB）"); continue; }
+    const slot = {up: true};
+    pendImgs[w].push(slot); renderAtt(w);
+    try {
+      const data = await new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => bad(new Error("读不出这张图")); r.readAsDataURL(f); });
+      const res = await api("/api/upload", {data});
+      slot.id = res.id; delete slot.up;
+    } catch(e){ pendImgs[w].splice(pendImgs[w].indexOf(slot), 1); toast("图片没传上去：" + (e.message || "")); }
+    renderAtt(w);
+  }
+  return true;
+}
+const readyImgs = w => pendImgs[w].filter(x => x.id).map(x => x.id);
+const uploading = w => pendImgs[w].some(x => x.up);
+function bindImageInput(w, txtId, dropEl, fileId){
+  $(txtId).addEventListener("paste", e => {
+    const files = Array.from((e.clipboardData && e.clipboardData.items) || []).filter(it => it.kind === "file").map(it => it.getAsFile()).filter(Boolean);
+    if (files.some(f => /^image\//.test(f.type))){ e.preventDefault(); addImages(files, w); }
+  });
+  const el = dropEl();
+  if (!el || !el.addEventListener) return bindFile(w, fileId);
+  el.addEventListener("dragover", e => { if (e.dataTransfer && Array.from(e.dataTransfer.types || []).indexOf("Files") >= 0){ e.preventDefault(); el.classList.add("dropping"); } });
+  el.addEventListener("dragleave", () => el.classList.remove("dropping"));
+  el.addEventListener("drop", e => { el.classList.remove("dropping"); if (e.dataTransfer && e.dataTransfer.files.length){ e.preventDefault(); addImages(e.dataTransfer.files, w); } });
+  bindFile(w, fileId);
+}
+function bindFile(w, fileId){ $(fileId).addEventListener("change", e => { addImages(e.target.files, w); e.target.value = ""; }); }
 function settingsHtml(){
   const cfg = S.config, hl = S.health || {results:{}};
   if (isRemote()) return '<h3>设置<button class="btn x" data-act="settings">返回团队</button></h3>' +
@@ -1107,6 +1168,7 @@ function headHtml(it, extraMeta){
   h += '</div><div class="acts">' +
     (running ? (stopArm === it.id ? '<button class="btn danger" data-act="stop" data-sure="1" style="background:var(--bad);color:#fff">再点一次确认停止</button>' : '<button class="btn danger" data-act="stop">■ 停止</button>') : '<button class="btn" data-act="retry">↻ 重新执行</button><button class="btn" data-act="fork" data-type="' + esc(it.type) + '" data-id="' + esc(it.id) + '" title="带上到这里为止的上下文，另开一条线接着做，原来这条不受影响">⑂ 从这里分叉</button>') +
     (isRemote() ? '' : '<button class="btn" data-act="opendir" title="' + esc(it.rec.cwd || "") + '">打开工作目录</button>') + archBtn(it) + '</div>';
+  if (it.rec && it.rec.images && it.rec.kind !== "chat") h += thumbsHtml(it.rec.images);   // 对话页在每轮气泡里显示
   return h;
 }
 function archBtn(it){
@@ -1250,7 +1312,7 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
   let h = headHtml(it, '<span>和对接人的对话 · ' + turns.length + ' 轮</span>' + (it.rec.chat && it.rec.chat.write ? '<span class="badge plain">可改文件</span>' : "")) + '<div class="chat">';
   for (const t of turns){
     const r = t.rec;
-    h += '<div class="me">' + esc(t.title || "") + "</div>";
+    h += '<div class="me">' + esc(t.title || "") + thumbsHtml(r.images) + "</div>";
     if (t.type === "run"){
       h += '<div class="them"><div class="who">团队（' + (r.mode === "council" ? "会审" : r.pressure ? "高压" : "自动分工") + '）</div><button class="job" data-act="select" data-type="run" data-id="' + esc(r.id) + '">打开这个项目组看过程 · ' + esc(stInfo(r.status, r.error).t) + "</button></div>";
       continue;
@@ -1361,6 +1423,11 @@ async function send(){
     cwd: typedCwd || (useCtx && cit.rec.cwd && cit.rec.cwd !== S.workspace ? cit.rec.cwd : ""), write: allowWrite && mode !== "image" && mode !== "council"};
   if (useCtx) body.context = ctx;
   if (useCtx && forking) body.fork = true;
+  if (uploading("main")){ toast("图片还在上传，稍等一下"); return; }
+  if (readyImgs("main").length){
+    if (mode === "image"){ toast("画图暂时不支持参考图，先去掉图片"); return; }
+    body.images = readyImgs("main");
+  }
   if (isRemote()) body.cwd = "";   // 手机上不能指定电脑上的目录
   if ((body.write || body.mode === "image") && isRemote()){
     if (!confirm(body.mode === "image" ? "画图会在电脑上保存图片文件，确定吗？" : "确定允许这次任务改动电脑上的文件吗？\n它会无人值守地新建、修改甚至覆盖工作目录里的文件。")) return;
@@ -1372,6 +1439,7 @@ async function send(){
     const accepted = await api("/api/submit", body);
     if (followLatest) pendingSubmission = accepted.submission_id;
     if (body.fork){ forking = false; toast("已分叉出一条新线"); }
+    if (body.images){ pendImgs.main = []; renderAtt("main"); }
     if ($("txt").value.trim() === text) $("txt").value = "";
     saveDraft();
     autosize();
@@ -1477,6 +1545,8 @@ document.addEventListener("click", async e => {
     else if (act === "yesctx"){ ctx = sel; renderComposer(); $("txt").focus(); }
     else if (act === "sidewin"){ sideOpen = !sideOpen; last.side = last.sideCtl = last.rail = ""; renderSide(); renderRail(); if (sideOpen) $("sw-txt").focus(); }
     else if (act === "side-send") await sendSide();
+    else if (act === "att-pick") $(el.dataset.w === "side" ? "file-side" : "file-main").click();
+    else if (act === "att-del"){ pendImgs[el.dataset.w].splice(+el.dataset.i, 1); renderAtt(el.dataset.w); }
     else if (act === "side-follow"){ sideFollow = {type:"call", id:el.dataset.id}; sideBase = "follow"; last.sideCtl = ""; renderSide(); $("sw-txt").focus(); }
     else if (act === "send") send();
     else if (act === "sug"){
@@ -1609,6 +1679,8 @@ function saveDraft(){   // 草稿只存在当前窗口；不保存「允许改�
 }
 $("txt").addEventListener("input", () => { autosize(); saveDraft(); $("send").disabled = sending || !$("txt").value.trim(); });
 $("txt").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)){ e.preventDefault(); send(); } });
+bindImageInput("main", "txt", () => document.querySelector && document.querySelector(".cbox"), "file-main");
+bindImageInput("side", "sw-txt", () => $("sidewin"), "file-side");
 $("sw-txt").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)){ e.preventDefault(); sendSide(); } });
 $("sw-txt").addEventListener("input", () => { $("sw-send").disabled = sideSending || !$("sw-txt").value.trim(); });
 

@@ -8,7 +8,7 @@ const posts=[];
 const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []},body:{classList:{add(){},remove(){},toggle(){},contains(){return false}}}},window:{},localStorage:{getItem(){return null},setItem(){}},sessionStorage:{getItem(){return null},setItem(){},removeItem(){}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},setTimeout:()=>1,clearTimeout(){},getSelection:()=>null,fetch:()=>new Promise(()=>{})};
 vm.createContext(ctx);
 vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);',
-  'globalThis.ui={set:s=>S=s,items,renderSide,sideCtlHtml,sideState,renderComposer,open:v=>{sideOpen=v;},setSel:v=>{sel=v;ctx=v;},setCtx:v=>{ctx=v;},setSide:o=>{if("base" in o)sideBase=o.base;if("follow" in o)sideFollow=o.follow;if("agent" in o)sideAgent=o.agent;if("effort" in o)sideEffort=o.effort;},api:f=>{api=f;},sendSide,last,groups,chainOf,findItem,send,fork:(t,i)=>{ctx={type:t,id:i};forking=true;},isForking:()=>forking,setScope:v=>{sideScope=v;}};'),ctx);
+  'globalThis.ui={set:s=>S=s,items,renderSide,sideCtlHtml,sideState,renderComposer,open:v=>{sideOpen=v;},setSel:v=>{sel=v;ctx=v;},setCtx:v=>{ctx=v;},setSide:o=>{if("base" in o)sideBase=o.base;if("follow" in o)sideFollow=o.follow;if("agent" in o)sideAgent=o.agent;if("effort" in o)sideEffort=o.effort;},api:f=>{api=f;},sendSide,last,groups,chainOf,findItem,send,fork:(t,i)=>{ctx={type:t,id:i};forking=true;},isForking:()=>forking,setScope:v=>{sideScope=v;},pendImgs,thumbsHtml};'),ctx);
 const agents=[{name:'gemini',chain:['agy:gemini-4-carbon-medium'],profile:'x'},{name:'gpt',chain:['codex'],profile:'x'},{name:'ds',chain:['dsh'],profile:'x'}];
 const backends=['low','medium','high'].map(l=>({spec:'agy:gemini-4-carbon-'+l,label:'Gemini 4 Carbon ('+l[0].toUpperCase()+l.slice(1)+')'}))
   .concat([{spec:'codex',label:'GPT',efforts:[{id:'low',desc:''},{id:'ultra',desc:''}]},{spec:'codex:gpt-6-luna',label:'Luna',efforts:[{id:'low',desc:''}]},{spec:'dsh',label:'DS'}]);
@@ -83,5 +83,18 @@ assert.ok(/value="follow" selected>接着旁问：旁问一下/.test(h));
   await ctx.ui.send();
   assert.equal(posts[0][1].fork,true); assert.deepEqual(posts[0][1].context,{type:'call',id:'c_main'});
   assert.equal(ctx.ui.isForking(),false,'发完就不再是分叉状态');
+  // 贴图：发送时带上已上传的图，上传中的不带；记录里显示缩略图
+  ctx.ui.pendImgs.side.push({id:'att-20261115-010101-aaaaaaaa.png'});
+  ctx.ui.setSide({base:'none'}); posts.length=0; nodes['sw-txt'].value='看看这张图';
+  await ctx.ui.sendSide();
+  assert.deepEqual(posts[0][1].images,['att-20261115-010101-aaaaaaaa.png']);
+  assert.equal(ctx.ui.pendImgs.side.length,0,'发完清空');
+  ctx.ui.pendImgs.side.push({up:true}); posts.length=0; nodes['sw-txt'].value='还在传';
+  await ctx.ui.sendSide();
+  assert.equal(posts.length,0,'图片没传完不发');
+  ctx.ui.pendImgs.side.length=0;
+  const th=ctx.ui.thumbsHtml(['att-1.png" onerror="x']);
+  assert.ok(!th.includes('" onerror="') && th.includes('/api/attachment?id='),'缩略图地址转义');
+  assert.equal(ctx.ui.thumbsHtml([]),'');
   console.log('ui side: excluded from list, context choices, model levels, send body and ctx restore passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});

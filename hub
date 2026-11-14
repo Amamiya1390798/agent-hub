@@ -18,6 +18,8 @@ hub —— 本机多 Agent 调度器（Claude / GPT / Gemini / DeepSeek 互相�
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import glob
 import json
 import os
@@ -41,6 +43,7 @@ DSH_PATCH = os.path.join(HUB_HOME, "dsh.patch.yml")
 CALLS_DIR = os.path.join(HUB_HOME, "calls")      # 每次调用一份完整记录（面板用）
 UI_HTML = os.path.join(HUB_HOME, "ui.html")
 UI_WORKSPACE = os.path.join(HUB_HOME, "workspace")  # 面板下任务时的默认工作目录
+ATTACH_DIR = os.path.join(UI_WORKSPACE, "attachments")  # 用户粘贴/拖进来的图片
 _ctx = threading.local()                          # 当前线程正在进行的调用 id
 MAX_DEPTH = 2  # agent 调 agent 的最大嵌套层数，防止互相无限踢皮球
 
@@ -469,6 +472,8 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
         cmd += ["--model", model]
     if cfg.get("_resume"):  # 续接上一轮的会话，只发这一轮的话
         cmd += ["--conversation", cfg["_resume"]]
+    if cfg.get("_images"):  # 让它能打开放图片的目录
+        cmd += ["--add-dir", ATTACH_DIR]
     if write:
         cmd += ["--mode", "accept-edits", "--dangerously-skip-permissions"]
     live = Live()
@@ -537,6 +542,8 @@ def backend_codex(cfg, model, prompt, cwd, write, timeout):
         cmd = [exe, "exec", "--skip-git-repo-check", "-C", cwd, "-s", sandbox, "-o", outfile]
     if model:
         cmd += ["-m", model]
+    for img in cfg.get("_images") or []:  # GPT 直接收图
+        cmd += ["--image=" + img]
     if cfg.get("_effort") and _EFFORT_ID.match(cfg["_effort"]):
         cmd += ["-c", 'model_reasoning_effort="%s"' % cfg["_effort"]]
     if cfg.get("_web"):  # 打开 GPT 自带的实时网页搜索
@@ -648,6 +655,8 @@ def backend_claude(cfg, model, prompt, cwd, write, timeout):
         cmd += ["--allowedTools", "WebSearch", "WebFetch"]
     if cfg.get("_resume"):
         cmd += ["--resume", cfg["_resume"]]
+    if cfg.get("_images"):
+        cmd += ["--add-dir", ATTACH_DIR]
     cmd += ["--output-format", "json"]  # 拿到会话编号，下次追问能续接
     rc, out, err = _run(cmd, cwd, clean_env(), timeout, stdin_text=prompt)
     text = out.strip()
@@ -863,6 +872,51 @@ def team_note(cfg, me):
             "不需要就别用。直接给出最终结果，不要反问。" % (me, " / ".join(others)))
 
 
+_ATT_NAME = re.compile(r"^att-[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\.(png|jpg|webp|gif)$")
+_IMG_SIGS = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpg"), (b"GIF87a", "gif"), (b"GIF89a", "gif"))
+MAX_IMAGES = 6
+
+
+def image_kind(data):
+    for sig, ext in _IMG_SIGS:
+        if data.startswith(sig):
+            return ext
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def save_attachment(data):
+    """保存一张用户贴进来的图片，只认 PNG/JPEG/WebP/GIF；返回文件名。"""
+    if not isinstance(data, bytes) or not data:
+        raise ValueError("图片是空的")
+    if len(data) > 10 * 1024 * 1024:
+        raise ValueError("图片太大了（超过 10MB），请缩小后再贴")
+    ext = image_kind(data)
+    if not ext:
+        raise ValueError("只支持 PNG、JPEG、WebP、GIF 图片")
+    os.makedirs(ATTACH_DIR, exist_ok=True)
+    name = "att-%s-%s.%s" % (time.strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:8], ext)
+    with open(os.path.join(ATTACH_DIR, name), "wb") as f:
+        f.write(data)
+    return name
+
+
+def attachment_path(name):
+    if not isinstance(name, str) or not _ATT_NAME.match(name):
+        return None
+    p = os.path.join(ATTACH_DIR, name)
+    return p if os.path.isfile(p) else None
+
+
+def image_note(paths):
+    """告诉模型图片在哪、怎么看。GPT 另外直接附图；DeepSeek 用 read_image；Gemini、Claude 用各自的看图/读文件工具。"""
+    if not paths:
+        return ""
+    return ("\n\n【用户附了 %d 张图片，回答前请先逐张打开看清楚（用你的看图工具，例如 read_image / 读取文件；"
+            "GPT 已直接收到图片）】\n" % len(paths)) + "\n".join("图 %d：%s" % (i + 1, p) for i, p in enumerate(paths))
+
+
 _SID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
@@ -883,8 +937,9 @@ def resume_plan(agent, ext, meta, web):
     text = meta.get("resume_prompt") or ext.get("display")
     if not text:
         return None
+    imgs = [p for p in (attachment_path(n) for n in ext.get("images") or []) if p]
     return {"from": f["id"], "path": tpath, "sid": str(ses["id"]), "backend": t.get("backend"),
-            "prompt": text + (WEB_NOTE if web else "")}
+            "prompt": text + image_note(imgs) + (WEB_NOTE if web else "")}
 
 
 def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, quiet=False, note=True, meta=None,
@@ -925,6 +980,9 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
            "image": meta.get("image"), "follows": None, "display": None, "chat": meta.get("chat")}
     if web or spec or effort is not None:
         rec["side"] = {"web": bool(web), "effort": effort or "", "spec": spec or ""}
+    images = [n for n in (top_meta().get("images") or []) if attachment_path(n)][:MAX_IMAGES]
+    if images and not rec["parent"]:
+        rec["images"] = images
     if rec["kind"] in ("ask", "image", "chat", "side") and not rec["parent"]:
         ext = top_meta()
         rec["follows"], rec["display"] = ext.get("follows"), ext.get("display") or meta.get("display")
@@ -967,7 +1025,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
             eff = agent_effort(cfg, agent, spec_i)
             if effort is not None and i == 0 and spec:  # 旁问里单独选的档位只用在指定的那个模型上
                 eff = effort if effort in effort_levels(spec_i) else ""
-            run_cfg = dict(cfg, _effort=eff, _web=bool(web))
+            run_cfg = dict(cfg, _effort=eff, _web=bool(web), _images=[attachment_path(n) for n in images])
             text = None
             if resume and resume["backend"] == spec_i:
                 t = read_json(resume["path"]) or {}
@@ -1276,7 +1334,8 @@ def _open_run(cfg, goal, cwd, write, **fields):
              "end": None, "cwd": cwd, "planner": None, "synthesizer": None, "tasks": [], "final": None,
              "error": None, "pid": os.getpid(), "write": bool(write), "timeout": cfg["timeout"],
              "follows": top_meta().get("follows"), "display": top_meta().get("display"),
-             "submission_id": top_meta().get("submission_id"), "fork": bool(top_meta().get("fork")) or None}
+             "submission_id": top_meta().get("submission_id"), "fork": bool(top_meta().get("fork")) or None,
+             "images": [n for n in (top_meta().get("images") or []) if attachment_path(n)] or None}
     state.update(fields)
     slock = threading.RLock()
 
@@ -1844,7 +1903,7 @@ def ui_state(cfg):
     for c in calls[:200]:
         d = {k: c.get(k) for k in ("id", "parent", "run", "task", "kind", "title", "agent", "backend", "status",
                                    "start", "end", "secs", "write", "cwd", "error", "follows", "display", "submission_id",
-                                   "chat", "dispatch", "side", "fork", "resumed")}
+                                   "chat", "dispatch", "side", "fork", "resumed", "images")}
         d["preferred_backend"] = call_preferred(c)
         d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
         d["answer_preview"] = _preview(c.get("answer"))
@@ -1855,7 +1914,7 @@ def ui_state(cfg):
     for r in runs:
         d = {k: r.get(k) for k in ("id", "goal", "status", "summary", "start", "end", "cwd", "planner",
                                    "synthesizer", "error", "write", "follows", "display", "submission_id",
-                                   "participants", "skipped", "timeout_warning", "parent_call", "pressure", "fork")}
+                                   "participants", "skipped", "timeout_warning", "parent_call", "pressure", "fork", "images")}
         d["mode"] = r.get("mode") or "run"  # 旧记录没有 mode，都是自动分工
         d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min",
                                              "progress", "leftover", "skip_reason", "started",
@@ -2411,7 +2470,7 @@ class PairLimiter(object):
             self.fails.clear()
 
 
-REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
+REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
 
 
 def gate(ip, host, sock_ip, port, path, cookie, lan_on):
@@ -2813,6 +2872,13 @@ def serve_ui(port, me):
         if not os.path.isdir(cwd):
             raise ValueError("工作目录不存在：%s" % (body.get("cwd") or cwd))
         meta = {"display": text, "submission_id": uuid.uuid4().hex}
+        imgs = body.get("images") or []
+        if not isinstance(imgs, list) or len(imgs) > MAX_IMAGES or not all(attachment_path(n) for n in imgs):
+            raise ValueError("图片不对或已经不在了（最多 %d 张），请重新贴" % MAX_IMAGES)
+        if imgs and mode == "image":
+            raise ValueError("画图暂时不支持参考图")
+        if imgs:
+            meta["images"] = list(dict.fromkeys(imgs))
         ctx = body.get("context", {})
         if not isinstance(ctx, dict):
             raise ValueError("追问记录格式不对")
@@ -2839,6 +2905,8 @@ def serve_ui(port, me):
                 if mode == "side":
                     raise ValueError("旁问不用分叉")
                 meta["fork"] = True
+        if meta.get("images"):
+            full += image_note([attachment_path(n) for n in meta["images"]])
         if mode == "image":
             out = os.path.join(UI_WORKSPACE, "images", "img-%s-%s.png" % (time.strftime("%Y%m%d-%H%M%S"),
                                                                            uuid.uuid4().hex[:4]))
@@ -3049,6 +3117,13 @@ def serve_ui(port, me):
             if u.path in ("/api/call", "/api/run"):
                 r = ui_record(u.path.rsplit("/", 1)[1], q.get("id"))
                 return self.send(200 if r else 404, r or {"ok": False, "error": "没有这条记录"})
+            if u.path == "/api/attachment":
+                p = attachment_path(q.get("id"))
+                if not p:
+                    return self.send(404, {"ok": False, "error": "没有图片"})
+                ctype = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}[p.rsplit(".", 1)[1]]
+                with open(p, "rb") as f:
+                    return self.send(200, f.read(), ctype)
             if u.path == "/api/image":
                 c = ui_call(q.get("id"))
                 p = (c or {}).get("image")
@@ -3076,7 +3151,7 @@ def serve_ui(port, me):
                 return self.send(403, {"ok": False, "error": "页面已过期，请刷新"})
             try:
                 length = int(self.headers.get("Content-Length") or 0)
-                if not 0 <= length <= 1024 * 1024:
+                if not 0 <= length <= (16 if u.path == "/api/upload" else 1) * 1024 * 1024:
                     raise ValueError("请求内容过长")
                 body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
                 if not isinstance(body, dict):
@@ -3088,6 +3163,12 @@ def serve_ui(port, me):
                     err = stop_record(body.get("type"), body.get("id"))
                     if err:
                         raise ValueError(err)
+                elif self.path == "/api/upload":  # 粘贴/拖进来的图片：{data: base64}
+                    try:
+                        raw = base64.b64decode(str(body.get("data") or "").split(",")[-1], validate=True)
+                    except (ValueError, binascii.Error):
+                        raise ValueError("图片数据坏了，请重新贴")
+                    return self.send(200, {"ok": True, "id": save_attachment(raw)})
                 elif self.path == "/api/archive":
                     set_archived(body.get("keys"), body.get("on"))
                 elif self.path == "/api/health":
