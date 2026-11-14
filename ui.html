@@ -118,6 +118,7 @@ input,textarea,select{font:inherit;color:inherit}
 
 /* ---------- 中栏 ---------- */
 .main{display:flex;flex-direction:column;min-width:0;min-height:0;position:relative}
+.rail h3 span.x{display:inline-flex;gap:6px}
 .topbar{display:none;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
 .iconbtn{width:32px;height:32px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:var(--muted)}
 .iconbtn:hover{background:var(--hover);color:var(--ink)}
@@ -299,6 +300,7 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
   .rail{position:fixed;right:0;top:0;bottom:0;width:320px;z-index:20;transform:translateX(100%);transition:transform .2s;box-shadow:var(--shadow)}
   body.rail-open .rail{transform:none} body.rail-open .scrim{display:block}
   .topbar{display:flex}.topbar .menu{display:none}
+  .railside{display:none}
 }
 @media (max-width:760px){
   .app{grid-template-columns:minmax(0,1fr)}
@@ -992,7 +994,7 @@ function settingsHtml(){
 }
 function renderRail(){
   const hl = S.health || {results:{}};
-  let h = '<h3>团队<button class="btn x" data-act="settings" aria-label="打开设置">⚙ 设置</button></h3><p class="small">按目标分工，不限两位。点模型名称可更换。</p>';
+  let h = '<h3>团队<span class="x"><button class="btn railside' + (sideOpen ? ' primary' : '') + '" data-act="sidewin" title="开个小窗单独问个小问题，不影响主线">旁问</button><button class="btn" data-act="settings" aria-label="打开设置">⚙ 设置</button></span></h3><p class="small">按目标分工，不限两位。点模型名称可更换。</p>';
   for (const a of S.agents){
     const busy = a.busy > 0, expanded = agentDetails.has(a.name);
     h += '<div class="ag' + (busy ? ' busy' : '') + '" style="--c:' + agc(a.name) + '"><div class="hd"><div class="a">' + agl(a.name) + '</div><div><div class="n">' + esc(a.name) + '</div><div class="role">' + esc((AG[a.name]||{}).role || '') + '</div></div><span style="margin-left:auto">' + (busy ? badge('run', a.busy + ' 件进行中') : badge('wait','空闲')) + '</span></div>';
@@ -1473,7 +1475,7 @@ document.addEventListener("click", async e => {
     else if (act === "noctx"){ if (forking){ forking = false; ctx = sel; } else ctx = null; renderComposer(); }
     else if (act === "fork"){ ctx = {type: el.dataset.type, id: el.dataset.id}; forking = true; renderComposer(); $("txt").focus(); toast("已准备分叉：发出的话会另开一条线"); }
     else if (act === "yesctx"){ ctx = sel; renderComposer(); $("txt").focus(); }
-    else if (act === "sidewin"){ sideOpen = !sideOpen; last.side = last.sideCtl = ""; renderSide(); if (sideOpen) $("sw-txt").focus(); }
+    else if (act === "sidewin"){ sideOpen = !sideOpen; last.side = last.sideCtl = last.rail = ""; renderSide(); renderRail(); if (sideOpen) $("sw-txt").focus(); }
     else if (act === "side-send") await sendSide();
     else if (act === "side-follow"){ sideFollow = {type:"call", id:el.dataset.id}; sideBase = "follow"; last.sideCtl = ""; renderSide(); $("sw-txt").focus(); }
     else if (act === "send") send();
