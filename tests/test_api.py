@@ -306,6 +306,33 @@ class API(unittest.TestCase):
             self.assertEqual(self.request('/api/handoff',bad)[0],400,bad)
 
 
+    def test_member_and_model_switches(self):
+        cfgp = self.home/'config.json'
+        self.assertEqual(self.request('/api/config',{'agent_enabled':{'agent':'ds','on':False}})[0],200)
+        st = json.loads(self.request('/api/state?c=t')[1])
+        self.assertTrue([a for a in st['agents'] if a['name']=='ds'][0]['disabled'])
+        self.assertEqual(st['config']['disabled_agents'],['ds'])
+        st_, data, _ = self.request('/api/submit',{'mode':'ask','agent':'ds','text':'x'})
+        self.assertEqual(st_,400); self.assertIn('已停用', json.loads(data)['error'])
+        self.assertEqual(self.request('/api/submit',{'mode':'pressure','text':'x'})[0],400)
+        names = [a['name'] for a in st['agents']]
+        for n in names:
+            if n != 'gemini':
+                self.request('/api/config',{'agent_enabled':{'agent':n,'on':False}})
+        self.assertEqual(self.request('/api/config',{'agent_enabled':{'agent':'gemini','on':False}})[0],400,'至少留一位')
+        for n in names:
+            self.assertEqual(self.request('/api/config',{'agent_enabled':{'agent':n,'on':True}})[0],200)
+        self.assertEqual(json.loads(cfgp.read_text())['disabled_agents'],[])
+        self.assertEqual(self.request('/api/config',{'model_enabled':{'spec':'dsh','on':False}})[0],200)
+        st = json.loads(self.request('/api/state?c=t')[1])
+        self.assertTrue([b for b in st['backends'] if b['spec']=='dsh'][0].get('off'))
+        self.assertEqual(self.request('/api/config',{'chain':{'agent':'gpt','index':0,'spec':'dsh'}})[0],400,'不能选停用的模型')
+        self.assertEqual(self.request('/api/submit',{'mode':'side','agent':'gemini','text':'x','spec':'dsh'})[0],400)
+        self.assertEqual(self.request('/api/config',{'model_enabled':{'spec':'dsh','on':True}})[0],200)
+        for bad in ({'agent_enabled':{'agent':'nobody','on':False}},{'agent_enabled':{'agent':'ds','on':'no'}},{'model_enabled':{'spec':'agy:nope','on':False}}):
+            self.assertEqual(self.request('/api/config',bad)[0],400,bad)
+
+
     def test_archive(self):
         self.assertEqual(self.request('/api/archive',{'keys':['run:20261114-010101','call:c_abc'],'on':True})[0],200)
         st = json.loads(self.request('/api/state?c=t')[1])

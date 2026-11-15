@@ -63,6 +63,8 @@ DEFAULT_CONFIG = {
     "council_agents": ["gemini", "gpt", "ds"],  # 会审默认参加的成员；Claude 默认不参加，可在设置里勾选
     "max_parallel": 3,
     "timeout": 900,
+    "disabled_agents": [],     # 停用的成员：排工、会审、对接、旁问都不会叫他
+    "disabled_models": [],     # 停用的模型（如 "agy:gemini-4-argon-high"）：不出现在下拉框里，也不会被调用（包括当备用）
     "auto_title": "ds",        # 项目组做完后由谁起个短名字；""=不自动起名
     "pressure_prompt": "",     # 高压模式：DeepSeek 拆任务前先读到的这段话，由用户在设置里自己写
     "quota_guard": True,       # True：5 小时额度低于 15% 的成员自动跳过；False：照样让他干活（用户可在设置里关）
@@ -181,6 +183,36 @@ def agent_effort(cfg, agent, spec):
     else:
         e = (cfg.get("codex_effort") or "") if kind == "codex" else ""
     return e if e and e in effort_levels(spec) else ""
+
+
+def active_cfg(cfg):
+    """去掉停用的成员和模型后的配置。所有真正干活的命令都用它，于是排工、会审、自动对接、备用模型都只看得到启用的。"""
+    dis_a = set(x for x in cfg.get("disabled_agents") or [] if isinstance(x, str))
+    dis_m = set(x for x in cfg.get("disabled_models") or [] if isinstance(x, str))
+    if not dis_a and not dis_m:
+        return cfg
+    c = dict(cfg)
+    agents = {}
+    for n, chain in cfg["agents"].items():
+        ch = [x for x in chain if x not in dis_m]
+        if n not in dis_a and ch:
+            agents[n] = ch
+    c["agents"] = agents
+    c["_disabled_agents"] = [n for n in cfg["agents"] if n not in agents]
+    pref = [x for x in ("gemini", "gpt", "ds", "claude") if x in agents] + [x for x in agents if x not in ("gemini", "gpt", "ds", "claude")]
+    for k in ("planner", "synthesizer", "default_worker"):
+        if c.get(k) not in agents and pref:
+            c[k] = pref[0]
+    if c.get("auto_title") not in agents:
+        c["auto_title"] = ""
+    c["council_agents"] = [x for x in cfg.get("council_agents") or [] if x in agents]
+    return c
+
+
+def disabled_reason(cfg, agent):
+    if agent in (cfg.get("disabled_agents") or []):
+        return "%s 已停用（在团队卡片上打开就能用）" % agent
+    return "%s 的模型都停用了（在设置的「可用模型」里勾回来）" % agent
 
 
 def find_bin(cfg, name):
@@ -946,6 +978,8 @@ def resume_plan(agent, ext, meta, web):
 def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, quiet=False, note=True, meta=None,
         spec=None, effort=None, web=False):
     """调用某个角色。返回 (回答文本, 实际使用的后端描述)。全部后备都失败则抛 BackendError。"""
+    if agent not in cfg["agents"] and agent in (cfg.get("_disabled_agents") or []):
+        raise BackendError(disabled_reason(cfg, agent))
     if agent not in cfg["agents"]:
         raise BackendError("未知 agent：%s（可选：%s）" % (agent, ", ".join(cfg["agents"])))
     if hub_depth() >= MAX_DEPTH:
@@ -1665,6 +1699,9 @@ def choose_contact(cfg, message, contact=None):
                 reason = "%s，%s 最合适（%s）" % (stage, name, why)
             return name, phase, reason
         skipped.append("%s（%s）" % (name, why))
+    rest = [n for n in cfg["agents"] if n not in PHASE_PREFS[phase]]
+    if rest and not any(n in cfg["agents"] for n in PHASE_PREFS[phase]):  # 平时该找的人都停用了：由还启用的成员对接
+        return rest[0], phase, "平时这个阶段找的 %s 都停用了，改由 %s 对接" % ("、".join(PHASE_PREFS[phase]), rest[0])
     raise BackendError("自动模式找不到额度读得到且充足的成员（%s）。请在输入框上方手动指定联络人。" % "；".join(skipped))
 
 
@@ -1872,7 +1909,7 @@ def call_preferred(c):
 def ui_state(cfg):
     calls, runs = load_calls(), load_runs()
     try:
-        start_auto_titles(cfg, calls, runs)
+        start_auto_titles(active_cfg(cfg), calls, runs)
     except Exception as e:  # 起名出问题不能影响面板
         eprint("[hub] 自动起名出错：%s" % e)
     now = time.time()
@@ -1890,6 +1927,7 @@ def ui_state(cfg):
         last = mine[0] if mine else None
         agents.append({
             "name": name, "profile": cfg["profiles"].get(name, ""), "chain": chain,
+            "disabled": name in (cfg.get("disabled_agents") or []),
             "busy": len(cur),
             "current": [{"id": c["id"], "run": c.get("run"), "start": c.get("start"),
                          "title": c.get("title") or _preview(c.get("display") or c.get("prompt"), 40)} for c in cur],
@@ -1938,7 +1976,8 @@ def ui_state(cfg):
             "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout")},
                            council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
                            council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
-                           quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "", pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1],
+                           quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "",
+                           disabled_agents=list(cfg.get("disabled_agents") or []), disabled_models=list(cfg.get("disabled_models") or []), pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1],
                            effort={n: agent_effort(cfg, n, (cfg["agents"][n] or [""])[0]) for n in cfg["agents"]}),
             "workspace": UI_WORKSPACE, "backends": backend_choices(cfg),
             "ui_version": int(os.path.getmtime(UI_HTML)) if os.path.exists(UI_HTML) else 0}
@@ -1993,6 +2032,10 @@ def codex_defaults():
     return model, effort
 
 
+def enabled_specs(cfg):
+    return set(o["spec"] for o in backend_choices(cfg) if not o.get("off"))
+
+
 def backend_choices(cfg):
     """面板里可选的后端：[{spec, label}]。"""
     d = read_json(MODELS_PATH) or {}
@@ -2016,6 +2059,10 @@ def backend_choices(cfg):
             o["efforts"] = [{"id": e, "desc": d} for e, d in codex_model_efforts(mdl)]
         elif kind == "claude":
             o["efforts"] = [{"id": e, "desc": ""} for e in CLAUDE_EFFORTS]
+    off = set(cfg.get("disabled_models") or [])
+    for o in out:
+        if o["spec"] in off:
+            o["off"] = True
     known = set(o["spec"] for o in out)
     for chain in cfg["agents"].values():
         for sp in chain:
@@ -2051,7 +2098,7 @@ def run_health():
 
     def work():
         try:
-            write_json(HEALTH_PATH, {"ts": time.time(), "results": check_specs(load_config())})
+            write_json(HEALTH_PATH, {"ts": time.time(), "results": check_specs(active_cfg(load_config()))})
         finally:
             _health_running.clear()
 
@@ -2165,6 +2212,29 @@ def make_handoff(src, dst, title=""):
         "follows": {"type": dst["type"], "id": dst["id"]},
         "handoff": {"from": {"type": src["type"], "id": src["id"]}, "name": name}})
     return cid
+
+
+def undo_handoff(cid):
+    """撤销一次交接：把那条「交接」记录挪走（改名留底，不真删），两组重新分开。
+    交接之后已经接着问过的，改成直接接在交接之前那一轮后面。"""
+    if not re.fullmatch(r"c_[0-9a-f]+", str(cid or "")):
+        raise ValueError("记录不对")
+    path = os.path.join(CALLS_DIR, cid + ".json")
+    rec = read_json(path)
+    if not rec or rec.get("kind") != "handoff":
+        raise ValueError("这不是一条交接记录")
+    up = rec.get("follows")
+    paths = [os.path.join(CALLS_DIR, n) for n in os.listdir(CALLS_DIR) if n.endswith(".json") and n != cid + ".json"]
+    if os.path.isdir(RUNS_DIR):
+        paths += [os.path.join(RUNS_DIR, n, "run.json") for n in os.listdir(RUNS_DIR)]
+    for cp in paths:
+        c = read_json(cp)
+        f = c.get("follows") if isinstance(c, dict) else None
+        if isinstance(f, dict) and f.get("type") == "call" and f.get("id") == cid:
+            c["follows"] = up
+            write_json(cp, c)
+    os.replace(path, path + ".undone")
+    return up
 
 
 NAMES_PATH = os.path.join(HUB_HOME, "names.json")
@@ -2633,7 +2703,7 @@ class PairLimiter(object):
             self.fails.clear()
 
 
-REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/rename", "/api/handoff", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
+REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/rename", "/api/handoff", "/api/handoff/undo", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
 
 
 def gate(ip, host, sock_ip, port, path, cookie, lan_on):
@@ -3013,14 +3083,21 @@ def serve_ui(port, me):
             raise ValueError("会审只读，不能允许改文件")
         if mode in ("ask", "side") and agent not in c["agents"]:
             raise ValueError("没有这个 agent")
+        live = active_cfg(c)
+        if mode in ("ask", "side", "chat") and agent in c["agents"] and agent not in live["agents"]:
+            raise ValueError(disabled_reason(c, agent))
+        if mode == "pressure" and "ds" not in live["agents"]:
+            raise ValueError("高压模式需要 ds（DeepSeek），它现在停用了")
+        if mode == "image" and "gpt" not in live["agents"]:
+            raise ValueError("画图要用 gpt，它现在停用了")
         side = []
         if mode == "side":  # 旁问：只读，可指定模型、档位、联网
             if body.get("write"):
                 raise ValueError("旁问只读，不能允许改文件")
             sp, ef = body.get("spec") or "", body.get("effort")
             if sp:
-                if sp not in set(o["spec"] for o in backend_choices(c)):
-                    raise ValueError("不认识这个模型：%s" % sp)
+                if sp not in enabled_specs(c):
+                    raise ValueError("这个模型不认识或已停用：%s" % sp)
                 side += ["--spec", sp]
             if ef not in (None, ""):
                 if ef not in effort_levels(sp or (c["agents"][agent] or [""])[0]):
@@ -3081,6 +3158,9 @@ def serve_ui(port, me):
             if ag is not None:  # 重新执行时沿用当时的成员和综合者
                 if not isinstance(ag, list) or not ag or not all(isinstance(x, str) and x in c["agents"] for x in ag):
                     raise ValueError("会审成员不对")
+                ag = [x for x in ag if x in live["agents"]]  # 重新执行时，现在停用的成员不再叫
+                if not ag:
+                    raise ValueError("当时参加会审的成员现在都停用了")
                 cmd += ["--agents", ",".join(ag)]
             if sy is not None:
                 if sy not in c["agents"]:
@@ -3129,6 +3209,24 @@ def serve_ui(port, me):
             if not isinstance(pp, str) or len(pp) > 20000:
                 raise ValueError("高压模式提示词必须是文字，最多 2 万字")
             raw["pressure_prompt"] = pp
+        ae = body.get("agent_enabled")
+        if "agent_enabled" in body:
+            if not isinstance(ae, dict) or ae.get("agent") not in c["agents"] or not isinstance(ae.get("on"), bool):
+                raise ValueError("成员开关格式不对")
+            dis = [x for x in (raw.get("disabled_agents") or []) if x in c["agents"] and x != ae["agent"]]
+            if not ae["on"]:
+                dis.append(ae["agent"])
+                if len(dis) >= len(c["agents"]):
+                    raise ValueError("至少要留一位成员启用")
+            raw["disabled_agents"] = dis
+        me = body.get("model_enabled")
+        if "model_enabled" in body:
+            if not isinstance(me, dict) or not isinstance(me.get("on"), bool) or me.get("spec") not in set(o["spec"] for o in backend_choices(c)):
+                raise ValueError("模型开关格式不对")
+            dis = [x for x in (raw.get("disabled_models") or []) if isinstance(x, str) and x != me["spec"]]
+            if not me["on"]:
+                dis.append(me["spec"])
+            raw["disabled_models"] = dis
         if "auto_title" in body:
             if body["auto_title"] != "" and body["auto_title"] not in c["agents"]:
                 raise ValueError("没有这位成员")
@@ -3159,6 +3257,8 @@ def serve_ui(port, me):
                 raise ValueError("没有这个 agent：%s" % name)
             if spec not in set(o["spec"] for o in backend_choices(c)):
                 raise ValueError("不认识这个模型：%s" % spec)
+            if spec in (c.get("disabled_models") or []):
+                raise ValueError("这个模型已停用，先在设置的「可用模型」里勾回来")
             chain = list(c["agents"][name])
             idx = ch.get("index", 0)
             if type(idx) is not int:
@@ -3338,6 +3438,8 @@ def serve_ui(port, me):
                     return self.send(200, {"ok": True, "id": save_attachment(raw)})
                 elif self.path == "/api/handoff":  # 把一组的结果交接到另一组
                     return self.send(200, {"ok": True, "id": make_handoff(body.get("from"), body.get("to"), body.get("title"))})
+                elif self.path == "/api/handoff/undo":  # 撤销交接
+                    return self.send(200, {"ok": True, "back": undo_handoff(body.get("id"))})
                 elif self.path == "/api/rename":
                     set_name(body.get("key"), body.get("name"))
                 elif self.path == "/api/title/backfill":  # 给开启自动起名之前的项目组也起名（归档的不起）
@@ -3458,12 +3560,13 @@ def cmd_log(cfg, args):
 
 
 def main():
-    cfg = load_config()
+    full_cfg = load_config()
+    cfg = active_cfg(full_cfg)  # 停用的成员和模型不参与干活
     ap = argparse.ArgumentParser(prog="hub", description="本机多 Agent 调度器")
     sub = ap.add_subparsers(dest="cmd")
 
     a = sub.add_parser("ask", help="让某个 agent 回答/干活")
-    a.add_argument("agent", choices=list(cfg["agents"]))
+    a.add_argument("agent", choices=list(full_cfg["agents"]))
     a.add_argument("prompt", nargs="+", help="内容；写 - 则从标准输入读")
     a.add_argument("-w", "--cwd", help="工作目录（默认当前目录）")
     a.add_argument("--write", action="store_true", help="允许它创建/修改工作目录里的文件")
@@ -3522,8 +3625,8 @@ def main():
             warn = timeout_warning(args.timeout or cfg["timeout"])
             if warn:
                 eprint("[hub] 提醒：" + warn)
-            if args.spec and args.spec not in set(o["spec"] for o in backend_choices(cfg)):
-                raise BackendError("不认识这个模型：%s" % args.spec)
+            if args.spec and args.spec not in enabled_specs(full_cfg):
+                raise BackendError("这个模型不认识或已停用：%s" % args.spec)
             text, _ = ask(cfg, args.agent, read_prompt(args.prompt), cwd=args.cwd, write=args.write,
                           timeout=args.timeout, model=args.model, spec=args.spec, effort=args.effort,
                           web=args.web, meta={"kind": "side"} if args.side else None)

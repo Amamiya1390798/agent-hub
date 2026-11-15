@@ -6,7 +6,7 @@ const nodes={};
 const node=id=>nodes[id]||(nodes[id]={innerHTML:'',value:'',style:{},dataset:{},scrollTop:0,classList:{add(){},remove(){},toggle(){}},addEventListener(){},querySelectorAll(){return []},focus(){},contains(){return false}});
 const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []}},window:{},localStorage:{getItem(){return null}},sessionStorage:{getItem(){return null}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},getSelection:()=>null};
 vm.createContext(ctx);
-vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);', 'globalThis.ui={set:s=>S=s,effortSelect,modelSelect};'),ctx);
+vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);', 'globalThis.ui={set:s=>S=s,effortSelect,modelSelect,renderRail,modelListHtml,liveAgents};'),ctx);
 const lv=['Low','Medium','High'];
 const backends=lv.map(l=>({spec:'agy:gemini-4-carbon-'+l.toLowerCase(),label:'Gemini 4 Carbon ('+l+')'}))
   .concat(['Low','Medium','High','XHigh'].map(l=>({spec:'agy:gemini-4-hydrogen-'+l.toLowerCase(),label:'Gemini 4 Hydrogen ('+l+')'})))
@@ -38,4 +38,19 @@ assert.ok(/value="agy:gemini-4-carbon-high" selected>Gemini 4 Carbon</.test(h),'
 assert.ok(h.includes('value="agy:gemini-4-hydrogen-medium">Gemini 4 Hydrogen<'),'换系列默认 Medium');
 // 备用模型下拉框保留完整列表
 assert.ok(ctx.ui.modelSelect({name:'gemini',chain:['agy:x','agy:gemini-4-carbon-high']},1).includes('Gemini 4 Carbon (Low)'));
+// 开关：停用的模型不出现在下拉框（当前选着的除外，标「已停用」），停用的成员卡片变灰
+{
+  const bk=backends.map(b=>b.spec==='agy:gemini-4-carbon-high'||b.spec==='codex:gpt-6-luna'?Object.assign({},b,{off:true}):b);
+  ctx.ui.set({backends:bk,config:{effort:{}},agents:[{name:'gemini',chain:['agy:gemini-4-carbon-medium'],busy:0,current:[]},{name:'gpt',chain:['codex:gpt-6-luna'],busy:0,current:[],disabled:true}],calls:[],runs:[],health:{results:{}}});
+  let h=ctx.ui.effortSelect({name:'gemini',chain:['agy:gemini-4-carbon-medium']});
+  assert.ok(!h.includes('carbon-high'),'停用的档位不出现');
+  h=ctx.ui.modelSelect({name:'gpt',chain:['codex:gpt-6-luna']},0);
+  assert.ok(h.includes('Luna（已停用）'),'当前选着的停用模型标出来');
+  assert.ok(!ctx.ui.modelSelect({name:'gemini',chain:['agy:gemini-4-carbon-medium']},0).includes('Luna'),'别处不出现停用模型');
+  assert.deepEqual(ctx.ui.liveAgents().map(a=>a.name),['gemini']);
+  const ml=ctx.ui.modelListHtml();
+  assert.ok(ml.includes('data-model="codex:gpt-6-luna"><span>') && ml.includes('data-model="agy:gemini-4-carbon-medium" checked') && ml.includes('gemini 首选'),'可用模型清单');
+  ctx.ui.renderRail();
+  assert.ok(nodes.rail.innerHTML.includes('class="ag off"') && nodes.rail.innerHTML.includes('data-agent-on="gpt">'),'停用成员卡片和开关');
+}
 console.log('ui effort: model-native level names, per-model levels, gemini family merge passed');

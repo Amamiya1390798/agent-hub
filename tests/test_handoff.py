@@ -57,6 +57,21 @@ class HandoffTests(unittest.TestCase):
         with patch.dict(os.environ, {"HUB_META": '{"follows": {"type": "call", "id": "%s"}, "display": "接着问"}' % hid}):
             self.assertIsNone(g["resume_plan"]("claude", g["top_meta"](), {}, False), "交接后要重发上文，不能续接旧会话")
 
+    def test_undo(self):
+        g = self.g
+        self.call("c_a1", display="q", answer="a")
+        self.call("c_b1", display="b", answer="bb")
+        hid = g["make_handoff"]({"type": "call", "id": "c_b1"}, {"type": "call", "id": "c_a1"})
+        self.call("c_a3", display="接着问", answer="x", follows={"type": "call", "id": hid})
+        back = g["undo_handoff"](hid)
+        self.assertEqual(back, {"type": "call", "id": "c_a1"})
+        self.assertFalse(os.path.exists(os.path.join(g["CALLS_DIR"], hid + ".json")))
+        self.assertTrue(os.path.exists(os.path.join(g["CALLS_DIR"], hid + ".json.undone")), "留底不真删")
+        self.assertEqual(g["read_json"](os.path.join(g["CALLS_DIR"], "c_a3.json"))["follows"], {"type": "call", "id": "c_a1"})
+        for bad in ("c_a1", "../x", "c_nope"):
+            with self.assertRaises(ValueError, msg=bad):
+                g["undo_handoff"](bad)
+
 
 if __name__ == "__main__":
     unittest.main()

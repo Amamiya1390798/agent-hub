@@ -213,6 +213,21 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .ctx button:hover{background:var(--sel)}
 .ctx.off{color:var(--faint);background:transparent;border:1px dashed var(--line)}
 .ctx.fork{color:var(--ink);background:var(--sel)}
+.ag.off{opacity:.6}
+.onoff{position:relative;display:inline-block;width:34px;height:20px;flex:none;cursor:pointer}
+.onoff input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
+.onoff i{position:absolute;inset:0;border-radius:10px;background:var(--line);transition:.15s;pointer-events:none}
+.onoff i::after{content:"";position:absolute;left:2px;top:2px;width:16px;height:16px;border-radius:8px;background:#fff;transition:.15s;box-shadow:0 1px 2px rgba(0,0,0,.25)}
+.onoff input:checked + i{background:var(--good,#2fa86a)}
+.onoff input:checked + i::after{left:16px}
+.onoff input:focus-visible + i{outline:2px solid var(--faint)}
+.mlist{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+.mgroup{display:flex;flex-direction:column;gap:3px;font-size:12.5px}
+.mgroup b{font-size:12px;color:var(--muted);font-weight:600;margin-top:4px}
+.setting .mgroup label{display:flex;flex-direction:row;align-items:center;justify-content:flex-start;gap:6px;text-align:left;width:100%;margin:0;padding:1px 0;font-weight:400}
+.setting .mgroup label span{flex:0 1 auto;min-width:0;font-size:12.5px;color:var(--ink);font-weight:400;margin:0}
+.setting .mgroup input{width:auto;flex:none;margin:0}
+.mgroup em{font-style:normal;color:var(--faint);font-size:11.5px;margin-left:auto}
 .handcard{border:1px dashed var(--line);border-radius:12px;padding:10px 12px;margin:10px 0;background:var(--panel)}
 .handcard .who{font-size:13px;font-weight:600;margin-bottom:6px}
 .handcard details{margin-top:6px;font-size:13px}.handcard summary{cursor:pointer;color:var(--muted)}
@@ -846,7 +861,7 @@ function phoneHtml(){            // 只在电脑上显示：打开局域网、�
 function modelSelect(a, i){
   const sp = a.chain[i];
   if (isRemote()) return '<div class="model-line"><span>' + (i ? '备用模型' : '下次使用') + '</span><span>' + esc((((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp) + '</span></div>';
-  const all = S.backends || [{spec:sp, label:sp}];
+  const all = usable(S.backends || [{spec:sp, label:sp}], sp);
   let list = all;
   if (!i){        // 首选模型：Gemini 同一系列只列一次，档位到下面「思考等级」里选
     const curFam = (gemLevel(sp) || [])[1];
@@ -859,10 +874,12 @@ function modelSelect(a, i){
   }
   const opts = list.map(o => {
     const label = o.spec === "codex" ? o.label.replace("GPT · 跟随 Codex 设置", "GPT · 沿用本机设置") : o.spec === "dsh" ? "DeepSeek" : !i && gemLevel(o.spec) ? gemFamily(o.label) : o.label;
-    return '<option value="' + esc(o.spec) + '"' + (o.spec === sp ? " selected" : "") + '>' + esc(label) + '</option>';
+    return '<option value="' + esc(o.spec) + '"' + (o.spec === sp ? " selected" : "") + '>' + esc(label + (o.off ? "（已停用）" : "")) + '</option>';
   }).join("");
   return '<label class="model-line"><span>' + (i ? '备用模型' : '下次使用') + '</span><select class="msel" aria-label="' + esc(a.name) + (i ? '备用模型' : '使用模型') + '" data-chain="' + esc(a.name) + ':' + i + '">' + opts + '</select></label>';
 }
+const liveAgents = () => S ? S.agents.filter(a => !a.disabled) : [];          // 启用的成员
+const usable = (list, cur) => (list || []).filter(o => !o.off || o.spec === cur);   // 停用的模型不出现（当前选着的除外）
 const GEM_LV = /^(.*)-(low|medium|high|xhigh|max)$/, GEM_ORDER = ["low", "medium", "high", "xhigh", "max"];
 const gemLevel = sp => (sp || "").startsWith("agy:") ? sp.slice(4).match(GEM_LV) : null;     // [全名, 系列, 档位]
 const gemLabel = o => (String(o.label || "").match(/\(([^)]+)\)\s*$/) || [0, (gemLevel(o.spec) || [0, 0, o.spec])[2]])[1];   // 模型自己的写法，如 Medium
@@ -875,7 +892,7 @@ function effortSelect(a){               // 卡片上的「思考等级」：沿�
   if (kind === "agy"){
     const m = gemLevel(sp);
     if (!m) return text("这个模型不分档位");
-    const sib = (S.backends || []).filter(b => { const x = gemLevel(b.spec); return x && x[1] === m[1]; })
+    const sib = usable(S.backends, sp).filter(b => { const x = gemLevel(b.spec); return x && x[1] === m[1]; })
       .sort((x, y) => GEM_ORDER.indexOf(gemLevel(x.spec)[2]) - GEM_ORDER.indexOf(gemLevel(y.spec)[2]));
     const cur = sib.find(b => b.spec === sp) || {spec: sp, label: ""};
     if (sib.length < 2) return text(gemLabel(cur) + "（只有这一档）");
@@ -897,10 +914,10 @@ function effortSelect(a){               // 卡片上的「思考等级」：沿�
 /* ---------- 旁问小窗：单独问小问题，不进主线 ---------- */
 const specLabel = sp => (((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp;
 function sideState(){                   // 当前小窗里选中的成员、模型、档位、上下文
-  const ags = S.agents;
+  const ags = liveAgents().length ? liveAgents() : S.agents;
   if (!sideAgent || !ags.some(a => a.name === sideAgent)) sideAgent = (ags.find(a => a.name === "gemini") || ags[0]).name;
   const a = ags.find(x => x.name === sideAgent), kind = (a.chain[0] || "").split(":")[0];
-  const models = (S.backends || []).filter(b => b.spec.split(":")[0] === kind);
+  const models = (S.backends || []).filter(b => b.spec.split(":")[0] === kind && (!b.off || b.spec === a.chain[0]));
   const sp = models.some(b => b.spec === sideSpec) ? sideSpec : a.chain[0];
   const base = sideBase === "follow" && sideFollow ? findSide(sideFollow.id) : sideBase === "main" ? findItem(sel) : null;
   const baseOk = base && !RUNNING[base.status] ? base : null;
@@ -910,7 +927,7 @@ const sideCalls = () => S ? S.calls.filter(c => c.kind === "side" && !c.parent).
 const findSide = id => { const c = S && S.calls.find(x => x.id === id && x.kind === "side"); return c ? {type:"call", id:c.id, status:c.status, title:c.display || c.prompt_preview, rec:c} : null; };
 function sideCtlHtml(st){
   const {a, kind, models, sp} = st;
-  let h = '<span>谁来答</span><div class="two"><select data-sw="agent" aria-label="旁问成员">' + S.agents.map(x => '<option value="' + esc(x.name) + '"' + (x.name === a.name ? " selected" : "") + '>' + esc(x.name) + '</option>').join("") + '</select>';
+  let h = '<span>谁来答</span><div class="two"><select data-sw="agent" aria-label="旁问成员">' + liveAgents().map(x => '<option value="' + esc(x.name) + '"' + (x.name === a.name ? " selected" : "") + '>' + esc(x.name) + '</option>').join("") + '</select>';
   let list = models;
   if (kind === "agy"){                  // Gemini 同系列只列一次，档位在右边选
     const cur = (gemLevel(sp) || [])[1];
@@ -1032,25 +1049,40 @@ function bindImageInput(w, txtId, dropEl, fileId){
   bindFile(w, fileId);
 }
 function bindFile(w, fileId){ $(fileId).addEventListener("change", e => { addImages(e.target.files, w); e.target.value = ""; }); }
+function modelListHtml(){              // 设置里的「可用模型」：勾掉的不出现在下拉框里，也不会被调用
+  const kinds = [["agy", "Gemini（Antigravity 里只用 Gemini）"], ["codex", "GPT"], ["claude", "Claude"], ["dsh", "DeepSeek"]];
+  const users = sp => S.agents.filter(a => a.chain[0] === sp).map(a => a.name + " 首选").concat(S.agents.filter(a => a.chain.indexOf(sp) > 0).map(a => a.name + " 备用"));
+  let h = '<div class="setting"><span>可用模型</span><p>勾掉的模型不会出现在下拉框里，也不会被调用（包括当备用）。成员整个不想用，在团队卡片右上角关掉更方便。</p><div class="mlist">';
+  for (const [k, title] of kinds){
+    const list = (S.backends || []).filter(o => o.spec.split(":")[0] === k);
+    if (!list.length) continue;
+    h += '<div class="mgroup"><b>' + esc(title) + '</b>' + list.map(o => {
+      const u = users(o.spec);
+      return '<label><input type="checkbox" data-model="' + esc(o.spec) + '"' + (o.off ? "" : " checked") + '><span>' + esc(o.spec === "codex" ? "GPT · 沿用本机设置" : o.spec === "dsh" ? "DeepSeek" : o.label) + '</span>' + (u.length ? '<em>' + esc(u.join("、")) + '</em>' : "") + '</label>';
+    }).join("") + '</div>';
+  }
+  return h + '</div></div>';
+}
 function settingsHtml(){
   const cfg = S.config, hl = S.health || {results:{}};
   if (isRemote()) return '<h3>设置<button class="btn x" data-act="settings">返回团队</button></h3>' +
     '<section class="box"><h4>在手机上</h4><p>分工方式、模型、手机访问、登录这些设置只能在电脑上改，免得手机丢了被人乱改。</p>' +
     '<div class="setting"><label><span>页面配色</span><select id="theme"><option value="auto"' + (theme === "auto" ? " selected" : "") + '>跟随系统</option><option value="light"' + (theme === "light" ? " selected" : "") + '>浅色</option><option value="dark"' + (theme === "dark" ? " selected" : "") + '>深色</option></select></label></div>' +
     '<p class="small">想把 Hub 放到手机桌面：安卓 Chrome 点右上角 ⋮ →「添加到主屏幕」；iPhone Safari 点分享 →「添加到主屏幕」。</p></section>';
-  const optA = v => S.agents.map(a => '<option' + (a.name === v ? " selected" : "") + '>' + esc(a.name) + '</option>').join("");
+  const optA = v => S.agents.filter(a => !a.disabled || a.name === v).map(a => '<option' + (a.name === v ? " selected" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</option>').join("");
   const field = (name, control, help) => '<div class="setting"><label><span>' + name + '</span>' + control + '</label><p>' + help + '</p></div>';
   return '<h3>设置<button class="btn x" data-act="settings">返回团队</button></h3><p class="small">改完即保存；分工和模型设置从新任务开始生效。</p>' +
     '<section class="box"><h4>分工方式</h4>' +
     field('谁来拆任务', '<select data-cfg="planner">' + optA(cfg.planner) + '</select>', '收到目标后，由它决定分几步、交给谁。建议日常用 Gemini，复杂目标再选更擅长规划的成员；拆任务也会花它的额度。') +
     field('谁来汇总', '<select data-cfg="synthesizer">' + optA(cfg.synthesizer) + '</select>', '把大家的回答整理成一份结果；会审时由它比较共同点和分歧。建议用 Gemini；只有一个子任务时直接交回结果。') +
-    field('谁参加会审', '<span class="council-pick">' + S.agents.map(a => '<label style="display:inline-flex;gap:4px;margin-right:10px"><input type="checkbox" data-council="' + esc(a.name) + '"' + ((cfg.council_agents || []).indexOf(a.name) >= 0 ? " checked" : "") + '>' + esc(a.name) + '</label>').join("") + '</span>', '会审时勾选的成员同时各自作答，互相看不到答案，再由汇总的人比较。默认 Gemini、GPT、DeepSeek；Claude 默认不参加，想让它参加就勾上。') +
-    field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + S.agents.map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
+    field('谁参加会审', '<span class="council-pick">' + S.agents.map(a => '<label style="display:inline-flex;gap:4px;margin-right:10px' + (a.disabled ? ';opacity:.5' : '') + '"><input type="checkbox" data-council="' + esc(a.name) + '"' + ((cfg.council_agents || []).indexOf(a.name) >= 0 ? " checked" : "") + (a.disabled ? " disabled" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</label>').join("") + '</span>', '会审时勾选的成员同时各自作答，互相看不到答案，再由汇总的人比较。默认 Gemini、GPT、DeepSeek；Claude 默认不参加，想让它参加就勾上。') +
+    field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
     field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
     field('最多同时做几件', '<input type="number" min="1" max="8" data-cfg="max_parallel" value="' + esc(cfg.max_parallel) + '">', '不是只能两位合作：最多可同时做 8 件，也可由同一位做多件。建议先用 3；依赖前一步结果的任务仍要等。') +
     field('每一步最多等几分钟', '<input type="number" min="1" max="120" data-cfg="timeout" data-scale="60" value="' + Math.round(cfg.timeout/60) + '">', '超过时间会停止这次尝试，有备用模型时再交给它。建议 15 分钟；长任务可调大。' + (cfg.timeout < (cfg.min_timeout || 900) ? '<br><b class="stuck" style="color:var(--bad)">现在少于 15 分钟：读资料、审查、写长文常常需要 5～15 分钟，时间太短成员容易什么都交不出来。</b>' : '')) + '</section>' +
     '<section class="box"><h4>模型与额度</h4><p class="small">模型就是成员干活时使用的 AI 版本。团队卡片可换下次使用的模型，详情里可换备用模型；通常保留原设置即可。</p>' +
     '<p class="small">思考等级在团队卡片上按成员调：越深入通常越慢，也可能用更多额度，难题再调高。</p>' +
+    modelListHtml() +
     '<button class="btn" data-act="quota">刷新额度</button><p class="small">重新读取剩余额度，不会增加额度，也不会发消息给 AI，不消耗模型额度。平时每 5 分钟自动读取；GPT 显示最近会话留下的数据。</p></section>' +
     '<section class="box"><h4>提醒与外观</h4>' +
     field('完成时通知我', '<button class="btn" data-act="notify">' + (notify ? '已开启，点击关闭' : '开启') + '</button>', '任务结束、你没在看它时提醒你。不花模型额度，建议开启；浏览器可能会请求通知权限。') +
@@ -1075,7 +1107,13 @@ function renderRail(){
   let h = '<h3>团队<span class="x"><button class="btn railside' + (sideOpen ? ' primary' : '') + '" data-act="sidewin" title="开个小窗单独问个小问题，不影响主线">旁问</button><button class="btn" data-act="settings" aria-label="打开设置">⚙ 设置</button></span></h3><p class="small">按目标分工，不限两位。点模型名称可更换。</p>';
   for (const a of S.agents){
     const busy = a.busy > 0, expanded = agentDetails.has(a.name);
-    h += '<div class="ag' + (busy ? ' busy' : '') + '" style="--c:' + agc(a.name) + '"><div class="hd"><div class="a">' + agl(a.name) + '</div><div><div class="n">' + esc(a.name) + '</div><div class="role">' + esc((AG[a.name]||{}).role || '') + '</div></div><span style="margin-left:auto">' + (busy ? badge('run', a.busy + ' 件进行中') : badge('wait','空闲')) + '</span></div>';
+    const sw = isRemote() ? "" : '<label class="onoff" title="' + (a.disabled ? "启用这位成员" : "停用：排工、会审、对接、旁问都不叫他，也不当备用") + '"><input type="checkbox" data-agent-on="' + esc(a.name) + '"' + (a.disabled ? "" : " checked") + '><i></i></label>';
+    if (a.disabled){
+      h += '<div class="ag off" style="--c:' + agc(a.name) + '"><div class="hd"><div class="a">' + agl(a.name) + '</div><div><div class="n">' + esc(a.name) + '</div><div class="role">已停用</div></div><span style="margin-left:auto">' + sw + '</span></div><p class="small">排工、会审、对接、旁问都不会叫他，也不会当备用。打开右上角开关就恢复。</p></div>';
+      continue;
+    }
+    h += '<div class="ag' + (busy ? ' busy' : '') + '" style="--c:' + agc(a.name) + '"><div class="hd"><div class="a">' + agl(a.name) + '</div><div><div class="n">' + esc(a.name) + '</div><div class="role">' + esc((AG[a.name]||{}).role || '') + '</div></div><span style="margin-left:auto;display:inline-flex;gap:8px;align-items:center">' + (busy ? badge('run', a.busy + ' 件进行中') : badge('wait','空闲')) + sw + '</span></div>';
+    if ((S.backends || []).some(b => b.off && b.spec === a.chain[0])) h += '<p class="small" style="color:var(--bad)">下次使用的模型已停用，会直接用备用模型。</p>';
     if (a.quota && (a.quota.windows || a.quota.balance)) h += quotaHtml(a);
     else h += '<p class="small">' + (a.name === 'claude' ? '额度请在 Claude 应用中查看' : '暂无额度数据，详情中查看说明') + '</p>';
     const liveModels = uniq(S.calls.filter(c => c.agent === a.name && c.status === 'running').map(c => c.backend));
@@ -1356,6 +1394,7 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
       if (full.answer) copyStore[key] = full.answer;
       h += '<div class="handcard"><div class="who">⇢ 交接进来：「' + esc(hf.name || "") + '」的结果</div>' +
         (hf.from ? '<button class="job" data-act="select" data-type="' + esc(hf.from.type) + '" data-id="' + esc(hf.from.id) + '">打开来源那一组</button>' : "") +
+        '<button class="job" data-act="handoff-undo" data-id="' + esc(r.id) + '" title="去掉这次交接，两个项目组重新分开">↩ 撤销交接</button>' +
         '<details><summary>看交接的内容</summary>' + (full.answer ? '<div class="md">' + md(full.answer) + '</div>' : '<div class="small">载入中…</div>') + '</details></div>';
       continue;
     }
@@ -1404,23 +1443,24 @@ function renderView(){
   if (h === last.view) return;
   const s = getSelection();
   if (s && !s.isCollapsed && $("view").contains(s.anchorNode)) return;   // 用户正在选文字，先不重绘
-  const v = $("view"), st = v.scrollTop, keep = last.viewKey === (sel ? sel.type + sel.id : "new");
+  const v = $("view"), st = v.scrollTop, keep = last.viewKey === (sel ? sel.type + sel.id : "new"),
+    atEnd = v.scrollHeight - v.scrollTop - v.clientHeight < 60;   // 原来就停在最底下
   v.innerHTML = h; last.view = h; last.viewKey = sel ? sel.type + sel.id : "new";
   const sticks = {};
   v.querySelectorAll("[data-stick]").forEach((el, i) => { sticks[i] = el; });
-  v.scrollTop = keep ? st : 0;
+  v.scrollTop = it && (!keep || atEnd) ? v.scrollHeight : keep ? st : 0;   // 打开对话停在最新一轮；在底部时新内容来了也跟着到底
   Object.values(sticks).forEach(el => { el.scrollTop = el.scrollHeight; });   // 实时输出始终看最新一行
   ticks();
 }
 
 /* ---------- 输入区 ---------- */
 function renderComposer(){
-  const ms = [["chat","对接人",""], ["run","自动分工",""], ["council","会审",""], ["pressure","高压",""]].concat(S ? S.agents.map(a => [a.name, a.name, agc(a.name)]) : [], [["image","画图",""]]);
+  const ms = [["chat","对接人",""], ["run","自动分工",""], ["council","会审",""]].concat(!S || liveAgents().some(a => a.name === "ds") ? [["pressure","高压",""]] : []).concat(liveAgents().map(a => [a.name, a.name, agc(a.name)]), S && liveAgents().some(a => a.name === "gpt") ? [["image","画图",""]] : []);
   if (S && !ms.some(m => m[0] === mode)) mode = "chat";   // 恢复的草稿模式已不存在
   let mh = ms.map(m => '<button class="' + (mode === m[0] ? "on" : "") + '" data-act="mode" data-v="' + esc(m[0]) + '">' + (m[2] ? '<i class="dot" style="background:' + m[2] + '"></i>' : "") + esc(m[1]) + "</button>").join("");
-  if (S && contact !== "auto" && !S.agents.some(a => a.name === contact)) contact = "auto";   // 记住的人已经不在了
+  if (S && contact !== "auto" && !liveAgents().some(a => a.name === contact)) contact = "auto";   // 记住的人已经不在了或停用了
   const copts = '<option value="auto"' + (contact === "auto" ? " selected" : "") + '>对接人：自动</option>' +
-    (S ? S.agents : []).map(a => '<option value="' + esc(a.name) + '"' + (contact === a.name ? " selected" : "") + '>对接人：' + esc(a.name) + "</option>").join("");
+    liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (contact === a.name ? " selected" : "") + '>对接人：' + esc(a.name) + "</option>").join("");
   if (copts !== last.contact && document.activeElement !== $("contact")){ $("contact").innerHTML = copts; last.contact = copts; }
   $("contact").style.display = mode === "chat" ? "" : "none";
   if (mh !== last.modes){ $("modes").innerHTML = mh; last.modes = mh; }
@@ -1594,6 +1634,11 @@ document.addEventListener("click", async e => {
     else if (act === "sidewin"){ sideOpen = !sideOpen; last.side = last.sideCtl = last.rail = ""; renderSide(); renderRail(); if (sideOpen) $("sw-txt").focus(); }
     else if (act === "side-send") await sendSide();
     else if (act === "handoff-arm"){ handoffArm = el.dataset.id; last.view = ""; renderView(); }
+    else if (act === "handoff-undo"){
+      if (!confirm("撤销这次交接？两个项目组会重新分开，交接内容不再带给后面的追问。")) return;
+      try { const r = await api("/api/handoff/undo", {id: el.dataset.id}); toast("已撤销交接"); await poll(); if (r.back) select(r.back.type, r.back.id); else select(null); }
+      catch (e){ toast(e.message || "撤销失败"); }
+    }
     else if (act === "handoff-cancel"){ handoffArm = null; last.view = ""; renderView(); }
     else if (act === "rename"){
       const v = prompt("给它起个名字（清空就恢复成自动的名字）", el.dataset.name || "");
@@ -1713,6 +1758,12 @@ document.addEventListener("change", async e => {
       handoffArm = null; toast("已交接到「" + dstTitle + "」，在那边接着问就能用上"); await poll(); select("call", r.id);
     } catch(err){ toast(err.message || "没交接成功"); el.value = ""; }
     return;
+  }
+  if (el.dataset && (el.dataset.agentOn || el.dataset.model)){
+    const body = el.dataset.agentOn ? {agent_enabled: {agent: el.dataset.agentOn, on: el.checked}} : {model_enabled: {spec: el.dataset.model, on: el.checked}};
+    try { await api("/api/config", body); toast((el.dataset.agentOn || el.parentNode.textContent.trim().slice(0, 30)) + (el.checked ? " 已启用" : " 已停用")); }
+    catch(err){ el.checked = !el.checked; toast(err.message); }
+    el.blur(); last.rail = ""; last.modes = ""; last.contact = ""; poll(); return;
   }
   if (el.dataset && el.dataset.sw){
     const k = el.dataset.sw;
