@@ -26,7 +26,7 @@ class Fake:
             spec = kind + (":" + mdl if mdl else "")
             with self.lock:
                 self.prompts.append((spec, prompt, write))
-            synth = "几位成员各自独立回答了同一个问题" in prompt
+            synth = "比较各成员的独立回答" in prompt
             if self.barrier and not synth:
                 self.barrier.wait(timeout=5)  # 三位必须同时在跑才能一起过这道门
             if spec in self.fail or (synth and "synth" in self.fail):
@@ -76,8 +76,8 @@ class CouncilTests(Base):
         self.assertEqual(run['mode'], 'council')
         self.assertEqual(run['participants'], ['gemini', 'gpt', 'ds'])  # 默认没有 Claude
         self.assertFalse(any(spec.startswith('claude') for spec, _, _ in fake.prompts))
-        workers = [p for p in fake.prompts if '几位成员各自独立回答' not in p[1]]
-        synth = [p for p in fake.prompts if '几位成员各自独立回答' in p[1]]
+        workers = [p for p in fake.prompts if '比较各成员的独立回答' not in p[1]]
+        synth = [p for p in fake.prompts if '比较各成员的独立回答' in p[1]]
         self.assertEqual(len(workers), 3)
         self.assertEqual(len(synth), 1)
         for spec, prompt, write in workers:
@@ -109,7 +109,7 @@ class CouncilTests(Base):
         fake = Fake({})
         rc, run, _ = self.council(fake)
         self.assertEqual(run['synthesizer'], 'gpt')
-        synth = [s for s, p, _ in fake.prompts if '几位成员各自独立回答' in p]
+        synth = [s for s, p, _ in fake.prompts if '比较各成员的独立回答' in p]
         self.assertEqual(synth, ['codex:x'])
 
     def test_only_one_member_no_synthesis(self):
@@ -138,7 +138,7 @@ class CouncilTests(Base):
         self.assertEqual(tasks['gemini']['status'], 'ok')
         self.assertEqual(run['status'], 'failed')
         self.assertIn('1 位没有答复', run['error'])
-        synth = [p for s, p, _ in fake.prompts if '几位成员各自独立回答' in p][0]
+        synth = [p for s, p, _ in fake.prompts if '比较各成员的独立回答' in p][0]
         self.assertIn('缺席或失败', synth)
 
     def test_all_fail_and_synth_fail(self):
@@ -347,7 +347,7 @@ class ReviewFixTests(Base):
     def test_council_members_get_no_team_note(self):
         fake = Fake({})
         self.council(fake)
-        workers = [p for _, p, _ in fake.prompts if '几位成员各自独立回答' not in p]
+        workers = [p for _, p, _ in fake.prompts if '比较各成员的独立回答' not in p]
         self.assertTrue(workers)
         self.assertFalse(any('hub ask' in p for p in workers))
 

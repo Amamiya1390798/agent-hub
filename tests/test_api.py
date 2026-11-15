@@ -37,7 +37,7 @@ class API(unittest.TestCase):
                         ' time.sleep(30)\n'
                         'print(json.dumps({"event":"result","result":{"status":"SUCCESS","response":"测试回答"}}))\n' % sys.executable)
         fake.chmod(0o755)
-        (cls.home/'config.json').write_text(json.dumps({'bins': {'agy': str(fake)}, 'planner':'gemini', 'auto_title':'',
+        (cls.home/'config.json').write_text(json.dumps({'bins': {'agy': str(fake)}, 'keep_sessions': False, 'planner':'gemini', 'auto_title':'',
             'agents': {'ds': ['agy:fake-ds'], 'claude': ['agy:fake-claude']}}))
         with socket.socket() as sock:
             sock.bind(('127.0.0.1',0)); cls.port = sock.getsockname()[1]

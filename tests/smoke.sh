@@ -14,6 +14,9 @@ from pathlib import Path
 ast.parse(Path('hub').read_text(), feature_version=(3, 9))
 PY
 python3 hub --help >/dev/null
+python3 tests/test_history.py
+python3 tests/test_keep.py
+python3 tests/test_lifecycle.py
 python3 tests/test_hub.py
 python3 tests/test_api.py
 python3 tests/test_council.py
@@ -27,6 +30,7 @@ python3 tests/test_names.py
 python3 tests/test_handoff.py
 python3 tests/test_toggles.py
 python3 tests/test_denied.py
+python3 tests/test_busy.py
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js

@@ -39,7 +39,13 @@ class ResumeTests(unittest.TestCase):
         self.assertIsNone(self.plan(scope="one"), "只带一条上文不续接")
         with self.env():
             self.assertIsNone(self.g["resume_plan"]("gpt", self.g["top_meta"](), {}, False), "换人不续接")
-        for bad in ({"dispatch": {"run": "r"}}, {"session_continued_by": "c_x"}, {"status": "fail"}, {"session": None},
+        self.target(dispatch={"run": "r"}, answer="派活了\n\n---\n\n团队结果")
+        p = self.plan()
+        self.assertTrue(p and p["prompt"].startswith("（上一轮团队任务已结束") and "团队结果" in p["prompt"] and p["prompt"].endswith("第二问"), "派过活也续接，把团队结果补进去")
+        with self.env():
+            self.target()
+            self.assertIsNone(self.g["resume_plan"]("gemini", self.g["top_meta"](), {"kind": "side"}, False), "旁问不抢主对话的会话")
+        for bad in ({"session_continued_by": "c_x"}, {"status": "fail"}, {"session": None},
                     {"session": {"id": "bad id; rm"}}, {"kind": "image"}):
             self.target(**bad)
             self.assertIsNone(self.plan(), bad)

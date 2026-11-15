@@ -25,7 +25,7 @@ class PressureTests(unittest.TestCase):
         self.assertEqual(seen["agent"], "ds")
         p = seen["prompt"]
         self.assertIn("我的特别要求XYZ", p)
-        self.assertLess(p.index("我的特别要求XYZ"), p.index("你在给一个多 Agent 小团队排工"))
+        self.assertLess(p.index("我的特别要求XYZ"), p.index("为平等协作的小团队排工"))
 
     def test_no_inject_when_empty(self):
         g = self.g
@@ -34,7 +34,7 @@ class PressureTests(unittest.TestCase):
             {"summary": "s", "tasks": [{"id": "t1", "agent": "gemini", "title": "x", "prompt": "p"}]}))[1:] + ("dsh",)
         cfg = g["load_config"]()
         g["make_plan"](cfg, "目标B", self.tmp, False, "ds", 3, inject="   ")
-        self.assertTrue(seen["p"].startswith("你在给一个多 Agent 小团队排工"))
+        self.assertTrue(seen["p"].startswith("为平等协作的小团队排工"))
 
     def test_config_saves_prompt(self):
         g = self.g

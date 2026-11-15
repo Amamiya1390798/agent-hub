@@ -20,7 +20,9 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import copy
 import glob
+import heapq
 import json
 import os
 import re
@@ -33,6 +35,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
+from contextlib import contextmanager
 
 HOME = os.path.expanduser("~")
 HUB_HOME = os.environ.get("HUB_HOME", os.path.join(HOME, ".agent-hub"))
@@ -143,8 +147,8 @@ def load_config():
         return DEFAULT_CONFIG
 
 
-WEB_NOTE = ("\n\n（这个问题可以联网：需要最新或你不确定的信息时，请先用你的网页搜索工具查，"
-            "回答里附上主要来源链接；搜不到或没有搜索工具就直说，不要编。）")
+WEB_NOTE = ("\n\n（可联网。需要最新信息或对信息没把握时，先用网页搜索工具核实，"
+            "回答附主要来源链接；搜不到或没有搜索工具就直说，不编造。）")
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]   # 来自 claude --help 的 --effort 档位
 CODEX_EFFORTS_FALLBACK = ["low", "medium", "high", "xhigh", "max"]
 _EFFORT_ID = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
@@ -289,6 +293,8 @@ def _kill_tree_hard(p):
 
 def _on_stop(signum, frame):
     _stopping.set()
+    for kid in list(_active_keeps):
+        keep_close(kid)  # 空闲会话继续常驻，正在回答的会话必须一并停止
     deadline = time.time() + 3
     seen = set()
     while time.time() < deadline:
@@ -383,26 +389,27 @@ def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None):
 
     def feed():
         try:
-            p.stdin.write(stdin_text)
+            with p.stdin:
+                p.stdin.write(stdin_text)
         except (OSError, ValueError):
             pass
-        finally:
-            p.stdin.close()
 
     ths = [threading.Thread(target=pump, args=(p.stdout, outs, on_line), daemon=True),
            threading.Thread(target=pump, args=(p.stderr, errs), daemon=True)]
     if stdin_text is not None:
         ths.append(threading.Thread(target=feed, daemon=True))
     deadline = time.monotonic() + timeout
-    for t in ths:
-        t.start()
     try:
+        if _stopping.is_set():
+            raise BackendError(STOP_MSG)
+        for t in ths:
+            t.start()
         p.wait(timeout=max(0, deadline - time.monotonic()))
         for t in ths:
             t.join(max(0, deadline - time.monotonic()))
         if any(t.is_alive() for t in ths):
             raise subprocess.TimeoutExpired(cmd, timeout)
-    except subprocess.TimeoutExpired:
+    except BaseException as e:
         _kill_tree(p)
         try:
             p.wait(timeout=1)
@@ -412,9 +419,15 @@ def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None):
         _kill_tree_hard(p)
         p.wait()
         for t in ths:
-            t.join(2)
-        raise BackendError("超时（%ss）" % timeout)
+            if t.ident is not None:
+                t.join(2)
+        if isinstance(e, subprocess.TimeoutExpired):
+            raise BackendError("超时（%ss）" % timeout)
+        raise
     finally:
+        for stream, t in zip((p.stdout, p.stderr, p.stdin), ths):
+            if stream is not None and not t.is_alive():
+                stream.close()
         _children.discard(p)
     return p.returncode, "".join(outs), "".join(errs)
 
@@ -512,6 +525,226 @@ def agy_denied_text(data):
         DENIED_PREFIX, acts or "做一件需要权限的事", "（被拒的是：%s）" % detail if detail else "")
 
 
+KEEP_DIR = os.path.join(HUB_HOME, "keep")  # 常驻的 Gemini 会话：开着不关，下一句话直接接着说，省掉每次开机和重读前文
+_keep_processes = {}  # 本进程启动的会话，保留句柄以便退出时回收
+_active_keeps = set()
+
+
+def _keep_paths(kid):
+    return {k: os.path.join(KEEP_DIR, kid + ext) for k, ext in (("meta", ".json"), ("fifo", ".in"), ("log", ".log"), ("lock", ".lock"))}
+
+
+def _keep_alive(meta):
+    p = _keep_processes.get(meta.get("id"))
+    if p is not None and p.pid == meta.get("pid"):
+        return p.poll() is None  # poll 也会回收本进程的僵尸子进程
+    return pid_alive(meta.get("pid"))
+
+
+def keep_list():
+    """所有还开着的常驻会话；进程已经没了的顺手清掉。"""
+    out = []
+    if not os.path.isdir(KEEP_DIR):
+        return out
+    for n in sorted(os.listdir(KEEP_DIR)):
+        if not n.endswith(".json"):
+            continue
+        d = read_json(os.path.join(KEEP_DIR, n))
+        if not isinstance(d, dict) or not d.get("id"):
+            continue
+        if not _keep_alive(d):
+            keep_close(d["id"])
+            continue
+        out.append(d)
+    return out
+
+
+def keep_close(kid, kill=True):
+    if not re.fullmatch(r"k_[0-9a-f]{10}", str(kid or "")):
+        return False
+    ps = _keep_paths(kid)
+    d = read_json(ps["meta"]) or {}
+    p = _keep_processes.get(kid)
+    if p is not None and not d.get("pid"):
+        d = dict(d, id=kid, pid=p.pid)
+    if kill and d.get("pid"):
+        owned = p is not None and p.pid == d["pid"]
+        cmdline = ""
+        if not owned and _keep_alive(d):
+            try:
+                cmdline = subprocess.check_output(["ps", "-o", "command=", "-p", str(d["pid"])], text=True)
+            except (OSError, subprocess.CalledProcessError):
+                pass
+        if owned or "agy" in cmdline:  # 自己握着句柄，或确认仍是原来的 Gemini 进程
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(int(d["pid"]), sig)
+                except OSError:
+                    pass
+                for _ in range(20):
+                    if not _keep_alive(d):
+                        break
+                    time.sleep(0.1)
+                # 即使组长退出也继续 SIGKILL，避免留下继承 FIFO/日志的子孙。
+    if p is not None:
+        p.poll()
+        if p.returncode is not None:
+            _keep_processes.pop(kid, None)
+    for k in ("meta", "fifo", "log", "lock"):
+        try:
+            os.unlink(ps[k])
+        except OSError:
+            pass
+    return True
+
+
+def _keep_spawn(exe, model, cwd, write, sid, title):
+    if _stopping.is_set():
+        raise BackendError(STOP_MSG)
+    os.makedirs(KEEP_DIR, exist_ok=True)
+    kid = "k_" + uuid.uuid4().hex[:10]
+    ps = _keep_paths(kid)
+    os.mkfifo(ps["fifo"], 0o600)
+    cmd = [exe, "--input-format", "stream-json", "--output-format", "stream-json", "--add-dir", ATTACH_DIR]
+    if model:
+        cmd += ["--model", model]
+    if sid:
+        cmd += ["--conversation", sid]
+    cmd += agy_perm_args(write) + ["-p="]
+    try:
+        fin = os.open(ps["fifo"], os.O_RDWR)  # 自己也握着写端：中间没人说话时它不会读到结尾而退出
+        try:
+            with open(ps["log"], "ab") as logf:
+                p = subprocess.Popen(cmd, cwd=cwd, env=clean_env(), stdin=fin, stdout=logf, stderr=subprocess.STDOUT,
+                                     start_new_session=True, close_fds=True)
+        finally:
+            os.close(fin)
+    except BaseException:
+        keep_close(kid, kill=False)
+        raise
+    _keep_processes[kid] = p
+    meta = {"id": kid, "pid": p.pid, "model": model, "write": bool(write), "cwd": cwd, "conv": sid or "",
+            "title": title or "", "start": time.time(), "last": time.time(), "turns": 0}
+    write_json(ps["meta"], meta)
+    return meta
+
+
+def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line):
+    """在常驻会话里说一句话，等这一轮的结果。返回 False 表示这次用不了常驻（交给原来的一次性方式）。"""
+    import fcntl
+    deadline = time.monotonic() + timeout
+    if _stopping.is_set():
+        raise BackendError(STOP_MSG)
+    meta = None
+    keeps = keep_list() if sid else []
+    if sid:
+        meta = next((d for d in keeps if d.get("conv") == sid and d.get("model") == model
+                     and d.get("write") == bool(write) and d.get("cwd") == cwd), None)
+    if not meta:
+        for d in keeps:  # 同一个会话换了权限/目录：旧的那个用不上了，关掉
+            if sid and d.get("conv") == sid:
+                keep_close(d["id"])
+        meta = _keep_spawn(exe, model, cwd, write, sid, title)
+        meta["fresh"] = True
+    ps = _keep_paths(meta["id"])
+    try:
+        lockf = open(ps["lock"], "w")
+    except OSError:
+        if meta.get("fresh"):
+            keep_close(meta["id"])
+        raise
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lockf.close()
+        if meta.get("fresh"):
+            keep_close(meta["id"])
+        return False  # 同一个会话正在回答别的话
+    _active_keeps.add(meta["id"])
+
+    def check_deadline():
+        if _stopping.is_set():
+            raise BackendError(STOP_MSG)
+        if time.monotonic() >= deadline:
+            raise BackendError("超时（%ss）" % timeout)
+
+    try:
+        check_deadline()
+        pos = 0 if meta.pop("fresh", False) else (os.path.getsize(ps["log"]) if os.path.exists(ps["log"]) else 0)
+        try:
+            fd = os.open(ps["fifo"], os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            if not _keep_alive(meta) and not meta.get("turns"):
+                keep_close(meta["id"])
+                return False
+            raise
+        try:
+            data = (json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n").encode("utf-8")
+            while data:
+                check_deadline()
+                try:
+                    data = data[os.write(fd, data):]
+                except BlockingIOError:
+                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+                except BrokenPipeError:
+                    if not meta.get("turns") and not _keep_alive(meta):
+                        keep_close(meta["id"])
+                        return False
+                    raise
+        finally:
+            os.close(fd)
+        meta.update(last=time.time(), busy=True)
+        write_json(ps["meta"], meta)
+        buf = b""
+        with open(ps["log"], "rb") as f:
+            f.seek(pos)
+            while True:
+                check_deadline()  # 连续输出也不能绕过总超时
+                chunk = f.readline()
+                if chunk:
+                    buf += chunk
+                    if not buf.endswith(b"\n"):
+                        continue
+                    line, buf = buf.decode("utf-8", "replace"), b""
+                    on_line(line)
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        ev = None
+                    if isinstance(ev, dict) and ev.get("event") == "result" and isinstance(ev.get("result"), dict):
+                        res = ev["result"]
+                        meta.update(last=time.time(), busy=False, turns=meta.get("turns", 0) + 1,
+                                    conv=res.get("conversation_id") or meta.get("conv"))
+                        write_json(ps["meta"], meta)
+                        return True
+                    continue
+                if not _keep_alive(meta):
+                    f.seek(0)
+                    error = _tail(f.read().decode("utf-8", "replace"))
+                    keep_close(meta["id"])
+                    if not meta.get("turns"):  # 一开机就退出（比如这个版本不支持常驻）：改回一次性的方式
+                        return False
+                    raise BackendError("常驻的 Gemini 会话意外退出了：%s" % error)
+                time.sleep(0.15)
+    except BaseException:
+        keep_close(meta["id"])
+        raise
+    finally:
+        _active_keeps.discard(meta["id"])
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lockf.close()
+
+
+def agy_perm_args(write):
+    if write:
+        return ["--mode", "accept-edits", "--dangerously-skip-permissions"]
+    # 只读：允许读任何位置的文件（和其他成员的只读一样），但不能写、不能运行命令。否则读工作目录外的文件会被拒、交白卷
+    return ["--settings", json.dumps({"permissions": {"allow": ["read_file(/)"]}})]
+
+
 def backend_agy(cfg, model, prompt, cwd, write, timeout):
     exe = find_bin(cfg, "agy")
     if not exe:
@@ -532,10 +765,7 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
         cmd += ["--conversation", cfg["_resume"]]
     if cfg.get("_images"):  # 让它能打开放图片的目录
         cmd += ["--add-dir", ATTACH_DIR]
-    if write:
-        cmd += ["--mode", "accept-edits", "--dangerously-skip-permissions"]
-    else:  # 只读：允许读任何位置的文件（和其他成员的只读一样），但不能写、不能运行命令。否则读工作目录外的文件会被拒、交白卷
-        cmd += ["--settings", json.dumps({"permissions": {"allow": ["read_file(/)"]}})]
+    cmd += agy_perm_args(write)
     live = Live()
     box = {"data": None, "step": None, "tok": {"in": 0, "out": 0, "cache": 0}}
 
@@ -568,8 +798,11 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
             arg = next((str(v) for v in params.values() if isinstance(v, (str, int, float)) and str(v).strip()), "")
             live.step("%s %s" % (su.get("tool_name") or "tool", arg))
 
+    rc, out, err = 0, "", ""
     try:
-        rc, out, err = _run(cmd, cwd, clean_env(), timeout + 30, on_line=on_line)
+        kept = cfg.get("_keep") and keep_turn(exe, model, prompt, cwd, write, timeout, cfg.get("_resume"), cfg.get("_keep_title"), on_line)
+        if not kept:
+            rc, out, err = _run(cmd, cwd, clean_env(), timeout + 30, on_line=on_line)
     finally:
         live.close()
         if tmp:
@@ -710,7 +943,7 @@ def backend_claude(cfg, model, prompt, cwd, write, timeout):
     if not exe:
         raise BackendError("未找到 claude CLI")
     cmd = [exe, "-p", "--model", model or "opus",
-           "--permission-mode", "acceptEdits" if write else "plan"]
+           "--permission-mode", "bypassPermissions" if write else "plan"]  # 允许改文件=无人值守：命令、本机软件都放行（和 Gemini 一致）；acceptEdits 只放行改文件，命令会被拦
     if cfg.get("_effort") in CLAUDE_EFFORTS:
         cmd += ["--effort", cfg["_effort"]]
     if cfg.get("_web"):  # 只读模式下也放行 Claude 自带的网页搜索和读网页
@@ -774,6 +1007,28 @@ def read_json(path):
             return json.load(f)
     except (OSError, ValueError):
         return None
+
+
+def _fail_tasks(rec):
+    for t in rec.get("tasks") or []:
+        if t.get("status") in ("pending", "running"):
+            t["status"] = "fail" if t["status"] == "running" else "skipped"
+
+
+@contextmanager
+def _record_guard(get_record, save, failure):
+    """异常继续抛给调用方，同时把已创建的记录收尾。"""
+    try:
+        yield
+    except BaseException as e:
+        rec = get_record()
+        if (rec.get("status") in ("planning", "running", "synthesizing")
+                or (failure == "failed" and rec.get("status") == "failed")):
+            if failure == "failed":
+                _fail_tasks(rec)
+            error = STOP_MSG if isinstance(e, KeyboardInterrupt) else str(e) or type(e).__name__
+            save(status=failure, error=rec.get("error") or error, end=time.time())
+        raise
 
 
 QUOTA_PATH = os.path.join(HUB_HOME, "quota.json")
@@ -929,9 +1184,9 @@ def top_meta():
 
 def team_note(cfg, me):
     others = [a for a in cfg["agents"] if a != me]
-    return ("\n\n---\n[协作说明] 你是多 Agent 团队中的「%s」。如果遇到明显更适合队友的子任务，"
-            "可以在终端执行 `hub ask <agent> \"问题\"` 向队友求助（可选：%s；加 --write 允许对方改文件；长内容用 `hub ask <agent> -` 从标准输入传）。"
-            "不需要就别用。直接给出最终结果，不要反问。" % (me, " / ".join(others)))
+    return ("\n\n---\n[协作说明] 你是团队成员「%s」。子任务明显更适合队友时，"
+            "可在终端执行 `hub ask <agent> \"问题\"` 求助（可选：%s；加 --write 允许对方改文件；长内容用 `hub ask <agent> -` 从标准输入传入）。"
+            "只交最终结果和必要说明，不复述过程，不反问。" % (me, " / ".join(others)))
 
 
 _ATT_NAME = re.compile(r"^att-[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\.(png|jpg|webp|gif)$")
@@ -982,9 +1237,12 @@ def image_note(paths):
 _SID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
+CHAT_FAST = {"agy:gemini-pro-orchestrator": ("agy:gemini-4-carbon-medium",)}  # 首选模型 → 聊天时改用的轻模型
+
+
 def resume_plan(agent, ext, meta, web):
     """追问时能不能直接续接上一轮的原生会话（各家都会缓存会话前文，命中率更高，也不用重发上文）。
-    只在「接着上一轮、同一位、同一个模型、上一轮成功、没派过团队、那个会话还没被别的分支接过」时续接；
+    只在「接着上一轮、同一位、同一个模型、上一轮成功（或派过团队，结果补进这一句）、那个会话还没被别的分支接过」时续接；旁问只接旁问；
     分叉、只带一条上文、换人换模型时都不续接，照旧把上文写进提示词新开会话。"""
     f = ext.get("follows") or {}
     if ext.get("fork") or ext.get("scope", "full") != "full" or f.get("type") != "call" \
@@ -993,12 +1251,19 @@ def resume_plan(agent, ext, meta, web):
     tpath = os.path.join(CALLS_DIR, f["id"] + ".json")
     t = read_json(tpath) or {}
     ses = t.get("session") if isinstance(t.get("session"), dict) else {}
-    if t.get("status") != "ok" or t.get("agent") != agent or t.get("kind") not in ("ask", "chat", "side") \
-            or t.get("dispatch") or t.get("session_continued_by") or not _SID.match(str(ses.get("id") or "")):
+    if (t.get("status") != "ok" and not t.get("dispatch")) or t.get("agent") != agent or t.get("kind") not in ("ask", "chat", "side") \
+            or t.get("session_continued_by") or not _SID.match(str(ses.get("id") or "")):
+        return None
+    if (meta.get("kind") == "side") != (t.get("kind") == "side"):  # 旁问另开自己的线，不去抢主对话的会话
         return None
     text = meta.get("resume_prompt") or ext.get("display")
     if not text:
         return None
+    if t.get("dispatch") and t.get("status") != "running":  # 上一轮派了活（还在做的话，后台情况另外写在这句话里）：把团队交回的结果补给它，再接着说，不必重读全部前文
+        res = (t.get("answer") or "").split("\n\n---\n\n", 1)[-1].strip()
+        if t.get("status") != "ok":
+            res = "（没有全部完成：%s）\n%s" % (t.get("error") or "", res)
+        text = "（上一轮团队任务已结束，以下结果用户已看到：）\n%s\n\n%s" % (res[:12000], text)
     imgs = [p for p in (attachment_path(n) for n in ext.get("images") or []) if p]
     return {"from": f["id"], "path": tpath, "sid": str(ses["id"]), "backend": t.get("backend"),
             "prompt": text + image_note(imgs) + (WEB_NOTE if web else "")}
@@ -1032,6 +1297,8 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
     full_prompt = prompt + (team_note(cfg, agent) if note and hub_depth() + 1 < MAX_DEPTH else "")
     if web:
         full_prompt += WEB_NOTE
+    if (meta or {}).get("kind", "ask") in ("ask", "side") and not (meta or {}).get("run"):  # 用户直接问某位成员：同样照这个写法回
+        full_prompt += "\n\n" + USER_STYLE
     errors = []
     meta = meta or {}
     cid = "c_" + uuid.uuid4().hex[:10]
@@ -1054,10 +1321,10 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
             rec["fork"] = True
         rec["submission_id"] = ext.get("submission_id")
     cpath = os.path.join(CALLS_DIR, cid + ".json")
+    keepable = (bool(cfg.get("keep_sessions", True)) and not rec["parent"] and rec["kind"] in ("ask", "chat", "side")
+                and bool(os.environ.get("HUB_META")) and hub_depth() == 0)  # 只给面板里的对话留着；命令行、队员互相求助的一次性提问不留
     resume = resume_plan(agent, top_meta(), meta, web) if not rec["parent"] and rec["kind"] in ("ask", "chat", "side") else None
     write_json(cpath, rec)
-    if meta.get("on_start"):
-        meta["on_start"](cid)
     previous = (getattr(_ctx, "call_id", None), getattr(_ctx, "run_id", None), getattr(_ctx, "write", True))
     _ctx.call_id = cid
     _ctx.run_id = rec["run"]
@@ -1068,112 +1335,124 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
         rec["end"] = time.time()
         rec["secs"] = round(rec["end"] - rec["start"], 1)
         write_json(cpath, rec)
-        _ctx.call_id, _ctx.run_id, _ctx.write = previous
 
-    for i, spec_i in enumerate(chain):
-        if _stopping.is_set():
-            break
-        kind, _, mdl = spec_i.partition(":")
-        fn = BACKENDS.get(kind)
-        if not fn:
-            errors.append((spec_i, "未知后端（找不到）"))
-            rec["attempts"].append({"backend": spec_i, "error": "未知后端", "reason": "配置里写了不认识的模型：%s" % spec_i})
-            continue
-        t0 = time.time()
-        rec["backend"] = spec_i
-        write_json(cpath, rec)
-        _ctx.tokens = None
-        _ctx.session = None
-        _ctx.partial = None
-        try:
-            eff = agent_effort(cfg, agent, spec_i)
-            if effort is not None and i == 0 and spec:  # 旁问里单独选的档位只用在指定的那个模型上
-                eff = effort if effort in effort_levels(spec_i) else ""
-            run_cfg = dict(cfg, _effort=eff, _web=bool(web), _images=[attachment_path(n) for n in images])
-            text = None
-            if resume and resume["backend"] == spec_i:
-                t = read_json(resume["path"]) or {}
-                t["session_continued_by"] = cid  # 先占住：这个会话之后只沿这条线续，别的分支另开新会话
-                write_json(resume["path"], t)
-                try:
-                    text = fn(dict(run_cfg, _resume=resume["sid"]), mdl, resume["prompt"], cwd, write, timeout)
-                    rec["resumed"] = resume["from"]
-                except (BackendError, OSError) as e:
-                    if _stopping.is_set():
-                        raise
-                    rec["attempts"].append({"backend": spec_i, "error": str(e)[:800], "resume_failed": True,
-                                            "reason": "续接上一轮的会话没成功（%s），改为带上前文重新问" % explain_error(str(e))[0]})
-                    write_json(cpath, rec)
-                    _ctx.tokens = _ctx.session = _ctx.partial = None
-                    if not quiet:
-                        eprint("[hub] 续接上一轮会话没成功，改为带上前文重新问…")
-                resume = None
-            if text is None:
-                text = fn(run_cfg, mdl, full_prompt, cwd, write, timeout)
-            dt = time.time() - t0
-            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": True,
-                      "secs": round(dt, 1), "write": write, "cwd": cwd,
-                      "prompt": prompt[:200], "answer_chars": len(text)})
-            if i > 0 and not quiet:
-                eprint("[hub] 注意：%s 的首选模型没成功，这次由备用的 %s 完成。" % (agent, spec_label(spec_i)))
-            if meta.get("defer"):  # 调用方还要接着处理（例如对接人派活），先别标「完成」
-                finish(status="running", tokens=getattr(_ctx, "tokens", None), session=getattr(_ctx, "session", None))
-                rec["end"] = rec["secs"] = None
+    try:
+        with _record_guard(lambda: rec, finish, "fail"):
+            if meta.get("on_start"):
+                meta["on_start"](cid)
+            for i, spec_i in enumerate(chain):
+                if _stopping.is_set():
+                    break
+                kind, _, mdl = spec_i.partition(":")
+                fn = BACKENDS.get(kind)
+                if not fn:
+                    errors.append((spec_i, "未知后端（找不到）"))
+                    rec["attempts"].append({"backend": spec_i, "error": "未知后端", "reason": "配置里写了不认识的模型：%s" % spec_i})
+                    continue
+                t0 = time.time()
+                rec["backend"] = spec_i
                 write_json(cpath, rec)
-            else:
-                finish(status="ok", answer=text, tokens=getattr(_ctx, "tokens", None),
-                       session=getattr(_ctx, "session", None))
-            return text, spec_i
-        except (BackendError, OSError) as e:
-            errors.append((spec_i, str(e)))
-            att = {"backend": spec_i, "error": str(e)[:800], "reason": "%s：%s" % (spec_label(spec_i), explain_error(str(e))[0])}
-            if getattr(_ctx, "partial", None):
-                att["partial"] = _ctx.partial
-                rec["partial"] = _ctx.partial  # 超时等情况下已经写出来的部分，标「未完成」给人看
-            rec["attempts"].append(att)
-            log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": False,
-                      "secs": round(time.time() - t0, 1), "error": str(e)[:500], "prompt": prompt[:200]})
-            if str(e).startswith(DENIED_PREFIX):  # 权限问题换模型也一样，不浪费额度再试
-                break
-            if not quiet:
-                nxt = chain[i + 1] if i + 1 < len(chain) else None
-                eprint("[hub] %s 没成功（%s）%s" % (spec_label(spec_i), explain_error(str(e))[0],
-                                                 "，换 %s 再试…" % spec_label(nxt) if nxt else "。"))
-    msg = failure_text(agent, errors)
-    finish(status="fail", error=msg, error_detail="\n\n".join("[%s] %s" % (sp, raw) for sp, raw in errors))
-    raise BackendError(msg)
+                _ctx.tokens = None
+                _ctx.session = None
+                _ctx.partial = None
+                try:
+                    eff = agent_effort(cfg, agent, spec_i)
+                    if effort is not None and i == 0 and spec:  # 旁问里单独选的档位只用在指定的那个模型上
+                        eff = effort if effort in effort_levels(spec_i) else ""
+                    run_cfg = dict(cfg, _effort=eff, _web=bool(web), _images=[attachment_path(n) for n in images],
+                                   _keep=keepable, _keep_title=rec.get("display") or rec.get("title") or "")
+                    text = None
+                    if resume and resume["backend"] == spec_i:
+                        t = read_json(resume["path"]) or {}
+                        t["session_continued_by"] = cid  # 先占住：这个会话之后只沿这条线续，别的分支另开新会话
+                        write_json(resume["path"], t)
+                        try:
+                            text = fn(dict(run_cfg, _resume=resume["sid"]), mdl, resume["prompt"], cwd, write, timeout)
+                            rec["resumed"] = resume["from"]
+                        except (BackendError, OSError) as e:
+                            if _stopping.is_set():
+                                raise
+                            rec["attempts"].append({"backend": spec_i, "error": str(e)[:800], "resume_failed": True,
+                                                    "reason": "续接上一轮的会话没成功（%s），改为带上前文重新问" % explain_error(str(e))[0]})
+                            write_json(cpath, rec)
+                            _ctx.tokens = _ctx.session = _ctx.partial = None
+                            if not quiet:
+                                eprint("[hub] 续接上一轮会话没成功，改为带上前文重新问…")
+                        resume = None
+                    if text is None:
+                        text = fn(run_cfg, mdl, full_prompt, cwd, write, timeout)
+                    dt = time.time() - t0
+                    log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": True,
+                              "secs": round(dt, 1), "write": write, "cwd": cwd,
+                              "prompt": prompt[:200], "answer_chars": len(text)})
+                    if i > 0 and not quiet:
+                        eprint("[hub] 注意：%s 的首选模型没成功，这次由备用的 %s 完成。" % (agent, spec_label(spec_i)))
+                    if meta.get("defer"):  # 调用方还要接着处理（例如对接人派活），先别标「完成」
+                        finish(status="running", tokens=getattr(_ctx, "tokens", None), session=getattr(_ctx, "session", None))
+                        rec["end"] = rec["secs"] = None
+                        write_json(cpath, rec)
+                    else:
+                        finish(status="ok", answer=text, tokens=getattr(_ctx, "tokens", None),
+                               session=getattr(_ctx, "session", None))
+                    return text, spec_i
+                except (BackendError, OSError) as e:
+                    errors.append((spec_i, str(e)))
+                    att = {"backend": spec_i, "error": str(e)[:800], "reason": "%s：%s" % (spec_label(spec_i), explain_error(str(e))[0])}
+                    if getattr(_ctx, "partial", None):
+                        att["partial"] = _ctx.partial
+                        rec["partial"] = _ctx.partial  # 超时等情况下已经写出来的部分，标「未完成」给人看
+                    rec["attempts"].append(att)
+                    log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": False,
+                              "secs": round(time.time() - t0, 1), "error": str(e)[:500], "prompt": prompt[:200]})
+                    if str(e).startswith(DENIED_PREFIX):  # 权限问题换模型也一样，不浪费额度再试
+                        break
+                    if not quiet:
+                        nxt = chain[i + 1] if i + 1 < len(chain) else None
+                        eprint("[hub] %s 没成功（%s）%s" % (spec_label(spec_i), explain_error(str(e))[0],
+                                                         "，换 %s 再试…" % spec_label(nxt) if nxt else "。"))
+            msg = failure_text(agent, errors)
+            finish(status="fail", error=msg, error_detail="\n\n".join("[%s] %s" % (sp, raw) for sp, raw in errors))
+            raise BackendError(msg)
+    finally:
+        _ctx.call_id, _ctx.run_id, _ctx.write = previous
 
 
 # ---------------------------------------------------------------- 规划 + 并行执行
 
-PLAN_PROMPT = """你在给一个多 Agent 小团队排工。团队成员是平等的队友：按各自长处和剩余额度分配工作，写清依赖和预计耗时，而不是单向下命令。
+PLAN_PROMPT = """为平等协作的小团队排工，按成员长处和剩余额度分配，写清依赖与预计耗时。
 
 团队成员：
 {roster}
 
 排工规则：
-1. 简单目标（翻译一句话、回答一个小问题）只排 1 个任务，交给最合适的一位，不要为了热闹浪费额度。
-2. 目标里有几块互相独立的工作时，拆成 2～4 个可以同时做的任务，尽量分给不同成员，发挥各自长处；不要把同一份工作复制给几个人。
-3. 关键成果（方案、代码、要交给用户的结论）值得的话，再排一个由另一位成员做的「审查」任务，用 depends_on 接在它后面。
-4. 像一家小公司分岗位：执行类的活（查资料、写初稿、写代码、整理）默认给 gemini；claude / gpt 主要负责拍板和审查（定方案、审查关键成果），画图给 gpt；零碎小活给 ds。{quota_rule}gemini 额度不足时再让别人顶上，并在 why 里写明。
-5. 每个任务的 prompt 必须自包含：队员看不到用户原话，把需要的背景、约束、输出格式都写进去。确实依赖其他任务结果的用 depends_on 标出，执行时会自动把前置结果附给它。
-6. why 写一句为什么派给这位（长处或额度）；eta_min 写预计需要几分钟（整数）。每位成员一次最多有 {timeout_min} 分钟。
-7. 任务数 1~{max_tasks} 个。write=true 表示该任务需要创建/修改文件、运行命令或操作本机软件（只读任务只能读文件、上网查，不能运行任何命令）{write_hint}；不要让两个写任务改同一个文件。
-
-例子（只示意结构）：
-- 「把这句话翻译成英文」→ 1 个任务给 ds。
-- 「比较三家云盘并给出建议」→ t1 gemini 查资料、t2 ds 整理价格表（同时进行）→ t3 gpt 审查结论并拍板（depends_on t1、t2）。
+1. 简单目标只排 1 个任务，交给最合适的成员。
+2. 有多块独立工作时，拆成 2～4 个可并行任务，尽量分给不同成员；不要重复分派同一份工作。
+3. 关键成果（方案、代码、交付用户的结论）值得复核时，再交给另一位成员审查，用 depends_on 接在产出任务后。
+4. 执行工作（查资料、写初稿、写代码、整理）默认给 gemini；claude / gpt 主要定方案、拍板和审查；画图给 gpt，零碎小活给 ds。{quota_rule}gemini 额度不足时再由其他成员接手，并在 why 中说明。
+5. 每个任务的 prompt 必须自包含：队员看不到用户原话，须写全所需背景、约束和输出格式，并要求简洁交付成果与必要说明。依赖其他任务结果时用 depends_on 标出，执行时会自动附上前置结果。
+6. why 用一句话说明成员长处或额度原因；eta_min 填预计分钟数，须为整数。每位成员单次最多有 {timeout_min} 分钟。
+7. 共排 1～{max_tasks} 个任务。创建或修改文件、运行命令、操作本机软件的任务设 write=true（只读任务只能读文件、上网，不能运行任何命令）{write_hint}；两个写任务不得修改同一文件。
+8. 1～2 分钟内排完，只根据已给目标和背景拆分。不要自行读文件、运行命令、上网或执行任务；需要先摸清情况，就把它排为第一个任务。
 
 工作目录：{cwd}
 
 用户目标：
 {goal}
 
-只输出一个 JSON 对象，不要任何其他文字、不要代码块标记：
+只输出一个 JSON 对象，不加其他文字或代码块标记：
 {{"summary": "一句话方案", "tasks": [{{"id": "t1", "agent": "gemini", "title": "简短标题", "why": "为什么派给它", "eta_min": 5, "prompt": "给队员的完整指令", "depends_on": [], "write": false}}]}}"""
 
-SYNTH_PROMPT = """下面是一个多 Agent 团队为完成用户目标各自交回的结果。请整合成一份给用户的最终答复：
-直接给结论与成果，去掉重复，指出各结果之间的矛盾（如有），标明哪些任务失败了。用简体中文。
+USER_STYLE = """【回答写法，必须遵守】用户不是程序员，看不懂技术细节。有固定输出格式（如【派活】）时先守格式，其余一律这样写：
+1. 第一句就给结论或结果，像跟朋友发消息那样说。
+2. 默认 200 字以内；只说用户要知道的和要做的，不讲内部原理、代码、文件路径、函数名、参数名。
+3. 不用表格、不用小标题、不堆粗体；最多列 3～5 个短点。
+4. 用日常词，不用英文缩写和行话；实在绕不开就顺手用大白话解释一句。
+5. 用户追问了再展开细节。
+6. 没把握就直说哪里不确定，不编。"""
+
+SYNTH_PROMPT = USER_STYLE + """
+
+把各任务结果合并成一份给用户的最终答复，直接交付结论和成果。去掉重复，指出结果中的矛盾（如有），标明失败的任务；不要逐份复述队员的回答。
 
 用户目标：
 {goal}
@@ -1181,19 +1460,21 @@ SYNTH_PROMPT = """下面是一个多 Agent 团队为完成用户目标各自交�
 各任务结果：
 {results}"""
 
-COUNCIL_PROMPT = """请独立回答下面的问题。几位队友在同时、各自独立作答，你看不到他们的答案，他们也看不到你的；之后会有人比较大家的共同点和分歧。
-请给出你自己的判断和理由；不确定的地方直说不确定，不要编造。用简体中文。
+COUNCIL_PROMPT = """请独立回答下面的问题。其他队员也在同时独立作答，彼此看不到答案；之后会统一比较共同点和分歧。
+用简体中文，简短给出自己的判断和关键理由；不确定就直说，不编造。
 
 问题：
 {question}"""
 
-COUNCIL_SYNTH_PROMPT = """几位成员各自独立回答了同一个问题。请比较他们的回答，用简体中文按下面四节输出：
+COUNCIL_SYNTH_PROMPT = USER_STYLE + """
+
+比较各成员的独立回答，按以下四节输出，标题保持原样：
 ## 建议
 ## 共同点
 ## 分歧与各自理由
 ## 还需要确认的信息
 
-要求：不要因为多数人这么说就当成事实；每条分歧写清是谁的观点、理由是什么；如果有成员缺席或失败，在开头注明。{note}
+不要把多数意见当成事实；每项分歧写清成员、观点和理由。有成员缺席或失败时，在四节之前简要注明。{note}
 
 问题：
 {question}
@@ -1348,6 +1629,44 @@ def strip_report(text):
     return "\n".join(lines)
 
 
+def run_notes(rid):
+    """用户在团队干活途中补充的话（对接人转告的），按时间顺序。"""
+    out = []
+    try:
+        with open(os.path.join(RUNS_DIR, str(rid), "notes.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line)["text"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+def add_run_note(rid, text):
+    with open(os.path.join(RUNS_DIR, str(rid), "notes.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": time.time(), "text": text[:4000]}, ensure_ascii=False) + "\n")
+
+
+def busy_runs_in_line(depth=8):
+    """这条对话线上，对接人之前派出去、现在还在做的项目组。"""
+    out, f = [], top_meta().get("follows") or {}
+    for _ in range(depth):
+        if f.get("type") != "call" or not re.fullmatch(r"c_[0-9a-f]+", str(f.get("id") or "")):
+            break
+        t = read_json(os.path.join(CALLS_DIR, f["id"] + ".json")) or {}
+        rid = (t.get("dispatch") or {}).get("run")
+        if rid:
+            r = read_json(os.path.join(RUNS_DIR, str(rid), "run.json")) or {}
+            if r.get("status") in ("planning", "running", "synthesizing") and pid_alive(r.get("pid")):
+                ts = r.get("tasks") or []
+                out.append({"id": rid, "goal": (r.get("display") or r.get("goal") or "")[:300],
+                            "done": sum(1 for x in ts if x.get("status") == "ok"), "total": len(ts)})
+        f = t.get("follows") or {}
+    return out
+
+
 def board_text(state, me, share_results=True, footer=True):
     goal = state.get("display") or state["goal"]  # 追问时 goal 前面带着历史背景，看板上只写这次的要求
     lines = ["===== 共享进度板（项目看板，全队都能看到）=====", "整体目标：%s" % goal[:2000]]
@@ -1366,12 +1685,16 @@ def board_text(state, me, share_results=True, footer=True):
         if share_results and t["id"] != me and t.get("leftover"):
             bits.append("遗留：%s" % t["leftover"][:200])
         lines.append("；".join(bits))
+    notes = run_notes(state.get("id"))
+    if notes:
+        lines.append("用户补充（优先于上文；有冲突时以最新要求为准）：")
+        lines += ["- " + n for n in notes]
     if not footer:
         return "\n".join(lines)
     lines.append("你负责：%s。时限约 %d 分钟。" % (me, max(1, round(state.get("timeout", 900) / 60))))
     if not share_results:
-        lines.append("（这是会审：其他人在同时独立作答，你看不到他们的答案。）")
-    lines.append("做完后请在回答最后单独写两行，方便写回进度板：\n【进度】一句话说明做到哪\n【遗留】没做完或需要别人注意的事（没有就写 无）")
+        lines.append("（这是会审：其他人同时独立作答，你看不到他们的答案。）")
+    lines.append("简洁交付结果和必要说明，末尾单独写两行：\n【进度】一句话说明完成情况\n【遗留】未完成事项或提醒；没有则写 无")
     return "\n".join(lines)
 
 
@@ -1509,53 +1832,54 @@ def run_goal(cfg, goal, cwd, write, planner, synthesizer, max_parallel, max_task
     run_id, run_dir, state, save = _open_run(cfg, goal, cwd, write, planner=planner, synthesizer=synthesizer,
                                              pressure=bool(pressure), pressure_prompt=inject or None,
                                              **_sub_fields(goal, parent_call))
-    if on_open:
-        on_open(run_id)
-    cwd = state["cwd"]
-    eprint("[hub] 排工中（%s）…" % planner)
-    try:
-        plan = make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id, title=state.get("display"), inject=inject)
-    except BackendError as e:
-        save(status="failed", end=time.time(), error=str(e))
-        raise
-    write_json(os.path.join(run_dir, "plan.json"), dict(plan, goal=goal, cwd=cwd))
-    if dry:
-        save(status="done", end=time.time(), tasks=plan["tasks"],
-             summary="（只出方案）" + str(plan.get("summary", "")))
-        print(json.dumps(plan, ensure_ascii=False, indent=2))
-        return 0
-    eprint("[hub] 方案：%s" % plan.get("summary", ""))
-    for t in plan["tasks"]:
-        eprint("   - %s [%s]%s %s%s" % (t["id"], t["agent"], "✎" if t["write"] else "", t["title"],
-                                         ("  ⇐ " + ",".join(t["depends_on"])) if t["depends_on"] else ""))
-        t.update(status="pending", backend=None, secs=None, call_id=None, answer=None)
-    save(status="running", summary=str(plan.get("summary", "")), tasks=plan["tasks"])
-    results = _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel)
-    tasks = {t["id"]: t for t in state["tasks"]}
-
-    ok_count = sum(1 for r in results.values() if r["ok"])
-    synth_ok = True
-    if len(tasks) == 1:
-        final = strip_report(list(results.values())[0]["text"])
-    else:
-        blob = "\n\n".join("### %s %s（%s）\n%s" % (tid, tasks[tid]["title"], tasks[tid]["agent"], results[tid]["text"])
-                           for tid in tasks)
+    with _record_guard(lambda: state, save, "failed"):
+        if on_open:
+            on_open(run_id)
+        cwd = state["cwd"]
+        eprint("[hub] 排工中（%s）…" % planner)
         try:
-            eprint("[hub] 汇总中（%s）…" % synthesizer)
-            save(status="synthesizing")
-            final, _ = ask(cfg, synthesizer, SYNTH_PROMPT.format(goal=goal, results=blob), cwd=cwd, note=False,
-                           quiet=True, meta={"run": run_id, "kind": "synth", "title": "汇总：" + (state.get("display") or goal)[:40]})
+            plan = make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id, title=state.get("display"), inject=inject)
         except BackendError as e:
-            synth_ok = False
-            final = "（汇总失败：%s）\n\n%s" % (e, blob)
-    with open(os.path.join(run_dir, "final.md"), "w", encoding="utf-8") as f:
-        f.write(final + "\n")
-    all_ok = ok_count == len(tasks) and synth_ok
-    save(status="done" if all_ok else "failed", end=time.time(), final=final,
-         error=None if all_ok else ("汇总失败" if not synth_ok else "%d 个任务没有完成" % (len(tasks) - ok_count)))
-    print(final)
-    eprint("[hub] 完成 %d/%d 个任务。过程记录：%s" % (ok_count, len(tasks), run_dir))
-    return 0 if all_ok else 1
+            save(status="failed", end=time.time(), error=str(e))
+            raise
+        write_json(os.path.join(run_dir, "plan.json"), dict(plan, goal=goal, cwd=cwd))
+        if dry:
+            save(status="done", end=time.time(), tasks=plan["tasks"],
+                 summary="（只出方案）" + str(plan.get("summary", "")))
+            print(json.dumps(plan, ensure_ascii=False, indent=2))
+            return 0
+        eprint("[hub] 方案：%s" % plan.get("summary", ""))
+        for t in plan["tasks"]:
+            eprint("   - %s [%s]%s %s%s" % (t["id"], t["agent"], "✎" if t["write"] else "", t["title"],
+                                             ("  ⇐ " + ",".join(t["depends_on"])) if t["depends_on"] else ""))
+            t.update(status="pending", backend=None, secs=None, call_id=None, answer=None)
+        save(status="running", summary=str(plan.get("summary", "")), tasks=plan["tasks"])
+        results = _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel)
+        tasks = {t["id"]: t for t in state["tasks"]}
+
+        ok_count = sum(1 for r in results.values() if r["ok"])
+        synth_ok = True
+        if len(tasks) == 1:
+            final = strip_report(list(results.values())[0]["text"])
+        else:
+            blob = "\n\n".join("### %s %s（%s）\n%s" % (tid, tasks[tid]["title"], tasks[tid]["agent"], results[tid]["text"])
+                               for tid in tasks)
+            try:
+                eprint("[hub] 汇总中（%s）…" % synthesizer)
+                save(status="synthesizing")
+                final, _ = ask(cfg, synthesizer, SYNTH_PROMPT.format(goal=goal + "".join("\n（用户中途补充：%s）" % n for n in run_notes(run_id)), results=blob), cwd=cwd, note=False,
+                               quiet=True, meta={"run": run_id, "kind": "synth", "title": "汇总：" + (state.get("display") or goal)[:40]})
+            except BackendError as e:
+                synth_ok = False
+                final = "（汇总失败：%s）\n\n%s" % (e, blob)
+        with open(os.path.join(run_dir, "final.md"), "w", encoding="utf-8") as f:
+            f.write(final + "\n")
+        all_ok = ok_count == len(tasks) and synth_ok
+        save(status="done" if all_ok else "failed", end=time.time(), final=final,
+             error=None if all_ok else ("汇总失败" if not synth_ok else "%d 个任务没有完成" % (len(tasks) - ok_count)))
+        print(final)
+        eprint("[hub] 完成 %d/%d 个任务。过程记录：%s" % (ok_count, len(tasks), run_dir))
+        return 0 if all_ok else 1
 
 
 def council_members(cfg, members=None):
@@ -1593,76 +1917,84 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
         skipped=skipped, status="running", tasks=tasks, **_sub_fields(question, parent_call),
         summary="会审：%s 各自独立作答，%s比较共同点和分歧" % ("、".join(t["agent"] for t in active) or "无人",
                                                      (synth + " ") if synth else ""))
-    if on_open:
-        on_open(run_id)
-    if not active:
-        msg = "没有成员可以参加这次会审（%s）" % "；".join("%s：%s" % (s["agent"], s["reason"]) for s in skipped)
-        save(status="failed", end=time.time(), error=msg, final=msg)
-        raise BackendError(msg)
-    eprint("[hub] 会审：%s 同时作答%s" % ("、".join(t["agent"] for t in active),
-                                     "；跳过 " + "、".join(s["agent"] for s in skipped) if skipped else ""))
-    results = _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel=len(active), share_results=False)
-    ok = [t for t in tasks if results.get(t["id"], {}).get("ok")]
-    failed = [t for t in active if t not in ok]
-    absent = ["%s：%s" % (t["agent"], (t.get("skip_reason") or (t.get("answer") or "")[:200])) for t in tasks if t not in ok]
-    by_backend = {}
-    for t in ok:
-        by_backend.setdefault(t.get("backend"), []).append(t["agent"])
-    same = ["%s 实际都由同一个模型 %s 作答，不算不同模型的独立意见" % ("、".join(v), k)
-            for k, v in by_backend.items() if len(v) > 1]
-    notes = absent and ["缺席或失败：" + "；".join(absent)] or []
-    notes += same
-    synth_ok = True
-    if not ok:
-        final = "会审没有得到任何回答。\n\n" + "\n".join(absent)
-    elif len(ok) == 1:
-        final = ("**注意：仅 %s 一位给出了回答，没有形成多方会审。**\n\n" % ok[0]["agent"] + strip_report(ok[0]["answer"]) +
-                 ("\n\n---\n" + "\n".join(notes) if notes else ""))
-    else:
-        if any(t["agent"] == synth for t in failed):  # 综合者刚才自己都没答上来，换一位已答复的成员
-            synth = ok[0]["agent"]
-            notes.append("原定的综合者没有答复，改由 %s 综合" % synth)
-            save(synthesizer=synth)
-        blob = "\n\n".join("### %s（实际模型 %s）\n%s" % (t["agent"], t.get("backend"), t["answer"]) for t in ok)
-        note = ("\n额外说明：" + "；".join(notes)) if notes else ""
-        try:
-            eprint("[hub] 比较意见中（%s）…" % synth)
-            save(status="synthesizing")
-            final, _ = ask(cfg, synth, COUNCIL_SYNTH_PROMPT.format(question=question, results=blob, note=note),
-                           cwd=state["cwd"], note=False, quiet=True,
-                           meta={"run": run_id, "kind": "synth", "title": "会审综合：" + (state.get("display") or question)[:40]})
-            if same:
-                final = "> 注意：" + "；".join(same) + "\n\n" + final
-        except BackendError as e:
-            synth_ok = False
-            final = "（综合失败：%s）\n\n%s" % (e, blob)
-    with open(os.path.join(run_dir, "final.md"), "w", encoding="utf-8") as f:
-        f.write(final + "\n")
-    all_ok = not failed and synth_ok and len(ok) >= 2  # 因额度跳过的成员已注明，不算失败
-    if all_ok:
-        err = ("跳过了 " + "、".join(s["agent"] for s in skipped)) if skipped else None
-    elif not ok:
-        err = "没有成员给出回答"
-    elif not synth_ok:
-        err = "综合失败"
-    elif failed:
-        err = "%d 位没有答复" % len(failed) + ("，仅一位答复，未形成多方会审" if len(ok) == 1 else "")
-    else:
-        err = "仅一位参加，未形成多方会审"
-    save(status="done" if all_ok else "failed", end=time.time(), final=final, error=err, same_backend=same)
-    print(final)
-    eprint("[hub] 会审结束：%d/%d 位答复。过程记录：%s" % (len(ok), len(tasks), run_dir))
-    return 0 if all_ok else 1
+    with _record_guard(lambda: state, save, "failed"):
+        if on_open:
+            on_open(run_id)
+        if not active:
+            msg = "没有成员可以参加这次会审（%s）" % "；".join("%s：%s" % (s["agent"], s["reason"]) for s in skipped)
+            save(status="failed", end=time.time(), error=msg, final=msg)
+            raise BackendError(msg)
+        eprint("[hub] 会审：%s 同时作答%s" % ("、".join(t["agent"] for t in active),
+                                         "；跳过 " + "、".join(s["agent"] for s in skipped) if skipped else ""))
+        results = _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel=len(active), share_results=False)
+        ok = [t for t in tasks if results.get(t["id"], {}).get("ok")]
+        failed = [t for t in active if t not in ok]
+        absent = ["%s：%s" % (t["agent"], (t.get("skip_reason") or (t.get("answer") or "")[:200])) for t in tasks if t not in ok]
+        by_backend = {}
+        for t in ok:
+            by_backend.setdefault(t.get("backend"), []).append(t["agent"])
+        same = ["%s 实际都由同一个模型 %s 作答，不算不同模型的独立意见" % ("、".join(v), k)
+                for k, v in by_backend.items() if len(v) > 1]
+        notes = absent and ["缺席或失败：" + "；".join(absent)] or []
+        notes += same
+        synth_ok = True
+        if not ok:
+            final = "会审没有得到任何回答。\n\n" + "\n".join(absent)
+        elif len(ok) == 1:
+            final = ("**注意：仅 %s 一位给出了回答，没有形成多方会审。**\n\n" % ok[0]["agent"] + strip_report(ok[0]["answer"]) +
+                     ("\n\n---\n" + "\n".join(notes) if notes else ""))
+        else:
+            if any(t["agent"] == synth for t in failed):  # 综合者刚才自己都没答上来，换一位已答复的成员
+                synth = ok[0]["agent"]
+                notes.append("原定的综合者没有答复，改由 %s 综合" % synth)
+                save(synthesizer=synth)
+            blob = "\n\n".join("### %s（实际模型 %s）\n%s" % (t["agent"], t.get("backend"), t["answer"]) for t in ok)
+            note = ("\n额外说明：" + "；".join(notes)) if notes else ""
+            try:
+                eprint("[hub] 比较意见中（%s）…" % synth)
+                save(status="synthesizing")
+                final, _ = ask(cfg, synth, COUNCIL_SYNTH_PROMPT.format(question=question, results=blob, note=note),
+                               cwd=state["cwd"], note=False, quiet=True,
+                               meta={"run": run_id, "kind": "synth", "title": "会审综合：" + (state.get("display") or question)[:40]})
+                if same:
+                    final = "> 注意：" + "；".join(same) + "\n\n" + final
+            except BackendError as e:
+                synth_ok = False
+                final = "（综合失败：%s）\n\n%s" % (e, blob)
+        with open(os.path.join(run_dir, "final.md"), "w", encoding="utf-8") as f:
+            f.write(final + "\n")
+        all_ok = not failed and synth_ok and len(ok) >= 2  # 因额度跳过的成员已注明，不算失败
+        if all_ok:
+            err = ("跳过了 " + "、".join(s["agent"] for s in skipped)) if skipped else None
+        elif not ok:
+            err = "没有成员给出回答"
+        elif not synth_ok:
+            err = "综合失败"
+        elif failed:
+            err = "%d 位没有答复" % len(failed) + ("，仅一位答复，未形成多方会审" if len(ok) == 1 else "")
+        else:
+            err = "仅一位参加，未形成多方会审"
+        save(status="done" if all_ok else "failed", end=time.time(), final=final, error=err, same_backend=same)
+        print(final)
+        eprint("[hub] 会审结束：%d/%d 位答复。过程记录：%s" % (len(ok), len(tasks), run_dir))
+        return 0 if all_ok else 1
 
 
 # ---------------------------------------------------------------- 主联络窗口：用户只跟一位「联络人」说话
 
-CHAT_PROMPT = """你是用户在 Hub 这家小公司里的「对接人」（项目经理）。用户只跟你说话；团队里还有：{team}。
-你可以自己直接回答；如果这件事明显需要几位一起做（要拆成几块并行、要动手做较大的活、要查很多资料），或者需要几位独立给意见再比较，
-就不要自己硬做，只输出下面两种格式之一（单独一段，不要别的文字），Hub 会替你派活，做完把结果交回这个对话：
-【派活】自动分工：<写清楚交给团队的完整目标，包括用户的要求和背景>
-【派活】会审：<写清楚要几位独立回答并比较的问题>
-简单的问题（闲聊、翻译、小问答、解释）自己直接答，不要为了热闹派活。用简体中文，说人话。
+
+CHAT_PROMPT = USER_STYLE + """
+
+你负责在 Hub 对接用户，团队成员有：{team}。用户只与你交谈。
+
+简单问题（闲聊、翻译、小问答、解释）自己直接回答，不必派活。直接回答通常在一分钟内完成，最多读一两个文件；需要反复查阅、运行命令或动手操作时，交给团队。
+
+明显需要团队协作的工作（拆成几块并行、较大的执行任务、大量查资料）用自动分工；需要几位独立回答后比较，用会审。
+
+派活时只输出以下对应的一段，不加其他文字。Hub 会执行，并将结果送回本对话：
+【派活】自动分工：<完整目标，包含用户的要求和背景>
+【派活】会审：<要独立回答并比较的完整问题，包含用户的要求和背景>
+
 {phase_note}
 用户说：
 {message}"""
@@ -1790,8 +2122,17 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
     info.update(phase=phase, reason=reason, handoff=handoff)
     cid_box = []
     shown = top_meta().get("display") or message
+    busy = busy_runs_in_line()
+    if busy:  # 团队还在做之前派的活：告诉对接人，别再叠一份
+        b = busy[0]
+        bnote = ("\n\n（后台：先前任务「%s」仍在进行，已完成 %d/%d 件。"
+                 "若本轮是对该任务的补充、修改或催问，直接回答；需转告团队时，在回答末尾单独一行写：【转告团队】<要转告的话>。"
+                 "不要重复派活；只有与该任务无关的新事才能另派。）" % (b["goal"], b["done"], b["total"]))
+        message, shown = message + bnote, shown + bnote
+    # 对接人日常聊天用轻快的模型（最重的那档留给拆任务），失败了自动换回原来的顺序
+    fast = next((x for x in cfg["agents"].get(name) or [] if x in CHAT_FAST.get((cfg["agents"][name] or [""])[0], ())), None)
     text, spec = ask(cfg, name, CHAT_PROMPT.format(team=team, phase_note=note, message=message), cwd=cwd,
-                     write=False, note=False,
+                     write=False, note=False, spec=fast,
                      meta={"kind": "chat", "title": "联络：" + shown[:40], "chat": info, "on_start": cid_box.append,
                            "defer": True,
                            "resume_prompt": CHAT_PROMPT.format(team=team, phase_note=note, message=shown) if top_meta().get("display") else None})
@@ -1804,42 +2145,57 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
             rec["secs"] = round(kw["end"] - (rec.get("start") or kw["end"]), 1)
         write_json(cpath, rec)
 
-    m = re.match(r"\s*【派活】\s*(自动分工|会审)\s*[:：]\s*(\S[\s\S]*)", text)  # 只认开头就是【派活】的回答
-    if not m:
-        update(status="ok", answer=text, end=time.time())
-        print(text)
-        return 0
-    how, goal = m.group(1), m.group(2).strip()
-    lead = "%s 觉得这件事需要团队：交给团队%s。做完会把结果写在这里。" % (name, "一起做（自动分工）" if how == "自动分工" else "会审")
+    with _record_guard(lambda: read_json(cpath) or {}, update, "fail"):
+        m = re.match(r"\s*【派活】\s*(自动分工|会审)\s*[:：]\s*(\S[\s\S]*)", text)  # 只认开头就是【派活】的回答
+        if busy:
+            rid = busy[0]["id"]
+            if m:  # 团队还在忙又想派活：不叠新的一份，当作补充转告给正在做的团队
+                add_run_note(rid, m.group(2).strip())
+                text = ("团队还在做上一件事，我没有另派一份，而是把这个要求转告给了正在做的团队：\n\n> %s\n\n"
+                        "还没开始的成员和最后汇总都会照这个来。如果你确实想另起一件新的事，等这一件做完，或者先停掉它再说。"
+                        % m.group(2).strip()[:600].replace("\n", "\n> "))
+                m = None
+            else:
+                relay = re.findall(r"^\s*【转告团队】\s*[:：]?\s*(.+)$", text, re.M)
+                for r in relay:
+                    add_run_note(rid, r.strip())
+                if relay:
+                    text = re.sub(r"^\s*【转告团队】\s*[:：]?\s*(.+)$", r"（已转告正在做的团队：\1）", text, flags=re.M)
+        if not m:
+            update(status="ok", answer=text, end=time.time())
+            print(text)
+            return 0
+        how, goal = m.group(1), m.group(2).strip()
+        lead = "%s 觉得这件事需要团队：交给团队%s。做完会把结果写在这里。" % (name, "一起做（自动分工）" if how == "自动分工" else "会审")
 
-    def opened(rid):
-        update(status="running", answer=lead, dispatch={"mode": "council" if how == "会审" else "run", "goal": goal, "run": rid})
-    eprint("[hub] %s 派活：%s" % (name, how))
-    err = None
-    try:
-        if how == "会审":
-            run_council(cfg, goal, cwd, synthesizer=pick_ok(cfg, cfg["synthesizer"])[0], on_open=opened, parent_call=cid_box[0])
-        else:
-            planner, n1 = pick_ok(cfg, cfg["planner"])
-            synth, n2 = pick_ok(cfg, cfg["synthesizer"])
-            for n in (n1, n2):
-                if n:
-                    eprint("[hub] " + n)
-            run_goal(cfg, goal, cwd, write, planner, synth, cfg["max_parallel"], 6, False,
-                     on_open=opened, parent_call=cid_box[0])
-    except BackendError as e:
-        err = str(e)
-        eprint("[hub] 失败：%s" % err)
-    rec = read_json(cpath) or {}
-    rid = (rec.get("dispatch") or {}).get("run")
-    run = (read_json(os.path.join(RUNS_DIR, str(rid), "run.json")) or {}) if rid else {}
-    ok = run.get("status") == "done" and not err  # 以项目组的最终状态为准，对话和项目组不会一个绿一个红
-    final = run.get("final") or ""
-    answer = lead + "\n\n---\n\n" + (final or "（团队没有交回结果：%s）" % (err or run.get("error") or "未知原因"))
-    update(status="ok" if ok else "fail", end=time.time(), answer=answer,
-           error=None if ok else (err or run.get("error") or "团队没有全部完成"))
-    print(answer)
-    return 0 if ok else 1
+        def opened(rid):
+            update(status="running", answer=lead, dispatch={"mode": "council" if how == "会审" else "run", "goal": goal, "run": rid})
+        eprint("[hub] %s 派活：%s" % (name, how))
+        err = None
+        try:
+            if how == "会审":
+                run_council(cfg, goal, cwd, synthesizer=pick_ok(cfg, cfg["synthesizer"])[0], on_open=opened, parent_call=cid_box[0])
+            else:
+                planner, n1 = pick_ok(cfg, cfg["planner"])
+                synth, n2 = pick_ok(cfg, cfg["synthesizer"])
+                for n in (n1, n2):
+                    if n:
+                        eprint("[hub] " + n)
+                run_goal(cfg, goal, cwd, write, planner, synth, cfg["max_parallel"], 6, False,
+                         on_open=opened, parent_call=cid_box[0])
+        except BackendError as e:
+            err = str(e)
+            eprint("[hub] 失败：%s" % err)
+        rec = read_json(cpath) or {}
+        rid = (rec.get("dispatch") or {}).get("run")
+        run = (read_json(os.path.join(RUNS_DIR, str(rid), "run.json")) or {}) if rid else {}
+        ok = run.get("status") == "done" and not err  # 以项目组的最终状态为准，对话和项目组不会一个绿一个红
+        final = run.get("final") or ""
+        answer = lead + "\n\n---\n\n" + (final or "（团队没有交回结果：%s）" % (err or run.get("error") or "未知原因"))
+        update(status="ok" if ok else "fail", end=time.time(), answer=answer,
+               error=None if ok else (err or run.get("error") or "团队没有全部完成"))
+        print(answer)
+        return 0 if ok else 1
 
 
 # ---------------------------------------------------------------- 面板（本地网页）
@@ -1860,22 +2216,94 @@ def pid_alive(pid):
         return False
 
 
+class _RecordCache:
+    """只解析变化的历史文件；有界缓存，返回副本供详情页补充字段。"""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.records = OrderedDict()
+        self.lock = threading.Lock()
+
+    def read(self, path, st=None):
+        with self.lock:
+            try:
+                st = st or os.stat(path)
+            except OSError:
+                self.records.pop(path, None)
+                return None
+            sig = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+            cached = self.records.get(path)
+            if cached is None or cached[0] != sig:
+                cached = (sig, read_json(path))
+                self.records[path] = cached
+                if len(self.records) > self.limit:
+                    self.records.popitem(last=False)
+            self.records.move_to_end(path)
+            return copy.deepcopy(cached[1])
+
+
+_call_records = _RecordCache(1024)  # 最近 400 次调用，加上项目里的旧任务和当前详情
+_run_records = _RecordCache(64)
+
+
+def _load_call(path, st=None):
+    try:
+        st = st or os.stat(path)
+    except OSError:
+        return None
+    c = _call_records.read(path, st)
+    if not isinstance(c, dict) or "id" not in c:
+        return None
+    if c.get("status") == "running" and not pid_alive(c.get("pid")):
+        pid = c.get("pid")
+        c = _call_records.read(path)  # 进程退出前可能刚写好最终结果，不能用扫描时的旧状态覆盖
+        if not isinstance(c, dict) or "id" not in c:
+            return None
+        if c.get("status") != "running" or c.get("pid") != pid:
+            return c
+        c.update(status="fail", error=DEAD_MSG, end=c.get("end") or st.st_mtime)
+        write_json(path, c)  # 落盘，免得日后 PID 被别的进程复用时“复活”
+    return c
+
+
+def _load_run(path):
+    r = _run_records.read(path)
+    if not isinstance(r, dict):
+        return None
+    if r.get("status") in ("planning", "running", "synthesizing") and not pid_alive(r.get("pid")):
+        pid = r.get("pid")
+        r = _run_records.read(path)
+        if not isinstance(r, dict):
+            return None
+        if r.get("status") not in ("planning", "running", "synthesizing") or r.get("pid") != pid:
+            return r
+        r.update(status="failed", error=r.get("error") or DEAD_MSG, end=r.get("end") or r.get("start"))
+        _fail_tasks(r)
+        write_json(path, r)
+        write_board_md(os.path.dirname(path), r)
+    return r
+
+
 def load_calls(limit=400):
     try:
-        names = [n for n in os.listdir(CALLS_DIR) if n.endswith(".json")]
+        paths = []
+        with os.scandir(CALLS_DIR) as entries:
+            for entry in entries:
+                if entry.name.endswith(".json"):
+                    try:
+                        paths.append((entry.path, entry.stat()))
+                    except OSError:  # 另一个进程可能刚删掉/替换了记录
+                        continue
     except OSError:
         return []
-    paths = [os.path.join(CALLS_DIR, n) for n in names]
-    paths.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0, reverse=True)
+    key = lambda item: item[1].st_mtime
+    paths = (heapq.nlargest(limit, paths, key=key) if limit is not None and limit >= 0
+             else sorted(paths, key=key, reverse=True)[:limit])
     out = []
-    for p in paths[:limit]:
-        c = read_json(p)
-        if not isinstance(c, dict) or "id" not in c:
-            continue
-        if c.get("status") == "running" and not pid_alive(c.get("pid")):
-            c.update(status="fail", error=DEAD_MSG, end=c.get("end") or os.path.getmtime(p))
-            write_json(p, c)  # 落盘，免得日后 PID 被别的进程复用时“复活”
-        out.append(c)
+    for p, st in paths:
+        c = _load_call(p, st)
+        if c is not None:
+            out.append(c)
     out.sort(key=lambda c: c.get("start") or 0, reverse=True)
     return out
 
@@ -1887,16 +2315,9 @@ def load_runs(limit=40):
         return []
     out = []
     for rid in ids:
-        r = read_json(os.path.join(RUNS_DIR, rid, "run.json"))
-        if not isinstance(r, dict):
+        r = _load_run(os.path.join(RUNS_DIR, rid, "run.json"))
+        if r is None:
             continue
-        if r.get("status") in ("planning", "running", "synthesizing") and not pid_alive(r.get("pid")):
-            r.update(status="failed", error=r.get("error") or DEAD_MSG, end=r.get("end") or r.get("start"))
-            for t in r.get("tasks") or []:
-                if t.get("status") in ("pending", "running"):
-                    t["status"] = "fail" if t["status"] == "running" else "skipped"
-            write_json(os.path.join(RUNS_DIR, rid, "run.json"), r)
-            write_board_md(os.path.join(RUNS_DIR, rid), r)
         out.append(r)
         if len(out) >= limit:
             break
@@ -1995,11 +2416,12 @@ def ui_state(cfg):
                                              "backend", "preferred_backend", "secs", "call_id")} for t in (r.get("tasks") or [])]
         for t in d["tasks"]:
             if not t.get("preferred_backend") and t.get("call_id"):
-                t["preferred_backend"] = call_preferred(read_json(os.path.join(
+                t["preferred_backend"] = call_preferred(_call_records.read(os.path.join(
                     CALLS_DIR, t["call_id"] + ".json")) or {})
         lite_runs.append(d)
     health = read_json(HEALTH_PATH) or {}
-    return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls,
+    keeps = [{k: d.get(k) for k in ("id", "model", "write", "title", "start", "last", "turns", "busy")} for d in keep_list()]
+    return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls, "keeps": keeps,
             "archived": load_archived(),
             "names": load_names(), "naming": _names_running.is_set(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
@@ -2152,11 +2574,9 @@ def live_len(cid):
 def ui_call(cid):
     if not isinstance(cid, str) or not re.fullmatch(r"c_[0-9a-f]+", cid):
         return None
-    c = read_json(os.path.join(CALLS_DIR, cid + ".json"))
-    if not isinstance(c, dict):
+    c = _load_call(os.path.join(CALLS_DIR, cid + ".json"))
+    if c is None:
         return None
-    if c.get("status") == "running" and not pid_alive(c.get("pid")):
-        c.update(status="fail", error=DEAD_MSG)
     c["has_image"] = bool(c.get("image") and os.path.isfile(c["image"]))
     if c.get("status") == "running":
         c["live"] = read_live(cid)
@@ -2166,19 +2586,19 @@ def ui_call(cid):
 def ui_run(rid):
     if not isinstance(rid, str) or not re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", rid):
         return None
-    for r in load_runs(limit=10 ** 6):
-        if r.get("id") == rid:
-            for t in r.get("tasks") or []:
-                if t.get("status") == "running":
-                    t["live"] = read_live(t.get("call_id"))
-                elif t.get("call_id"):
-                    t["session"] = (read_json(os.path.join(CALLS_DIR, "%s.json" % t["call_id"])) or {}).get("session")
-            for c in load_calls():
-                if c.get("run") == rid and c.get("kind") in ("plan", "synth"):
-                    r.setdefault(c["kind"] + "_calls", []).append(
-                        {k: c.get(k) for k in ("id", "agent", "backend", "status", "secs", "start", "attempts")})
-            return r
-    return None
+    r = _load_run(os.path.join(RUNS_DIR, rid, "run.json"))
+    if r is None or r.get("id") != rid:
+        return None
+    for t in r.get("tasks") or []:
+        if t.get("status") == "running":
+            t["live"] = read_live(t.get("call_id"))
+        elif t.get("call_id"):
+            t["session"] = (_call_records.read(os.path.join(CALLS_DIR, "%s.json" % t["call_id"])) or {}).get("session")
+    for c in load_calls():
+        if c.get("run") == rid and c.get("kind") in ("plan", "synth"):
+            r.setdefault(c["kind"] + "_calls", []).append(
+                {k: c.get(k) for k in ("id", "agent", "backend", "status", "secs", "start", "attempts")})
+    return r
 
 
 def ui_record(kind, rid):
@@ -2203,7 +2623,9 @@ def follow_context(kind, rid, depth=8):
         a = r.get("final") or r.get("answer") or ""
         if not a and kind == "run":
             a = "\n\n".join("【%s】%s" % (t.get("title"), t.get("answer") or "") for t in r.get("tasks") or [])
-        turns.append("【用户当时的要求】\n%s\n\n【当时得到的结果】\n%s" % (q[:6000], a[:12000]))
+        if turns and len(a) > 1500:  # 只有最近一轮带全文；更早的只留开头，免得每轮都重读一大堆旧汇报
+            a = a[:1500].rstrip() + "\n…（较早的内容已省略）"
+        turns.append("【用户当时的要求】\n%s\n\n【当时得到的结果】\n%s" % (q[:6000] if not turns else q[:1500], a[:12000]))
         follows = r.get("follows") or {}
         kind, rid = follows.get("type"), follows.get("id")
         if not rid:
@@ -2456,9 +2878,7 @@ def stop_record(kind, rid):
         p = os.path.join(RUNS_DIR, rid, "run.json")
         d = read_json(p)
         if d:
-            for t in d.get("tasks") or []:
-                if t.get("status") in ("pending", "running"):
-                    t["status"] = "fail" if t["status"] == "running" else "skipped"
+            _fail_tasks(d)
             d.update(status="failed", error=STOP_MSG, end=now)
             write_json(p, d)
             write_board_md(os.path.join(RUNS_DIR, rid), d)
@@ -2472,9 +2892,7 @@ def stop_record(kind, rid):
             d = read_json(p)
             if (isinstance(d, dict) and d.get("pid") == pid
                     and (d.get("status") in ("planning", "running", "synthesizing") or d.get("error") == DEAD_MSG)):
-                for t in d.get("tasks") or []:
-                    if t.get("status") in ("pending", "running"):
-                        t["status"] = "fail" if t["status"] == "running" else "skipped"
+                _fail_tasks(d)
                 d.update(status="failed", error=STOP_MSG, end=now)
                 write_json(p, d)
                 write_board_md(os.path.join(RUNS_DIR, name), d)
@@ -2734,7 +3152,7 @@ class PairLimiter(object):
             self.fails.clear()
 
 
-REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/rename", "/api/handoff", "/api/handoff/undo", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
+REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/rename", "/api/handoff", "/api/handoff/undo", "/api/keep/close", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
 
 
 def gate(ip, host, sock_ip, port, path, cookie, lan_on):
@@ -3471,6 +3889,9 @@ def serve_ui(port, me):
                     return self.send(200, {"ok": True, "id": make_handoff(body.get("from"), body.get("to"), body.get("title"))})
                 elif self.path == "/api/handoff/undo":  # 撤销交接
                     return self.send(200, {"ok": True, "back": undo_handoff(body.get("id"))})
+                elif self.path == "/api/keep/close":  # 关掉开着的 Gemini 会话（"all" = 全部）
+                    ids = [d["id"] for d in keep_list()] if body.get("id") == "all" else [body.get("id")]
+                    return self.send(200, {"ok": True, "closed": sum(1 for k in ids if keep_close(k))})
                 elif self.path == "/api/rename":
                     set_name(body.get("key"), body.get("name"))
                 elif self.path == "/api/title/backfill":  # 给开启自动起名之前的项目组也起名（归档的不起）

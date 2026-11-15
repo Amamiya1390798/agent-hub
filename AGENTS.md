@@ -39,7 +39,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 
 **思考等级**：配置 `effort` 是 `{成员: 档位}`，档位名沿用各模型自己的（`effort_levels(spec)`）：GPT 读 `~/.codex/models_cache.json` 里该模型的 `supported_reasoning_levels`，以 `-c model_reasoning_effort=…` 传入；Claude 是 `low/medium/high/xhigh/max`，以 `--effort` 传入；Gemini 的档位是不同的模型名（如 `gemini-4-carbon-high`），面板通过换模型来调；DeepSeek 不支持。模型不支持所选档位时不传。旧配置 `codex_effort` 只在成员没单独设过时作为 GPT 的后备。
 
-**续接原生会话**：每次调用会把后端返回的会话编号存进记录的 `session`。追问时由 `resume_plan()` 判断能否直接续接：同一位成员、同一个模型、上一轮成功、没派过团队、不是分叉、上下文范围是完整、且那个会话还没被别的分支续过（`session_continued_by`）。能续接就只发这一轮的话（GPT `codex exec resume <id>`、Gemini `agy --conversation <id>`、Claude `claude --resume <id> --output-format json`、DeepSeek `dsh --session-id <id>`）；续接失败自动改为把前文写进提示词新开会话。
+**续接原生会话**：每次调用会把后端返回的会话编号存进记录的 `session`。追问时由 `resume_plan()` 判断能否直接续接：同一位成员、同一个模型、上一轮成功（派过团队也可以：团队交回的结果会补在这一句前面）、不是分叉、旁问只接旁问、上下文范围是完整、且那个会话还没被别的分支续过（`session_continued_by`）。能续接就只发这一轮的话（GPT `codex exec resume <id>`、Gemini `agy --conversation <id>`、Claude `claude --resume <id> --output-format json`、DeepSeek `dsh --session-id <id>`）；续接失败自动改为把前文写进提示词新开会话。
 
 ## 4. 核心流程（都在 `hub` 里）
 
@@ -48,6 +48,14 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 - **`run_council(...)`**（`hub council`）：几位成员只读、互相看不到答案地回答同一个问题，再由一位按 `COUNCIL_SYNTH_PROMPT` 比较。
 - **`run_chat(...)`**（`hub chat`）：对接人模式。`choose_contact` 按阶段（定方案 / 动手 / 整理）和剩余额度选人，对接人可以直接回答，也可以发起 run 或 council，结果交回对话。
 - **旁问**（`mode: "side"`）：`hub ask <成员> --side [--spec 模型] [--effort 档位] [--web]`。只读；记录的 `kind` 为 `side`，不进左栏主线。`--web` 时 GPT 加 `-c web_search="live"`，Claude 加 `--allowedTools WebSearch WebFetch`，并在提示词末尾附 `WEB_NOTE`。
+**常驻会话（Gemini）**：面板里的顶层对话（chat / ask / side，且 `HUB_META` 存在、不是队员互相求助）用 `keep_turn()` 把 `agy --input-format stream-json` 进程留在后台，输入走 `~/.agent-hub/keep/<id>.in`（FIFO），输出写 `<id>.log`。下一句按会话编号找到它直接写入，不重新启动。面板左栏「开着的会话」列出它们，`/api/keep/close {id|"all"}` 关闭；进程一启动就退出时自动退回一次性调用。配置 `keep_sessions: false` 可关掉。
+
+**团队在忙时接着说话**：`busy_runs_in_line()` 找出这条对话线上还在跑的项目组，并在对接人的提示里写明。对接人回答末尾的 `【转告团队】…`，或者在团队忙时又输出的 `【派活】`，都不会另开一组，而是写进 `runs/<id>/notes.jsonl`：进度板（`board_text`）和最后汇总会读到，已经开工的成员看不到。
+
+**回答写法**：`USER_STYLE` 是给用户看的统一写法（先结论、默认 200 字内、不用表格和行话），拼在对接人、汇总、会审综合和直接提问的提示词里。
+
+**历史读取缓存**：`_RecordCache` 按文件的 mtime/大小缓存解析好的调用和项目记录，`/api/state` 只重读变过的文件。
+
 - **分叉**：提交时 `fork: true` 加 `context`，记录带 `fork: true`。面板把分叉作为独立项目组，追问链在分叉处断开；后端带上到分叉点为止的上下文，并且不续接原会话。
 - **图片**：`/api/upload` 收 `{data: base64}`，按文件头只认 PNG/JPEG/WebP/GIF（≤10MB），存到 `<HUB_HOME>/workspace/attachments/att-时间-随机.扩展名`；提交时 `images: [文件名]`（≤6 张）。`image_note()` 把图片路径写进提示词；GPT 另以 `--image=路径` 直接附图，Gemini/Claude 加 `--add-dir` 放行附件目录，DeepSeek 用自带的 `read_image` 工具读。`/api/attachment?id=` 只返回位图。
 - **项目组名字**：`names.json` 存 `{记录键: {name, auto}}`，键是项目组第一条记录（`call:…` / `run:…`）。面板服务在 `ui_state()` 里用 `start_auto_titles()` 在后台给做完的新项目组起名：直接调用配置 `auto_title` 那位成员的后端（不经过 `ask()`，不写调用记录），手动名字（`/api/rename`）不会被自动名覆盖。`since` 之前的旧项目组只有调用 `/api/title/backfill` 才起名，归档的不起。离线测试必须设 `HUB_NO_AUTOTITLE=1`，否则会真的调用模型。
@@ -83,7 +91,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 `hub ui` 启动 `ThreadingHTTPServer`，默认只监听 `127.0.0.1:8765`。
 
 - GET：`/`、`/api/state?c=<客户端id>`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
-- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
+- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/handoff/undo`、`/api/keep/close`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
 - `/api/bye` 不需要令牌，只用于页面关闭时登记。
 
 安全措施：检查 Host 头；图片接口只返回位图（不返回 SVG，防止 XSS）；设置 CSP 和 `X-Frame-Options`。局域网模式（`lan_access`）默认关闭，开启后只接受私有网段，需要配对码加 HttpOnly cookie，配对码输错有限速；设置、登录、开关局域网这些操作只能在本机做（见 `gate()` 和 `REMOTE_POSTS`）。
