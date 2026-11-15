@@ -36,6 +36,25 @@ class DeniedTests(unittest.TestCase):
         self.assertEqual(calls, ["m1"], "权限问题不该换备用模型重试")
         self.assertIn("没有权限", str(cm.exception))
 
+    def test_readonly_can_read_anywhere(self):
+        g = self.g
+        seen = []
+
+        def fake_run(cmd, cwd, env, timeout, **kw):
+            seen.append(cmd)
+            return 0, '{"event": "result", "result": {"status": "SUCCESS", "response": "ok"}}\n', ""
+        with patch.dict(g, {"_run": fake_run, "find_bin": lambda cfg, n: "/bin/agy"}):
+            for w in (False, True):
+                try:
+                    g["backend_agy"]({}, "m", "hi", self.tmp, w, 60)
+                except g["BackendError"]:
+                    pass  # 只看命令行
+        ro, rw = seen
+        self.assertIn("--settings", ro)
+        self.assertIn("read_file(/)", ro[ro.index("--settings") + 1])
+        self.assertNotIn("--dangerously-skip-permissions", ro, "只读不能放开写和命令")
+        self.assertIn("--dangerously-skip-permissions", rw)
+
 
 if __name__ == "__main__":
     unittest.main()

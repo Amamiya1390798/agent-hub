@@ -534,6 +534,8 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
         cmd += ["--add-dir", ATTACH_DIR]
     if write:
         cmd += ["--mode", "accept-edits", "--dangerously-skip-permissions"]
+    else:  # 只读：允许读任何位置的文件（和其他成员的只读一样），但不能写、不能运行命令。否则读工作目录外的文件会被拒、交白卷
+        cmd += ["--settings", json.dumps({"permissions": {"allow": ["read_file(/)"]}})]
     live = Live()
     box = {"data": None, "step": None, "tok": {"in": 0, "out": 0, "cache": 0}}
 
@@ -1156,7 +1158,7 @@ PLAN_PROMPT = """你在给一个多 Agent 小团队排工。团队成员是平�
 4. 像一家小公司分岗位：执行类的活（查资料、写初稿、写代码、整理）默认给 gemini；claude / gpt 主要负责拍板和审查（定方案、审查关键成果），画图给 gpt；零碎小活给 ds。{quota_rule}gemini 额度不足时再让别人顶上，并在 why 里写明。
 5. 每个任务的 prompt 必须自包含：队员看不到用户原话，把需要的背景、约束、输出格式都写进去。确实依赖其他任务结果的用 depends_on 标出，执行时会自动把前置结果附给它。
 6. why 写一句为什么派给这位（长处或额度）；eta_min 写预计需要几分钟（整数）。每位成员一次最多有 {timeout_min} 分钟。
-7. 任务数 1~{max_tasks} 个。write=true 表示该任务需要创建/修改文件{write_hint}；不要让两个写任务改同一个文件。
+7. 任务数 1~{max_tasks} 个。write=true 表示该任务需要创建/修改文件、运行命令或操作本机软件（只读任务只能读文件、上网查，不能运行任何命令）{write_hint}；不要让两个写任务改同一个文件。
 
 例子（只示意结构）：
 - 「把这句话翻译成英文」→ 1 个任务给 ds。

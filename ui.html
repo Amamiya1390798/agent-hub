@@ -506,7 +506,7 @@ let sel = null;                     // {type:'run'|'call', id}；null = 新任�
 let followLatest = false, pendingSubmission = null, pollSeq = 0, appliedPollSeq = 0, sending = false, stopTimer = 0;
 const beginSubmit = () => { pendingSubmission = null; followLatest = true; };
 let filter = "all", query = "";
-let mode = "chat", allowWrite = false, showCwd = false, ctx = null;
+let mode = "chat", allowWrite = localStorage.getItem("hub-write") === "1", showCwd = false, ctx = null;
 let forking = false;
 let handoffArm = null;                // 正在选「交接到哪一组」的那条记录 id
 const pendImgs = {main: [], side: []};   // 还没发出去的图片 {id} 或 {up:true} 上传中                // 正在从 ctx 那条分叉出一条新线
@@ -1698,7 +1698,7 @@ document.addEventListener("click", async e => {
       toast("已复制");
     }
     else if (act === "mode"){ mode = el.dataset.v; saveDraft(); renderComposer(); $("txt").focus(); }
-    else if (act === "write"){ allowWrite = !allowWrite; renderComposer(); }
+    else if (act === "write"){ allowWrite = !allowWrite; try { localStorage.setItem("hub-write", allowWrite ? "1" : "0"); } catch (e2){} renderComposer(); }   // 记住：下次打开还是这个选择
     else if (act === "cwd"){ showCwd = !showCwd; renderComposer(); if (showCwd) $("cwd").focus(); }
     else if (act === "noctx"){ if (forking){ forking = false; ctx = sel; } else ctx = null; renderComposer(); }
     else if (act === "fork"){ ctx = {type: el.dataset.type, id: el.dataset.id}; forking = true; renderComposer(); $("txt").focus(); toast("已准备分叉：发出的话会另开一条线"); }

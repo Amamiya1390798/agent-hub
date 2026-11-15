@@ -53,7 +53,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 - **项目组名字**：`names.json` 存 `{记录键: {name, auto}}`，键是项目组第一条记录（`call:…` / `run:…`）。面板服务在 `ui_state()` 里用 `start_auto_titles()` 在后台给做完的新项目组起名：直接调用配置 `auto_title` 那位成员的后端（不经过 `ask()`，不写调用记录），手动名字（`/api/rename`）不会被自动名覆盖。`since` 之前的旧项目组只有调用 `/api/title/backfill` 才起名，归档的不起。离线测试必须设 `HUB_NO_AUTOTITLE=1`，否则会真的调用模型。
 - **交接**：`/api/handoff {from, to, title}` 由 `make_handoff()` 在目标那条线后面写一条 `kind: "handoff"` 的记录：`follows` 指向目标最后一轮，`answer` 是来源最近几轮的 `follow_context` 文本，`handoff.from` 指向来源。面板据此把两组合并显示；之后的追问通过 `follow_context` 同时带上两边。来源未做完（running / planning / synthesizing）时拒绝。交接后的追问不会续接原生会话。`/api/handoff/undo {id}` 由 `undo_handoff()` 撤销：把那条记录改名为 `.json.undone` 留底，原本接在它后面的追问（call 或 run.json 的 `follows`）改为接到交接之前那一轮。
 - **成员 / 模型开关**：配置里的 `disabled_agents`、`disabled_models` 由 `active_cfg()` 过滤，所有干活的命令（排工、会审、对接、旁问、备用模型）只看得到启用的；平时的对接人都停用时，`choose_contact` 改找启用的成员。面板通过 `/api/config` 的 `agent_enabled`、`model_enabled` 切换。
-- **权限被拒**：agy 在只读模式下被拒权限（`denied_actions` 非空且回答为空）时，`agy_denied_text()` 从它的对话记录里找出被拒的那一步，报错以 `DENIED_PREFIX` 开头；`ask()` 遇到这种报错不再换备用模型重试。
+- **权限被拒**：agy 在只读模式下被拒权限（`denied_actions` 非空且回答为空）时，`agy_denied_text()` 从它的对话记录里找出被拒的那一步，报错以 `DENIED_PREFIX` 开头；`ask()` 遇到这种报错不再换备用模型重试。只读时 `backend_agy` 传 `--settings {"permissions":{"allow":["read_file(/)"]}}`，让它能读任何位置的文件（但不能写、不能运行命令）；面板的「允许改文件」开关记在 localStorage 的 `hub-write`。
 - **面板布局**：团队页依次是返回对话、标题（过长收两行）、步骤条（`stepperHtml`）、结果，然后是可折叠的过程和进度板（`fold()`，默认开关由是否有结果决定）；对话页的团队卡片带每件任务的小标签（`taskChips`），页面顶部有进行中总览（`liveBar`）；对话页在有进行中的轮次或团队时也显示停止按钮（`liveTarget`）。
 - **追问进行中的记录**：上一轮还在做时也可以带 `context` 提交，`follow_context` 只会带上已有的内容。
 - **上下文范围**：提交时 `context_scope` 为 `full`（`follow_context` 最多 8 轮）或 `one`（只带那一轮）。
