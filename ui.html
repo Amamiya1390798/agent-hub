@@ -360,6 +360,29 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .intro li{padding:12px;background:var(--panel);border:1px solid var(--line);border-radius:12px}
 .intro b,.intro span{display:block}.intro span{font-size:12px;color:var(--muted);margin-top:6px}
 .team-summary{padding:12px 0;font-size:13px}
+.head h2.clamp{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:17px;line-height:1.45}
+.crumb{background:none;border:0;color:var(--muted);font-size:13px;padding:0;margin:0 0 8px;cursor:pointer}
+.crumb:hover{color:var(--fg,inherit);text-decoration:underline}
+.stepper{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:4px 0 16px;font-size:13px}
+.stepper .stg{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--hover);color:var(--muted)}
+.stepper .stg.now{background:var(--card);color:inherit;box-shadow:0 0 0 1.5px var(--accent,#5b8def) inset;font-weight:600}
+.stepper .stg.done{color:inherit}
+.stepper .arr{color:var(--muted);opacity:.6}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;padding:3px 9px;border-radius:999px;background:var(--hover);max-width:100%}
+.chip .dot{width:7px;height:7px;border-radius:50%;flex:none}
+.chip .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:220px}
+.chip.running{box-shadow:0 0 0 1.5px var(--accent,#5b8def) inset}
+.chip.fail .s{color:var(--bad)}
+.fold{margin:6px 0 14px}
+.fold>.foldh{display:flex;align-items:center;gap:8px;width:100%;text-align:left;background:none;border:0;padding:8px 0;font-size:13px;font-weight:650;color:inherit;cursor:pointer;border-top:1px solid var(--line,rgba(127,127,127,.25))}
+.fold>.foldh .chev{transition:transform .15s;display:inline-block}
+.fold.open>.foldh .chev{transform:rotate(90deg)}
+.fold>.foldb{display:none}
+.fold.open>.foldb{display:block}
+.livebar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 14px;padding:8px 10px;border-radius:10px;background:var(--hover);font-size:12px}
+.livebar b{font-weight:650;margin-right:2px}
+.livebar .chip{background:var(--card);cursor:pointer;border:0;color:inherit}
 .board{border:1px solid var(--line,rgba(127,127,127,.25));border-radius:12px;padding:10px 14px;margin:4px 0 14px;font-size:13px;background:var(--card)}
 .board h4{margin:0 0 6px;font-size:13px}
 .board .bl{padding:6px 0;border-top:1px dashed var(--line,rgba(127,127,127,.25));line-height:1.55;word-break:break-word}
@@ -1212,9 +1235,22 @@ function subRows(cid){
 function step(agent, busy, inner){
   return '<div class="step"><div class="av' + (busy ? " busy" : "") + '" style="background:' + agc(agent) + '">' + agl(agent) + "</div>" + inner + "</div>";
 }
+function liveTarget(it){              // 对话页：这段对话里还在进行的那一轮，或它派出去还在做的团队
+  if (!it || it.type !== "call" || !it.rec || (it.rec.kind !== "chat" && it.rec.kind !== "handoff")) return null;
+  const turns = chainOf(it);
+  for (let i = turns.length - 1; i >= 0; i--){
+    const t = turns[i];
+    if (RUNNING[t.status]) return t;
+    const d = t.rec && t.rec.dispatch;
+    if (d && d.run){ const run = items().find(x => x.type === "run" && x.id === d.run); if (run && RUNNING[run.status]) return run; }
+  }
+  return null;
+}
 function headHtml(it, extraMeta){
-  const si = stInfo(it.status, it.error), running = RUNNING[it.status];
-  let h = '<div class="head"><h2>' + esc(it.title || "") + "</h2></div><div class=\"meta\">" + badge(si.k, si.t) +
+  const si = stInfo(it.status, it.error), tgt = RUNNING[it.status] ? it : liveTarget(it), running = !!tgt;
+  const ttl = it.title || "", long = ttl.length > 70;
+  let h = '<div class="head"><h2 class="' + (long ? "clamp" : "") + '">' + esc(ttl) + "</h2></div>" +
+    (long ? fold("ttl:" + it.type + it.id, false, '<span class="small" style="display:inline;font-weight:400">看完整要求（' + ttl.length + ' 字）</span>', '<div class="md" style="white-space:pre-wrap">' + esc(ttl) + "</div>") : "") + "<div class=\"meta\">" + badge(si.k, si.t) +
     "<span>" + dayLabel(it.start) + " " + clock(it.start) + "</span><span>用时 " + tick(it.start, it.end, it.type === "call" ? it.rec.secs : null) + "</span>" + extraMeta;
   const grp = groupOf(it);
   if (grp && grp.named) h += '<span>项目组：' + esc(grp.title) + '</span>';
@@ -1223,7 +1259,7 @@ function headHtml(it, extraMeta){
     h += '<span>' + (it.fork ? "⑂ 分叉自" : "追问自") + ' <a href="#" data-act="select" data-type="' + esc(it.follows.type) + '" data-id="' + esc(it.follows.id) + '">' + esc(f ? (f.title || "").slice(0, 24) : "上一条") + "</a></span>";
   }
   h += '</div><div class="acts">' +
-    (running ? (stopArm === it.id ? '<button class="btn danger" data-act="stop" data-sure="1" style="background:var(--bad);color:#fff">再点一次确认停止</button>' : '<button class="btn danger" data-act="stop">■ 停止</button>') : '<button class="btn" data-act="retry">↻ 重新执行</button><button class="btn" data-act="fork" data-type="' + esc(it.type) + '" data-id="' + esc(it.id) + '" title="带上到这里为止的上下文，另开一条线接着做，原来这条不受影响">⑂ 从这里分叉</button>') +
+    (running ? (stopArm === tgt.id ? '<button class="btn danger" data-act="stop" data-sure="1" data-type="' + esc(tgt.type) + '" data-id="' + esc(tgt.id) + '" style="background:var(--bad);color:#fff">再点一次确认停止</button>' : '<button class="btn danger" data-act="stop" data-type="' + esc(tgt.type) + '" data-id="' + esc(tgt.id) + '" title="' + (tgt === it ? "停止这一条" : "停止这段对话里还在进行的：" + esc((tgt.title || "").slice(0, 30))) + '">■ 停止</button>') : '<button class="btn" data-act="retry">↻ 重新执行</button><button class="btn" data-act="fork" data-type="' + esc(it.type) + '" data-id="' + esc(it.id) + '" title="带上到这里为止的上下文，另开一条线接着做，原来这条不受影响">⑂ 从这里分叉</button>') +
     (isRemote() ? '' : '<button class="btn" data-act="opendir" title="' + esc(it.rec.cwd || "") + '">打开工作目录</button>') + renBtn(it) + handBtn(it) + archBtn(it) + '</div>' + handPicker(it);
   if (it.rec && it.rec.images && it.rec.kind !== "chat") h += thumbsHtml(it.rec.images);   // 对话页在每轮气泡里显示
   return h;
@@ -1273,18 +1309,56 @@ function boardHtml(lite){              // 共享进度板：谁在做什么、�
   }).join("");
   return '<div class="board"><h4>共享进度板 <span class="small" style="display:inline;font-weight:400">每位成员开工前都能看到这块板' + (lite.mode === "council" ? "（会审时只看到分工，看不到别人的答案）" : "和别人已完成的摘要") + "</span></h4>" + rows + "</div>";
 }
+const T_ST = {pending:"待开始", running:"在做", ok:"完成", fail:"没完成", skipped:"跳过"};
+function taskChips(tasks){            // 一排小标签：谁、做什么、到哪了
+  return '<div class="chips">' + tasks.map(t => '<span class="chip ' + esc(t.status || "") + '" title="' + esc(t.agent + "：" + (t.title || "")) + '"><span class="dot" style="background:' + agc(t.agent) + '"></span>' +
+    esc(t.agent) + '<span class="t">' + esc(t.title || "") + '</span><span class="s small" style="display:inline">' + esc(T_ST[t.status] || "仅方案") + "</span></span>").join("") + "</div>";
+}
+function stepperHtml(lite, hasSyn){     // 一眼看懂走到哪一步：拆任务 → 分头做 → 汇总 → 结果
+  const st = lite.status, ts = lite.tasks.filter(t => !t.skip_reason), ok = ts.filter(t => t.status === "ok").length;
+  const council = lite.mode === "council", finished = !RUNNING[st];
+  const stages = [];
+  if (!council) stages.push({t:"① 拆任务", now: st === "planning", done: st !== "planning" && lite.tasks.length > 0});
+  stages.push({t:(council ? "① 各自作答 " : "② 分头做 ") + ok + "/" + ts.length, now: st === "running", done: ts.length > 0 && ok === ts.length});
+  if (ts.length > 1 || hasSyn || council) stages.push({t:council ? "② 比较汇总" : "③ 汇总", now: st === "synthesizing", done: finished && hasSyn && st === "done"});
+  stages.push({t:finished ? (st === "done" ? "✓ 有结果了" : "■ " + stInfo(st, lite.error).t) : "结果", now:false, done: finished && st === "done"});
+  return '<div class="stepper">' + stages.map(x => '<span class="stg' + (x.now ? " now" : x.done ? " done" : "") + '">' + (x.now ? '● ' : "") + esc(x.t) + "</span>").join('<span class="arr">→</span>') + "</div>";
+}
+function fold(key, defOpen, title, body){   // 可折叠的一段；默认开/关，手动点过就记住
+  const isOpen = open.has(key) || (defOpen && !closed.has(key));
+  return '<div class="fold' + (isOpen ? " open" : "") + '"><button class="foldh" data-act="toggle" data-key="' + esc(key) + '"><span class="chev">▶</span>' + title + '</button><div class="foldb">' + (isOpen ? body : "") + "</div></div>";
+}
+function liveBar(){                     // 页面最上方：现在所有在进行的事，点一下就过去
+  const cur = sel ? sel.type + ":" + sel.id : "";
+  const runs = S.runs.filter(r => RUNNING[r.status]);
+  const calls = S.calls.filter(c => RUNNING[c.status] && !c.parent && !c.run && !runs.some(r => r.parent_call === c.id));
+  const all = runs.map(r => ({type:"run", id:r.id, agent:(r.tasks.find(t => t.status === "running") || {}).agent || r.planner || "团队",
+      t:(r.display || r.goal || "").slice(0, 24), s:r.tasks.length ? r.tasks.filter(t => t.status === "ok").length + "/" + r.tasks.length : "排工中"}))
+    .concat(calls.map(c => ({type:"call", id:c.id, agent:c.agent, t:(c.display || c.prompt_preview || "").slice(0, 24), s:"回答中"})));
+  if (!all.length || (all.length === 1 && all[0].type + ":" + all[0].id === cur)) return "";
+  return '<div class="livebar"><b>进行中 ' + all.length + '</b>' + all.map(x => '<button class="chip running" data-act="select" data-type="' + x.type + '" data-id="' + esc(x.id) + '"><span class="dot" style="background:' + agc(x.agent) + '"></span>' +
+    esc(x.agent) + '<span class="t">' + esc(x.t) + '</span><span class="s small" style="display:inline">' + esc(x.s) + "</span></button>").join("") + "</div>";
+}
 function viewRun(it){
   const lite = it.rec;
   const sig = lite.status + "|" + lite.tasks.map(t => t.status + (t.call_id || "")).join(",") + "|" + S.calls.filter(c => c.run === lite.id).map(c => c.status + (c.live || "")).join("");
   const full = need("run", lite.id, sig) || lite;
-  let h = headHtml(it, (lite.write ? '<span class="badge plain">可改文件</span>' : ""));
+  let h = (lite.parent_call ? '<button class="crumb" data-act="select" data-type="call" data-id="' + esc(lite.parent_call) + '">← 回到和对接人的对话</button>' : "") +
+    headHtml(it, (lite.write ? '<span class="badge plain">可改文件</span>' : ""));
   if (lite.error && lite.error !== "已手动停止" && !(lite.mode === "council" && lite.status === "done")) h += '<div class="note bad" style="margin-bottom:14px">' + esc(lite.error) + "</div>";
   const council = lite.mode === "council";
   if (lite.timeout_warning) h += '<div class="note" style="margin-bottom:14px">⏱ ' + esc(lite.timeout_warning) + "</div>";
   if (lite.pressure) h += full.pressure_prompt
     ? '<details class="note" style="margin-bottom:14px"><summary>高压模式：ds 拆任务前读了你写的提示词（' + full.pressure_prompt.length + ' 字），点开查看</summary><div style="white-space:pre-wrap;margin-top:8px">' + esc(full.pressure_prompt) + '</div></details>'
     : '<div class="note" style="margin-bottom:14px">高压模式：当时提示词是空的，ds 按普通方式排工</div>';
-  h += '<div class="sec">过程</div><div class="steps">';
+  const synCalls = S.calls.filter(c => c.run === lite.id && c.kind === "synth");
+  h += stepperHtml(lite, synCalls.length > 0);
+  if (full.final){
+    copyStore["final"] = full.final;
+    h += '<div class="sec">结果</div><div class="result"><div class="lab"><span></span><button class="copy" data-act="copy" data-key="final">复制</button></div><div class="md">' + md(full.final) + "</div></div>";
+  }
+  const procStart = h.length;
+  h += '<div class="steps">';
   if (council){
     const sk = lite.skipped || [];
     h += step(lite.synthesizer || "gemini", false, '<div class="plan"><span class="small">会审</span><br>' + esc(lite.summary || "几位各自独立作答，再比较共同点和分歧") +
@@ -1302,10 +1376,9 @@ function viewRun(it){
   const active = lite.tasks.filter(t => !t.skip_reason);   // 因额度跳过的成员不算参与
   for (const t of active) counts[t.agent] = (counts[t.agent] || 0) + 1;
   const participants = uniq([council ? null : lite.planner].concat(active.map(t => t.agent), S.calls.filter(c => c.run === lite.id).map(c => c.agent)));
-  h += '</div><div class="team-summary">这次 ' + participants.length + ' 位成员参与：' + participants.map(esc).join('、') +
-    (lite.tasks.length ? '<br>分工 ' + lite.tasks.length + ' 件：' + Object.entries(counts).map(([n,c]) => esc(n) + ' ×' + c).join('、') : '；正在安排分工') +
-    '<br><span class="small">当前 ' + lite.tasks.filter(t => t.status === 'running').length + ' 件同时进行，已完成 ' + lite.tasks.filter(t => t.status === 'ok').length + ' 件。带「接」的任务要等前一步完成；×2 表示分到两件任务。</span></div>' +
-    boardHtml(lite) + '<div class="task-grid">';
+  h += '</div><div class="team-summary small">' + participants.length + ' 位成员参与' +
+    (lite.tasks.length ? '，分工 ' + lite.tasks.length + ' 件（' + Object.entries(counts).map(([n,c]) => esc(n) + ' ×' + c).join('、') + '）。点任务卡片看指令和回答；带「接」的要等前一步完成。' : '，正在安排分工') + '</div>' +
+    (lite.tasks.length ? fold("board:" + lite.id, false, "共享进度板 <span class=\"small\" style=\"display:inline;font-weight:400\">· 每件的进度、原因和遗留</span>", boardHtml(lite)) : "") + '<div class="task-grid">';
   for (const t of lite.tasks){
     const ft = (full.tasks || []).find(x => x.id === t.id) || t;
     const key = "t:" + lite.id + ":" + t.id, isOpen = open.has(key) || (t.status === "running" && !closed.has(key)), si = t.status ? stInfo(t.status) : {k:"wait", t:"仅方案"};
@@ -1329,15 +1402,13 @@ function viewRun(it){
   }
   h += '</div><div class="steps">';
   // 汇总
-  const syn = S.calls.filter(c => c.run === lite.id && c.kind === "synth");
+  const syn = synCalls;
   if (syn.length || lite.status === "synthesizing")
     h += step(lite.synthesizer || "gemini", lite.status === "synthesizing", syn.map(c => callRow(c, '<span class="who" style="color:' + agc(c.agent) + '">' + esc(c.agent) + '</span><span class="what">' + (council ? "比较共同点和分歧" : "汇总大家的结果") + '</span>')).join("") ||
       '<div class="row"><div class="rh"><span class="what">' + (council ? "比较共同点和分歧…" : "汇总大家的结果…") + '</span></div></div>');
   h += "</div>";
-  if (full.final){
-    copyStore["final"] = full.final;
-    h += '<div class="sec">结果</div><div class="result"><div class="lab"><span></span><button class="copy" data-act="copy" data-key="final">复制</button></div><div class="md">' + md(full.final) + "</div></div>";
-  }
+  const proc = h.slice(procStart);
+  h = h.slice(0, procStart) + fold("proc:" + lite.id, !full.final || RUNNING[lite.status], "过程 <span class=\"small\" style=\"display:inline;font-weight:400\">· 谁做了什么" + (lite.tasks.length ? "（" + lite.tasks.length + " 件）" : "") + "</span>", proc);
   return h;
 }
 function viewCall(it){
@@ -1415,7 +1486,7 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
       const si = run ? stInfo(run.status, run.error) : {k:"run", t:"准备中"};
       const done = run ? run.tasks.filter(x => x.status === "ok").length : 0;
       h += '<button class="job" data-act="select" data-type="run" data-id="' + esc(r.dispatch.run || "") + '">📋 派给团队（' + (r.dispatch.mode === "council" ? "会审" : "自动分工") + '）：' + esc((r.dispatch.goal || "").slice(0, 80)) +
-        '<br><span class="small">' + esc(si.t) + (run && run.tasks.length ? " · 已完成 " + done + "/" + run.tasks.length + " 件" : "") + " · 点开看项目组和进度板</span></button>";
+        '<br><span class="small">' + esc(si.t) + (run && run.tasks.length ? " · 已完成 " + done + "/" + run.tasks.length + " 件" : "") + " · 点开看每个人的过程和结果</span>" + (run && run.tasks.length ? taskChips(run.tasks) : "") + "</button>";
     }
     h += "</div>";
   }
@@ -1438,7 +1509,7 @@ function renderView(){
   if (!S) return;
   const it = findItem(sel);
   if (sel && !it){ sel = null; }
-  const h = '<div class="wrap">' + (it ? (it.type === "run" ? viewRun(it) : it.rec.kind === "chat" || it.rec.kind === "handoff" ? viewChat(it) : viewCall(it)) : viewNew()) + "</div>";
+  const h = '<div class="wrap">' + liveBar() + (it ? (it.type === "run" ? viewRun(it) : it.rec.kind === "chat" || it.rec.kind === "handoff" ? viewChat(it) : viewCall(it)) : viewNew()) + "</div>";
   $("tb-title").textContent = it ? (it.title || "").slice(0, 30) : "新任务";
   if (h === last.view) return;
   const s = getSelection();
@@ -1448,7 +1519,8 @@ function renderView(){
   v.innerHTML = h; last.view = h; last.viewKey = sel ? sel.type + sel.id : "new";
   const sticks = {};
   v.querySelectorAll("[data-stick]").forEach((el, i) => { sticks[i] = el; });
-  v.scrollTop = it && (!keep || atEnd) ? v.scrollHeight : keep ? st : 0;   // 打开对话停在最新一轮；在底部时新内容来了也跟着到底
+  const isChat = it && it.type === "call" && (it.rec.kind === "chat" || it.rec.kind === "handoff");
+  v.scrollTop = isChat && (!keep || atEnd) ? v.scrollHeight : keep ? st : 0;   // 对话停在最新一轮；团队页、单条从顶上看起   // 打开对话停在最新一轮；在底部时新内容来了也跟着到底
   Object.values(sticks).forEach(el => { el.scrollTop = el.scrollHeight; });   // 实时输出始终看最新一行
   ticks();
 }
@@ -1697,8 +1769,8 @@ document.addEventListener("click", async e => {
     }
     else if (act === "stop" && it){
       clearTimeout(stopTimer);
-      if (el.dataset.sure){ el.disabled = true; el.textContent = "正在停止…"; delete el.dataset.act; stopArm = null; await api("/api/stop", sel); toast("已停止"); poll(); }
-      else { stopArm = sel.id; renderView(); stopTimer = setTimeout(() => { stopArm = null; renderView(); }, 4000); }
+      if (el.dataset.sure){ el.disabled = true; el.textContent = "正在停止…"; delete el.dataset.act; stopArm = null; await api("/api/stop", el.dataset.type ? {type: el.dataset.type, id: el.dataset.id} : sel); toast("已停止"); poll(); }
+      else { stopArm = el.dataset.id || sel.id; renderView(); stopTimer = setTimeout(() => { stopArm = null; renderView(); }, 4000); }
     }
     else if (act === "retry" && it){
       const r = it.rec;

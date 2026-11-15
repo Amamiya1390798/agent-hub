@@ -436,7 +436,10 @@ def spec_label(spec):
     return spec or "未知模型"
 
 
+DENIED_PREFIX = "权限不够"
 ERROR_KINDS = [  # (匹配原始报错的关键词, 一句人话, 一句建议)；按顺序先匹配先用
+    ((DENIED_PREFIX,), "没有权限：只读模式下不能读工作目录以外的文件、运行命令或操作别的软件",
+     "这件事需要更多权限：发送时勾上「可改文件」再试；只是要读资料的话，把文件放进工作目录"),
     (("已手动停止", "signal 15", "sigterm"), "被手动停止了", "需要的话可以点「重新执行」"),
     (("print timeout", "超时", "timed out", "timeout", "deadline exceeded"), "{t}内没做完，被掐断了",
      "可能任务太大：可以拆小一点，或在设置里放宽「每一步最多等几分钟」"),
@@ -486,6 +489,28 @@ def _tail(s, n=400):
 
 
 # ---------------------------------------------------------------- 各后端适配器
+
+def agy_denied_text(data):
+    """Gemini 在只读模式下想做没被允许的事（读工作目录以外的文件、运行命令等），没人能当场批准，它就交了空白回答。
+    从它自己的对话记录里找出被拒的是哪一步，给人看得懂的说明。"""
+    names = {"read_file": "读文件", "command": "运行命令", "write_file": "写文件", "edit_file": "改文件"}
+    acts = "、".join(sorted(set(names.get(a.get("action"), a.get("display_name") or a.get("action") or "?")
+                                for a in data.get("denied_actions") or [] if isinstance(a, dict))))
+    detail = ""
+    cid = str(data.get("conversation_id") or "")
+    if re.fullmatch(r"[0-9a-f-]{36}", cid):
+        path = os.path.join(HOME, ".gemini", "antigravity-cli", "brain", cid, ".system_generated", "logs", "transcript.jsonl")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = re.search(r'permission check failed for ([a-z_]+) \\?"?([^"\\]{1,200})', line)
+                    if m:
+                        detail = "%s %s" % (names.get(m.group(1), m.group(1)), m.group(2))
+        except OSError:
+            pass
+    return "%s：Gemini 在只读模式下想%s，没被允许，任务停下了%s" % (
+        DENIED_PREFIX, acts or "做一件需要权限的事", "（被拒的是：%s）" % detail if detail else "")
+
 
 def backend_agy(cfg, model, prompt, cwd, write, timeout):
     exe = find_bin(cfg, "agy")
@@ -553,6 +578,8 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
     data = box["data"]
     if not isinstance(data, dict):
         raise BackendError("agy 没有给出结果 rc=%s：%s" % (rc, _tail(err or out)))
+    if data.get("status") == "SUCCESS" and not (data.get("response") or "").strip() and data.get("denied_actions"):
+        raise BackendError(agy_denied_text(data))
     if data.get("status") != "SUCCESS" or not (data.get("response") or "").strip():
         raise BackendError("agy 状态 %s：%s" % (data.get("status"), _tail(json.dumps(data, ensure_ascii=False))))
     _ctx.tokens = box["tok"]
@@ -1104,6 +1131,8 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
             rec["attempts"].append(att)
             log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": False,
                       "secs": round(time.time() - t0, 1), "error": str(e)[:500], "prompt": prompt[:200]})
+            if str(e).startswith(DENIED_PREFIX):  # 权限问题换模型也一样，不浪费额度再试
+                break
             if not quiet:
                 nxt = chain[i + 1] if i + 1 < len(chain) else None
                 eprint("[hub] %s 没成功（%s）%s" % (spec_label(spec_i), explain_error(str(e))[0],

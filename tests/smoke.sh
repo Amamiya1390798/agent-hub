@@ -26,6 +26,7 @@ python3 tests/test_images.py
 python3 tests/test_names.py
 python3 tests/test_handoff.py
 python3 tests/test_toggles.py
+python3 tests/test_denied.py
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js

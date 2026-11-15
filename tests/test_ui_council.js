@@ -9,7 +9,7 @@ function boot(store){
   const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []}},window:{},localStorage:{getItem(){return null}},sessionStorage:ss,addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},getSelection:()=>null};
   vm.createContext(ctx);
   vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);',
-    `globalThis.ui={set:s=>S=s,errHtml,chainOf,groups,viewChat,findItem,viewRun,viewNew,items,renderComposer,settingsHtml,saveDraft,getMode:()=>mode,setMode:m=>mode=m,cache:detail};`),ctx);
+    `globalThis.ui={set:s=>S=s,errHtml,chainOf,groups,viewChat,findItem,viewRun,viewNew,items,renderComposer,openKey:k=>open.add(k),settingsHtml,saveDraft,getMode:()=>mode,setMode:m=>mode=m,cache:detail};`),ctx);
   return {ui:ctx.ui,nodes};
 }
 const agents=['gemini','gpt','ds','claude'].map(name=>({name,profile:'x。',chain:['agy:x'],busy:0,current:[],quota:null}));
@@ -22,10 +22,13 @@ const run={id:'r2',mode:'council',planner:null,synthesizer:'gemini',status:'done
 const {ui,nodes}=boot({});
 ui.set({agents,config,health:{results:{}},calls:[{id:'c_s',run:'r2',kind:'synth',agent:'gemini',status:'ok',start:5,secs:3}],runs:[run],workspace:'/w'});
 ui.cache['run:r2']={sig:'x',data:Object.assign({final:'## 建议\n买 A'},run)};
+const folded=ui.viewRun({type:'run',id:'r2',title:'问',rec:run,status:'done',start:1,end:9});
+assert.ok(folded.includes('买 A') && !folded.includes('进度：列了三条理由'),'做完后先看结果，过程和进度板折起');
+ui.openKey('proc:r2');ui.openKey('board:r2');
 const html=ui.viewRun({type:'run',id:'r2',title:'问',rec:run,status:'done',start:1,end:9});
-for(const t of ['共享进度板','看不到别人的答案','进度：列了三条理由','遗留：价格需要再确认','为什么派给它：快','跳过：gpt','比较共同点和分歧','已完成 2 件','少于 15 分钟']) assert.ok(html.includes(t),t);
+for(const t of ['共享进度板','看不到别人的答案','进度：列了三条理由','遗留：价格需要再确认','为什么派给它：快','跳过：gpt','比较共同点和分歧','少于 15 分钟']) assert.ok(html.includes(t),t);
 assert.ok(!html.includes('拆解任务、分配人手'),'会审不显示拆任务步骤');
-assert.ok(html.includes('这次 2 位成员参与'),'跳过的成员不算参与');
+assert.ok(html.includes('2 位成员参与'),'跳过的成员不算参与');
 assert.ok(!html.includes('note bad'),'按规则跳过且完成的会审不显示红色错误');
 assert.ok(!ui.items()[0].agents.includes('gpt'));
 assert.ok(!html.includes('undefined'));
