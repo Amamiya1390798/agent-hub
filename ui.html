@@ -890,7 +890,7 @@ function phoneHtml(){            // 只在电脑上显示：打开局域网、�
 function modelSelect(a, i){
   const sp = a.chain[i];
   if (isRemote()) return '<div class="model-line"><span>' + (i ? '备用模型' : '干活用') + '</span><span>' + esc((((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp) + '</span></div>';
-  const all = usable(S.backends || [{spec:sp, label:sp}], sp);
+  const all = i ? usable(S.backends || [{spec:sp, label:sp}], sp) : ownModels(a, sp);
   let list = all;
   if (!i){        // 首选模型：Gemini 同一系列只列一次，档位到下面「思考等级」里选
     const curFam = (gemLevel(sp) || [])[1];
@@ -940,22 +940,49 @@ function effortSelect(a){               // 卡片上的「思考等级」：沿�
   }
   return text(kind === "dsh" ? "DeepSeek 不支持调节" : "这个模型不支持调节");
 }
-function thinkSelect(a){                // 卡片上的「动脑用」：定方案、审查、拍板、会审时换用的模型和档位
+const HOME_KIND = {gemini: "agy", claude: "claude", gpt: "codex", ds: "dsh"};
+const kindOf = sp => (sp || "").split(":")[0];
+function ownModels(a, cur){              // 这位成员自家的模型（Claude 只列 Claude，GPT 只列 GPT…）；备用模型不受限
+  const k = HOME_KIND[a.name] || kindOf(a.chain[0]);
+  return usable(S.backends || [], cur).filter(o => kindOf(o.spec) === k || o.spec === cur);
+}
+function thinkSelect(a){                // 卡片上的「动脑用」+「动脑档位」：定方案、审查、拍板、会审时用
   const th = ((S.config || {}).think || {})[a.name] || {}, sp = th.spec || "", base = a.chain[0] || "";
-  const use = sp || base, kind = use.split(":")[0];
+  const use = sp || base, kind = kindOf(use);
   const lbl = o => o.spec === "codex" ? o.label.replace("GPT · 跟随 Codex 设置", "GPT · 沿用本机设置") : o.spec === "dsh" ? "DeepSeek" : o.label;
-  let h;
-  if (isRemote()) h = '<div class="model-line"><span>动脑用</span><span>' + esc(sp ? specLabel(sp) : "跟干活一样") + '</span></div>';
-  else h = '<label class="model-line"><span>动脑用</span><select class="msel" aria-label="' + esc(a.name) + '动脑用的模型" data-think-spec="' + esc(a.name) + '">' +
-    '<option value=""' + (sp ? "" : " selected") + '>跟干活一样</option>' +
-    usable(S.backends || [], sp).map(o => '<option value="' + esc(o.spec) + '"' + (o.spec === sp ? " selected" : "") + '>' + esc(lbl(o) + (o.off ? "（已停用）" : "")) + '</option>').join("") + '</select></label>';
-  const levels = ((S.backends || []).find(b => b.spec === use) || {}).efforts || [];
-  if ((kind === "codex" || kind === "claude") && levels.length){
-    const cur = th.effort || "";
-    if (isRemote()) h += '<div class="model-line"><span>动脑档位</span><span class="small">' + esc(cur || "跟干活一样") + '</span></div>';
-    else h += '<label class="model-line"><span>动脑档位</span><select class="msel" aria-label="' + esc(a.name) + '动脑思考等级" data-think-eff="' + esc(a.name) + '">' +
-      [{id: "", desc: ""}].concat(levels).map(e => '<option value="' + esc(e.id) + '"' + (e.id === cur ? " selected" : "") + (e.desc ? ' title="' + esc(e.desc) + '"' : "") + '>' + esc(e.id ? e.id + (EFF_NOTE[e.id] || "") : "跟干活一样") + '</option>').join("") + '</select></label>';
+  const sel = (aria, attr, opts) => '<select class="msel" aria-label="' + esc(a.name) + aria + '" ' + attr + '="' + esc(a.name) + '">' + opts + '</select>';
+  const opt = (v, t, on) => '<option value="' + esc(v) + '"' + (on ? " selected" : "") + '>' + esc(t) + '</option>';
+  const row = (name, inner) => '<label class="model-line"><span>' + name + '</span>' + inner + '</label>';
+  const txt = (name, t) => '<div class="model-line"><span>' + name + '</span><span class="small">' + esc(t) + '</span></div>';
+  const mine = ownModels(a, sp);
+  const g = gemLevel(use);
+  if (isRemote()){
+    const lv = g ? gemLabel((S.backends || []).find(b => b.spec === use) || {spec: use}) : (th.effort || "跟干活一样");
+    return txt("动脑用", sp ? gemFamily(specLabel(sp)) : "跟干活一样") + txt("动脑档位", lv);
   }
+  let h;
+  if (g){                                // Gemini：档位写在模型名里，系列和档位分两栏选
+    const fams = [];
+    mine.forEach(o => { const m = gemLevel(o.spec); const f = m ? m[1] : o.spec; if (!fams.some(x => x.f === f)) fams.push({f, o}); });
+    const pick = f => {                  // 换系列时尽量保持当前档位
+      const sib = mine.filter(o => (gemLevel(o.spec) || [])[1] === f);
+      return (sib.find(o => gemLevel(o.spec)[2] === g[2]) || sib.find(o => gemLevel(o.spec)[2] === "medium") || sib[0] || {spec: f}).spec;
+    };
+    h = row("动脑用", sel("动脑用的模型", "data-think-spec", opt("", "跟干活一样", !sp) +
+      fams.map(x => { const m = gemLevel(x.o.spec); return opt(m ? pick(m[1]) : x.o.spec, m ? gemFamily(x.o.label) : lbl(x.o), sp && (m ? m[1] === g[1] : x.o.spec === sp)); }).join("")));
+    const sib = mine.filter(o => { const m = gemLevel(o.spec); return m && m[1] === g[1]; })
+      .sort((x, y) => GEM_ORDER.indexOf(gemLevel(x.spec)[2]) - GEM_ORDER.indexOf(gemLevel(y.spec)[2]));
+    h += sib.length > 1 ? row("动脑档位", sel("动脑思考等级", "data-think-spec", (sp ? "" : opt("", "跟干活一样", true)) + sib.map(o => opt(o.spec, gemLabel(o), sp === o.spec)).join("")))
+                        : txt("动脑档位", "只有这一档");
+    return h;
+  }
+  const others = mine.filter(o => !gemLevel(o.spec));
+  h = others.length > 1 || sp ? row("动脑用", sel("动脑用的模型", "data-think-spec", opt("", "跟干活一样", !sp) + others.map(o => opt(o.spec, lbl(o), o.spec === sp)).join("")))
+                              : txt("动脑用", "跟干活一样（只有这一个模型）");
+  const levels = ((S.backends || []).find(b => b.spec === use) || {}).efforts || [];
+  if ((kind === "codex" || kind === "claude") && levels.length)
+    h += row("动脑档位", sel("动脑思考等级", "data-think-eff", [{id: "", desc: ""}].concat(levels).map(e => opt(e.id, e.id ? e.id + (EFF_NOTE[e.id] || "") : "跟干活一样", e.id === (th.effort || ""))).join("")));
+  else h += txt("动脑档位", kind === "dsh" ? "DeepSeek 不支持调节" : "这个模型不支持调节");
   return h;
 }
 /* ---------- 旁问小窗：单独问小问题，不进主线 ---------- */

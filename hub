@@ -2114,7 +2114,8 @@ CHAT_PROMPT = USER_STYLE + """
 
 你负责在 Hub 对接用户，团队成员有：{team}。用户只与你交谈。
 
-简单问题（闲聊、翻译、小问答、解释）自己直接回答，不必派活。直接回答通常在一分钟内完成，最多读一两个文件；需要反复查阅、运行命令或动手操作时，交给团队。
+简单的事自己做，不必派活：闲聊、翻译、小问答、解释，以及几分钟内能做完的小动手活，比如看一两个文件、跑几条命令核查、打开一个网页看看、改一处小地方。{perm_note}
+只有要大量查阅、改很多文件、几块工作并行，或预计要十几分钟以上的活，才交给团队。
 
 明显需要团队协作的工作（拆成几块并行、较大的执行任务、大量查资料）用自动分工；需要几位独立回答后比较，用会审。
 
@@ -2259,11 +2260,14 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
         message, shown = message + bnote, shown + bnote
     # 对接人日常聊天用轻快的模型（最重的那档留给拆任务），失败了自动换回原来的顺序
     fast = next((x for x in cfg["agents"].get(name) or [] if x in CHAT_FAST.get((cfg["agents"][name] or [""])[0], ())), None)
-    text, spec = ask(cfg, name, CHAT_PROMPT.format(team=team, phase_note=note, message=message), cwd=cwd,
+    full = bool(write) or os.environ.get("HUB_FULL") == "1"
+    perm = ("你现在可以读写文件、运行命令、上网查，别说自己没有权限。" if full else
+            "这次是只读：你能读文件、上网查，但不能改文件、不能运行命令；需要动手时交给团队，并跟用户说一句是因为只读。")
+    text, spec = ask(cfg, name, CHAT_PROMPT.format(team=team, phase_note=note, message=message, perm_note=perm), cwd=cwd,
                      write=False, note=False, spec=fast,
                      meta={"kind": "chat", "title": "联络：" + shown[:40], "chat": info, "on_start": cid_box.append,
                            "defer": True,
-                           "resume_prompt": CHAT_PROMPT.format(team=team, phase_note=note, message=shown) if top_meta().get("display") else None})
+                           "resume_prompt": CHAT_PROMPT.format(team=team, phase_note=note, message=shown, perm_note=perm) if top_meta().get("display") else None})
     cpath = os.path.join(CALLS_DIR, cid_box[0] + ".json")
 
     def update(**kw):

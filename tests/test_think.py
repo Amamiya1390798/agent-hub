@@ -52,6 +52,11 @@ class Think(unittest.TestCase):
         self.assertIn('"kind": "work"', self.g["PLAN_PROMPT"])
         self.assertNotIn("最多有", self.g["PLAN_PROMPT"])
 
+    def test_chat_prompt_states_permission(self):
+        P = self.g["CHAT_PROMPT"]
+        self.assertIn("{perm_note}", P)
+        self.assertIn("跑几条命令核查", P)
+
 
 if __name__ == "__main__":
     unittest.main()
