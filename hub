@@ -1278,6 +1278,8 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
         raise BackendError("未知 agent：%s（可选：%s）" % (agent, ", ".join(cfg["agents"])))
     if hub_depth() >= MAX_DEPTH:
         raise BackendError("agent 互相调用已达 %d 层上限，请自己完成这个任务。" % MAX_DEPTH)
+    if os.environ.get("HUB_FULL") == "1":  # 面板上打开了「允许改文件」：这次的所有调用（对接人、会审、旁问、任务）都放开
+        write = True
     if write and os.environ.get("HUB_READONLY") == "1":
         raise BackendError("上级任务是只读的（例如会审），不能在里面再让队友改文件。")
     if _stopping.is_set():
@@ -1691,9 +1693,15 @@ def board_text(state, me, share_results=True, footer=True):
         lines += ["- " + n for n in notes]
     if not footer:
         return "\n".join(lines)
-    lines.append("你负责：%s。时限约 %d 分钟。" % (me, max(1, round(state.get("timeout", 900) / 60))))
+    cap = max(1, round(state.get("timeout", 900) / 60))
+    eta = next((t.get("eta_min") for t in state["tasks"] if t["id"] == me), None)
     if not share_results:
-        lines.append("（这是会审：其他人同时独立作答，你看不到他们的答案。）")
+        lines.append("你负责：%s。（这是会审：其他人同时独立作答，你看不到他们的答案。）问题里提到的文件夹、文件，"
+                     "必须先亲自打开看过再下结论，开头一句写明看了哪些；没法看就直说，不要凭印象答。"
+                     "看完关键材料、意见成形就交，不用逐个穷尽检查；%d 分钟是上限，不是要用满的时间。" % (me, cap))
+    else:
+        lines.append("你负责：%s。任务里提到的文件、文件夹要先亲自打开看过再动手或下结论。%s%d 分钟是硬上限，不是要用满的时间：做到够用就交，别为了穷尽而反复检查。"
+                     % (me, "预计 %s 分钟能做完；" % eta if eta else "", cap))
     lines.append("简洁交付结果和必要说明，末尾单独写两行：\n【进度】一句话说明完成情况\n【遗留】未完成事项或提醒；没有则写 无")
     return "\n".join(lines)
 
@@ -1895,7 +1903,17 @@ def council_members(cfg, members=None):
 
 def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None, parent_call=None):
     """会审：每位成员同时独立回答同一问题（只读），再由一位比较共同点和分歧。"""
+    explicit = members is not None
     members = council_members(cfg, members)
+    fill_note = ""
+    if not explicit and len(members) < 2:  # 会审名单里能用的不到两位（比如有人被停用了）：一个人没法比较，自动补上其他在岗成员
+        named = [n for n in cfg["agents"] if n not in members and re.search(r"(?<![a-z])%s(?![a-z])" % re.escape(n), question, re.I)]
+        rest = [n for n in cfg["agents"] if n not in members and n not in named]
+        added = (named + rest)[:max(0, 3 - len(members))]
+        if added:
+            fill_note = "会审名单里能用的只有 %s，自动补上了 %s" % ("、".join(members) or "无人", "、".join(added))
+            members += added
+            eprint("[hub] " + fill_note)
     if not members:
         raise BackendError("会审没有可选的成员，请在设置里勾选参加会审的成员")
     tasks, skipped = [], []
@@ -1915,8 +1933,8 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
     run_id, run_dir, state, save = _open_run(
         cfg, question, cwd, False, mode="council", planner=None, synthesizer=synth, participants=members,
         skipped=skipped, status="running", tasks=tasks, **_sub_fields(question, parent_call),
-        summary="会审：%s 各自独立作答，%s比较共同点和分歧" % ("、".join(t["agent"] for t in active) or "无人",
-                                                     (synth + " ") if synth else ""))
+        summary="会审：%s 各自独立作答，%s比较共同点和分歧%s" % ("、".join(t["agent"] for t in active) or "无人",
+                                                     (synth + " ") if synth else "", "（%s）" % fill_note if fill_note else ""))
     with _record_guard(lambda: state, save, "failed"):
         if on_open:
             on_open(run_id)
@@ -1936,7 +1954,7 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
         same = ["%s 实际都由同一个模型 %s 作答，不算不同模型的独立意见" % ("、".join(v), k)
                 for k, v in by_backend.items() if len(v) > 1]
         notes = absent and ["缺席或失败：" + "；".join(absent)] or []
-        notes += same
+        notes += same + ([fill_note] if fill_note else [])
         synth_ok = True
         if not ok:
             final = "会审没有得到任何回答。\n\n" + "\n".join(absent)
@@ -1983,6 +2001,8 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
 # ---------------------------------------------------------------- 主联络窗口：用户只跟一位「联络人」说话
 
 
+DISPATCH_RE = re.compile(r"\s*【派活】\s*(?P<how>自动分工|会审)\s*(?:[（(](?P<who>[^）)]{1,60})[）)])?\s*[:：]\s*(?P<goal>\S[\s\S]*)")
+
 CHAT_PROMPT = USER_STYLE + """
 
 你负责在 Hub 对接用户，团队成员有：{team}。用户只与你交谈。
@@ -1994,6 +2014,7 @@ CHAT_PROMPT = USER_STYLE + """
 派活时只输出以下对应的一段，不加其他文字。Hub 会执行，并将结果送回本对话：
 【派活】自动分工：<完整目标，包含用户的要求和背景>
 【派活】会审：<要独立回答并比较的完整问题，包含用户的要求和背景>
+只让其中几位会审（比如上次没做完的补做，已经交了的别再做一遍）时，在「会审」后面写上名字：【派活】会审（gpt、claude）：<问题，并附上已交成员的结论供参考>
 
 {phase_note}
 用户说：
@@ -2146,14 +2167,14 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
         write_json(cpath, rec)
 
     with _record_guard(lambda: read_json(cpath) or {}, update, "fail"):
-        m = re.match(r"\s*【派活】\s*(自动分工|会审)\s*[:：]\s*(\S[\s\S]*)", text)  # 只认开头就是【派活】的回答
+        m = DISPATCH_RE.match(text)  # 只认开头就是【派活】的回答
         if busy:
             rid = busy[0]["id"]
             if m:  # 团队还在忙又想派活：不叠新的一份，当作补充转告给正在做的团队
-                add_run_note(rid, m.group(2).strip())
+                add_run_note(rid, m.group("goal").strip())
                 text = ("团队还在做上一件事，我没有另派一份，而是把这个要求转告给了正在做的团队：\n\n> %s\n\n"
                         "还没开始的成员和最后汇总都会照这个来。如果你确实想另起一件新的事，等这一件做完，或者先停掉它再说。"
-                        % m.group(2).strip()[:600].replace("\n", "\n> "))
+                        % m.group("goal").strip()[:600].replace("\n", "\n> "))
                 m = None
             else:
                 relay = re.findall(r"^\s*【转告团队】\s*[:：]?\s*(.+)$", text, re.M)
@@ -2165,7 +2186,8 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
             update(status="ok", answer=text, end=time.time())
             print(text)
             return 0
-        how, goal = m.group(1), m.group(2).strip()
+        how, goal = m.group("how"), m.group("goal").strip()
+        who = [n for n in re.split(r"[、,，/\s]+", m.group("who") or "") if n in cfg["agents"]] or None  # 会审只叫点名的几位（例如只让没做完的补）
         lead = "%s 觉得这件事需要团队：交给团队%s。做完会把结果写在这里。" % (name, "一起做（自动分工）" if how == "自动分工" else "会审")
 
         def opened(rid):
@@ -2174,7 +2196,7 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
         err = None
         try:
             if how == "会审":
-                run_council(cfg, goal, cwd, synthesizer=pick_ok(cfg, cfg["synthesizer"])[0], on_open=opened, parent_call=cid_box[0])
+                run_council(cfg, goal, cwd, members=who, synthesizer=pick_ok(cfg, cfg["synthesizer"])[0], on_open=opened, parent_call=cid_box[0])
             else:
                 planner, n1 = pick_ok(cfg, cfg["planner"])
                 synth, n2 = pick_ok(cfg, cfg["synthesizer"])
@@ -3497,6 +3519,8 @@ def serve_ui(port, me):
     def launch(cmd, cwd, text, meta):
         env = {k: v for k, v in os.environ.items() if not k.startswith("HUB_") or k == "HUB_HOME"}
         env["HUB_META"] = json.dumps(meta, ensure_ascii=False)
+        if meta.get("full"):
+            env["HUB_FULL"] = "1"
         logf = open(os.path.join(HUB_HOME, "ui-submits.log"), "a", encoding="utf-8")
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=logf, cwd=cwd, env=env,
@@ -3528,8 +3552,6 @@ def serve_ui(port, me):
             raise ValueError("内容是空的")
         if mode not in ("run", "pressure", "ask", "image", "council", "chat", "side"):
             raise ValueError("方式不对")
-        if mode == "council" and body.get("write"):
-            raise ValueError("会审只读，不能允许改文件")
         if mode in ("ask", "side") and agent not in c["agents"]:
             raise ValueError("没有这个 agent")
         live = active_cfg(c)
@@ -3627,6 +3649,8 @@ def serve_ui(port, me):
             if body.get("write"):
                 cmd.append("--write")
             cmd.append("-")
+        if body.get("write") and mode != "image":
+            meta["full"] = True
         launch(cmd, cwd, full, meta)
         return meta["submission_id"]
 

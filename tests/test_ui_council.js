@@ -44,7 +44,7 @@ ui.set({agents,config:Object.assign({},config,{council_quota:{gemini:'低'}}),he
 assert.ok(nodes.hint.textContent.includes('→ gpt 比较'),'综合者低额度时提示实际换上的人');
 ui.setMode('不存在的模式');ui.renderComposer();assert.equal(ui.getMode(),'chat');ui.setMode('council');
 ui.set({agents,config,health:{results:{}},calls:[{id:'c_s',run:'r2',kind:'synth',agent:'gemini',status:'ok',start:5,secs:3}],runs:[run],workspace:'/w'});ui.renderComposer();
-assert.equal(nodes.wtog.style.display,'none');
+assert.equal(nodes.wtog.style.display,'');  // 会审也能全部放开
 assert.ok(nodes.modes.innerHTML.includes('data-v="council"'));
 // 设置：会审成员勾选、时限过短提醒
 const st=ui.settingsHtml();

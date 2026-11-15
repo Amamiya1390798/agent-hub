@@ -385,6 +385,32 @@ class ReviewFixTests(Base):
         state['display'] = '这次的要求'
         self.assertIn('整体目标：这次的要求', g['board_text'](state, 't1'))
 
+    def test_too_few_members_auto_filled(self):
+        self.cfg['council_agents'] = ['gemini', 'ds']
+        del self.cfg['agents']['ds']  # ds 被停用：只剩 gemini 一位，没法比较
+        rc, run, err = self.council(Fake({}), q='请 claude 也看看')
+        self.assertEqual(run['participants'][:2], ['gemini', 'claude'], '先补问题里点名的成员')
+        self.assertIn('自动补上了', run['summary'])
+        self.assertIn('自动补上了', err)
+
+    def test_dispatch_names_members(self):
+        R = self.g['DISPATCH_RE']
+        m = R.match('【派活】会审（gpt、claude）：补做这个问题')
+        self.assertEqual((m.group('how'), m.group('who'), m.group('goal')), ('会审', 'gpt、claude', '补做这个问题'))
+        m = R.match('【派活】自动分工：做点事')
+        self.assertEqual((m.group('how'), m.group('who'), m.group('goal')), ('自动分工', None, '做点事'))
+
+    def test_council_board_says_cap_is_not_target(self):
+        txt = self.g['board_text']({'id': 'x', 'goal': 'g', 'timeout': 900, 'tasks': [{'id': 'm1', 'agent': 'gemini', 'title': 't', 'status': 'running'}]}, 'm1', False)
+        self.assertIn('必须先亲自打开看过', txt)
+        txt = self.g['board_text']({'id': 'x', 'goal': 'g', 'timeout': 900, 'tasks': [{'id': 't1', 'agent': 'gemini', 'title': 't', 'status': 'running', 'eta_min': 6}]}, 't1')
+        self.assertIn('预计 6 分钟能做完', txt)
+        self.assertIn('不是要用满的时间', txt)
+
+    def test_explicit_members_not_filled(self):
+        rc, run, _ = self.council(Fake({}), members=['gemini'])
+        self.assertEqual(run['participants'], ['gemini'])
+
     def test_bad_council_config_types(self):
         cm = self.g['council_members']
         for bad in (3, True, 'gemini', [['x'], 'ds']):

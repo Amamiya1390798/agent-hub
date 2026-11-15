@@ -161,11 +161,11 @@ class API(unittest.TestCase):
         state = json.loads(self.request('/api/state')[1])
         self.assertEqual(next(c for c in state['calls'] if c['id']==matching[0]['id'])['submission_id'],submission)
 
-    def test_submit_council_read_only(self):
+    def test_submit_council_checks(self):
         for b in [{'council_agents':[]},{'council_agents':['gemini']},{'council_agents':['gemini','gemini']},{'council_agents':['nobody']},{'council_agents':'gemini'}]:
             self.assertEqual(self.request('/api/config',b)[0],400)
         self.assertEqual(self.request('/api/config',{'council_agents':['gemini','ds']})[0],200)
-        self.assertEqual(self.request('/api/submit',{'mode':'council','text':'会审','write':True})[0],400)
+        self.assertEqual(self.request('/api/submit',{'mode':'council','text':'会审','write':True})[0],200)  # 全部放开时会审也可写
         for extra in [{'agents':['nobody']},{'agents':'gemini'},{'agents':[]},{'synthesizer':'nobody'}]:
             self.assertEqual(self.request('/api/submit',dict({'mode':'council','text':'会审'},**extra))[0],400)
         status, data, _ = self.request('/api/submit',{'mode':'council','text':'离线会审'})

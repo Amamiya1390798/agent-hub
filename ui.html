@@ -512,7 +512,7 @@ let sel = null;                     // {type:'run'|'call', id}；null = 新任�
 let followLatest = false, pendingSubmission = null, pollSeq = 0, appliedPollSeq = 0, sending = false, stopTimer = 0;
 const beginSubmit = () => { pendingSubmission = null; followLatest = true; };
 let filter = "all", query = "";
-let mode = "chat", allowWrite = localStorage.getItem("hub-write") === "1", showCwd = false, ctx = null;
+let mode = "chat", allowWrite = localStorage.getItem("hub-write") !== "0", showCwd = false, ctx = null;
 let forking = false;
 let handoffArm = null;                // 正在选「交接到哪一组」的那条记录 id
 const pendImgs = {main: [], side: []};   // 还没发出去的图片 {id} 或 {up:true} 上传中                // 正在从 ctx 那条分叉出一条新线
@@ -1560,10 +1560,11 @@ function renderComposer(){
     : mode === "council" ? councilHint(cfg, cq, cm)
     : mode === "pressure" ? "高压：ds 读完你在设置里写的提示词后排工 → 分给多位成员一起做 → ds 汇总" + (cfg.pressure_prompt ? "" : "（提示词还没写，在 ⚙ 设置 → 高压模式提示词）")
     : mode === "image" ? "由 gpt 生成图片，保存在 Hub 的图片目录" : a ? "只交给 " + mode + "：" + a.profile.split("。")[0] : "";
-  $("wtog").style.display = mode === "image" || mode === "council" ? "none" : "";
+  $("wtog").style.display = mode === "image" ? "none" : "";
   $("dtog").style.display = mode === "image" || isRemote() ? "none" : "";
   $("wtog").classList.toggle("on", allowWrite);
-  $("wtog").textContent = allowWrite ? "✎ 允许改文件（无人值守）" : "✎ 允许改文件";
+  $("wtog").textContent = allowWrite ? "✎ 全部放开（能改文件、跑命令）" : "✎ 只读";
+  $("wtog").title = allowWrite ? "对接人、会审、旁问、团队都能改文件、跑命令、操作软件，不用你批准。点一下改成只读" : "现在只读：只能看文件、上网查。点一下全部放开";
   $("cwd").style.display = showCwd && mode !== "image" ? "" : "none";
   $("cwd").placeholder = "工作目录，留空则用 " + (S ? S.workspace : "默认目录");
   $("dtog").textContent = (showCwd ? "▾" : "▸") + " 目录";
@@ -1594,7 +1595,7 @@ async function send(){
   const cit = ctx && findItem(ctx), useCtx = cit && mode !== "image";
   const typedCwd = showCwd ? $("cwd").value.trim() : "";
   const body = {mode: mode === "run" || mode === "pressure" || mode === "image" || mode === "council" || mode === "chat" ? mode : "ask", agent: mode === "chat" ? contact : mode, text,
-    cwd: typedCwd || (useCtx && cit.rec.cwd && cit.rec.cwd !== S.workspace ? cit.rec.cwd : ""), write: allowWrite && mode !== "image" && mode !== "council"};
+    cwd: typedCwd || (useCtx && cit.rec.cwd && cit.rec.cwd !== S.workspace ? cit.rec.cwd : ""), write: allowWrite && mode !== "image"};
   if (useCtx) body.context = ctx;
   if (useCtx && forking) body.fork = true;
   if (uploading("main")){ toast("图片还在上传，稍等一下"); return; }
@@ -1748,7 +1749,7 @@ document.addEventListener("click", async e => {
     else if (act === "sug"){
       const s = viewNew.sug[+el.dataset.i];
       if ($("txt").value.trim() && $("txt").value !== s[0]){ toast("输入框里已有文字，先清空再选模板"); return; }
-      $("txt").value = s[0]; mode = s[1]; if (mode === "council") allowWrite = false; saveDraft(); autosize(); renderComposer(); $("txt").focus();
+      $("txt").value = s[0]; mode = s[1]; saveDraft(); autosize(); renderComposer(); $("txt").focus();
     }
     else if (act === "side"){ document.body.classList.toggle("side-open"); syncTabs(); }
     else if (act === "settings"){ settingsOpen = !settingsOpen; railBusyUntil = 0; if (settingsOpen) loadPair(); renderRail(); $("rail").scrollTop = 0; }

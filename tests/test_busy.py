@@ -55,5 +55,22 @@ class Busy(unittest.TestCase):
         self.assertEqual(g["busy_runs_in_line"](), [])
 
 
+class FullAccess(unittest.TestCase):
+    def test_hub_full_makes_every_call_writable(self):
+        home = tempfile.mkdtemp()
+        with patch.dict(os.environ, {"HUB_HOME": home, "HUB_FULL": "1", "HUB_READONLY": ""}):
+            g = {"__name__": "hubmod"}
+            exec(compile(open(HUB, encoding="utf-8").read(), HUB, "exec"), g)
+            seen = []
+
+            def fake(cfg, model, prompt, cwd, write, timeout):
+                seen.append(write)
+                return "好"
+            with patch.dict(g["BACKENDS"], {"agy": fake}):
+                g["ask"]({"agents": {"gemini": ["agy:m"]}, "timeout": 60}, "gemini", "会审问题", cwd=home, write=False, quiet=True,
+                         meta={"kind": "task", "run": "r"})
+        self.assertEqual(seen, [True])
+
+
 if __name__ == "__main__":
     unittest.main()
