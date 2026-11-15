@@ -16,6 +16,7 @@ PY
 python3 hub --help >/dev/null
 python3 tests/test_history.py
 python3 tests/test_keep.py
+python3 tests/test_watchdog.py
 python3 tests/test_lifecycle.py
 python3 tests/test_hub.py
 python3 tests/test_api.py
@@ -31,6 +32,7 @@ python3 tests/test_handoff.py
 python3 tests/test_toggles.py
 python3 tests/test_denied.py
 python3 tests/test_busy.py
+python3 tests/test_think.py
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js

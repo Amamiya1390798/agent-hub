@@ -66,7 +66,9 @@ DEFAULT_CONFIG = {
     "default_worker": "gemini",
     "council_agents": ["gemini", "gpt", "ds"],  # 会审默认参加的成员；Claude 默认不参加，可在设置里勾选
     "max_parallel": 3,
-    "timeout": 900,
+    "timeout": 900,          # 软时限：仍有动静就继续
+    "idle_timeout": 300,     # 连续多久没有输出才判定卡住
+    "hard_timeout": 3600,    # 单次调用的总上限
     "disabled_agents": [],     # 停用的成员：排工、会审、对接、旁问都不会叫他
     "disabled_models": [],     # 停用的模型（如 "agy:gemini-4-argon-high"）：不出现在下拉框里，也不会被调用（包括当备用）
     "auto_title": "ds",        # 项目组做完后由谁起个短名字；""=不自动起名
@@ -75,6 +77,7 @@ DEFAULT_CONFIG = {
     "lan_access": False,       # 手机通过局域网访问面板；默认关闭，只能在电脑上打开
     "gpt_full_access": False,  # True：GPT 在「允许改文件」的任务里不受沙箱限制，才能调用 hub 指挥队友、联网
     "codex_effort": "",        # 旧设置：GPT 的思考强度；成员卡片上单独设过（见 effort）就以那个为准
+    "think": {},               # 动脑的活（定方案、审查、拍板、会审）用的模型和思考等级；没设就跟干活一样
     "effort": {},              # 每位成员的思考等级 {成员: low/medium/high/xhigh/max}，""=沿用该程序自己的默认；对 GPT、Claude 有效，Gemini 的等级写在模型名里
     "profiles": {
         "gemini": "额度最充裕（每周和每 5 小时仍有上限），能力中上。团队主力干活的人：阅读、搜索、整理、写初稿、写代码、批量改写等执行类的活默认都给它。",
@@ -187,6 +190,17 @@ def agent_effort(cfg, agent, spec):
     else:
         e = (cfg.get("codex_effort") or "") if kind == "codex" else ""
     return e if e and e in effort_levels(spec) else ""
+
+
+def think_setting(cfg, agent):
+    """这位成员做「动脑」的活时用的 (模型, 思考等级)；模型为空=跟干活用的一样。停用的模型不算。"""
+    th = cfg.get("think") if isinstance(cfg.get("think"), dict) else {}
+    d = th.get(agent) if isinstance(th.get(agent), dict) else {}
+    sp = d.get("spec") if isinstance(d.get("spec"), str) else ""
+    if sp in (cfg.get("disabled_models") or []):
+        sp = ""
+    eff = d.get("effort") if isinstance(d.get("effort"), str) else ""
+    return sp, eff
 
 
 def active_cfg(cfg):
@@ -363,7 +377,49 @@ class Live(object):
                     pass
 
 
-def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None):
+WATCHDOG_PREFIXES = ("卡住了（", "空转（", "超时（到总上限 ")
+
+
+class Watchdog(object):
+    """软时限后允许继续干活；只因没动静、反复调用同一工具或到总上限而停。"""
+
+    def __init__(self, cfg, timeout, streaming=True):
+        self.hard_timeout = max(timeout, cfg.get("hard_timeout", DEFAULT_CONFIG["hard_timeout"]))
+        self.idle_timeout = cfg.get("idle_timeout", DEFAULT_CONFIG["idle_timeout"])
+        self.streaming = streaming
+        self.start = self.last = time.monotonic()
+        self.tools, self.error = {}, None
+        self.lock = threading.Lock()
+
+    def touch(self):
+        with self.lock:
+            self.last = time.monotonic()
+
+    def tool(self, name, params):
+        arg = json.dumps(params, ensure_ascii=False, sort_keys=True)
+        key = (name, arg)
+        with self.lock:
+            self.tools[key] = self.tools.get(key, 0) + 1
+            if self.tools[key] >= 8 and not self.error:
+                detail = " ".join((name + " " + arg).split())[:160]
+                self.error = "空转（反复做同一件事：%s）" % detail
+
+    def check(self):
+        """检查后返回下一段最多等多久；流式回调只记状态，由调用线程停进程。"""
+        with self.lock:
+            now = time.monotonic()
+            hard_left = self.start + self.hard_timeout - now
+            idle_left = self.last + self.idle_timeout - now
+            if self.error:
+                raise BackendError(self.error)
+            if hard_left <= 0:
+                raise BackendError("超时（到总上限 %d 分钟）" % max(1, round(self.hard_timeout / 60)))
+            if self.streaming and idle_left <= 0:
+                raise BackendError("卡住了（%d 分钟没有任何动静）" % max(1, round(self.idle_timeout / 60)))
+            return min(0.2, hard_left, idle_left) if self.streaming else min(0.2, hard_left)
+
+
+def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None, watch=None):
     if _stopping.is_set():
         raise BackendError("已手动停止")
     try:
@@ -379,6 +435,8 @@ def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None):
         try:
             for line in stream:
                 chunks.append(line)
+                if watch:
+                    watch.touch()
                 if callback:
                     try:
                         callback(line)
@@ -399,16 +457,33 @@ def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None):
     if stdin_text is not None:
         ths.append(threading.Thread(target=feed, daemon=True))
     deadline = time.monotonic() + timeout
+
+    def wait_time():
+        if _stopping.is_set():
+            raise BackendError(STOP_MSG)
+        interval = watch.check() if watch else 0.2
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        return min(interval, left)
+
     try:
         if _stopping.is_set():
             raise BackendError(STOP_MSG)
         for t in ths:
             t.start()
-        p.wait(timeout=max(0, deadline - time.monotonic()))
+        while True:
+            interval = wait_time()
+            try:
+                p.wait(timeout=interval)
+                break
+            except subprocess.TimeoutExpired:
+                pass
         for t in ths:
-            t.join(max(0, deadline - time.monotonic()))
-        if any(t.is_alive() for t in ths):
-            raise subprocess.TimeoutExpired(cmd, timeout)
+            while t.is_alive():
+                t.join(wait_time())
+        if watch:
+            watch.check()
     except BaseException as e:
         _kill_tree(p)
         try:
@@ -454,8 +529,11 @@ ERROR_KINDS = [  # (匹配原始报错的关键词, 一句人话, 一句建议)�
     ((DENIED_PREFIX,), "没有权限：只读模式下不能读工作目录以外的文件、运行命令或操作别的软件",
      "这件事需要更多权限：发送时勾上「可改文件」再试；只是要读资料的话，把文件放进工作目录"),
     (("已手动停止", "signal 15", "sigterm"), "被手动停止了", "需要的话可以点「重新执行」"),
+    (("卡住了（",), "有一阵子没有任何动静，已经停下了", "可以换一位成员接着做，已写出的部分会保留"),
+    (("空转（",), "一直反复做同一件事，已经停下了", "换一位成员接着做，或说清楚下一步要做什么"),
+    (("超时（到总上限 ",), "已经到了最长等待时间，停下来了", "可以在设置里放宽总上限，或拆成几步做"),
     (("print timeout", "超时", "timed out", "timeout", "deadline exceeded"), "{t}内没做完，被掐断了",
-     "可能任务太大：可以拆小一点，或在设置里放宽「每一步最多等几分钟」"),
+     "可能任务太大：可以拆小一点，或在设置里放宽「最长做多久」"),
     (("rate limit", "rate_limit", "quota", "exhausted", "429", "usage limit", "额度", "insufficient", "credit", "余额"),
      "额度用完了（或被限速）", "等额度刷新后再试，或换一位成员"),
     (("not logged", "login", "unauthorized", "401", "403", "auth", "credential", "未登录", "登录"),
@@ -629,10 +707,10 @@ def _keep_spawn(exe, model, cwd, write, sid, title):
     return meta
 
 
-def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line):
+def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line, watch=None):
     """在常驻会话里说一句话，等这一轮的结果。返回 False 表示这次用不了常驻（交给原来的一次性方式）。"""
     import fcntl
-    deadline = time.monotonic() + timeout
+    watch = watch or Watchdog({}, timeout)
     if _stopping.is_set():
         raise BackendError(STOP_MSG)
     meta = None
@@ -665,8 +743,7 @@ def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line):
     def check_deadline():
         if _stopping.is_set():
             raise BackendError(STOP_MSG)
-        if time.monotonic() >= deadline:
-            raise BackendError("超时（%ss）" % timeout)
+        return watch.check()
 
     try:
         check_deadline()
@@ -685,7 +762,7 @@ def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line):
                 try:
                     data = data[os.write(fd, data):]
                 except BlockingIOError:
-                    time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+                    time.sleep(min(0.05, check_deadline()))
                 except BrokenPipeError:
                     if not meta.get("turns") and not _keep_alive(meta):
                         keep_close(meta["id"])
@@ -699,14 +776,16 @@ def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line):
         with open(ps["log"], "rb") as f:
             f.seek(pos)
             while True:
-                check_deadline()  # 连续输出也不能绕过总超时
+                check_deadline()
                 chunk = f.readline()
                 if chunk:
                     buf += chunk
                     if not buf.endswith(b"\n"):
                         continue
                     line, buf = buf.decode("utf-8", "replace"), b""
+                    watch.touch()
                     on_line(line)
+                    check_deadline()
                     try:
                         ev = json.loads(line)
                     except ValueError:
@@ -725,7 +804,7 @@ def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line):
                     if not meta.get("turns"):  # 一开机就退出（比如这个版本不支持常驻）：改回一次性的方式
                         return False
                     raise BackendError("常驻的 Gemini 会话意外退出了：%s" % error)
-                time.sleep(0.15)
+                time.sleep(min(0.15, check_deadline()))
     except BaseException:
         keep_close(meta["id"])
         raise
@@ -758,7 +837,8 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(prompt)
         prompt = "完整任务说明在文件 %s 中，请先完整阅读该文件，再严格按其中要求完成任务（不要修改或删除该文件）。" % tmp
-    cmd = [exe, "--print=" + prompt, "--output-format", "stream-json", "--print-timeout", "%ds" % timeout]
+    watch = Watchdog(cfg, timeout)
+    cmd = [exe, "--print=" + prompt, "--output-format", "stream-json", "--print-timeout", "%ds" % watch.hard_timeout]
     if model:
         cmd += ["--model", model]
     if cfg.get("_resume"):  # 续接上一轮的会话，只发这一轮的话
@@ -796,13 +876,15 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
         elif su.get("step_type") == "tool" and su.get("state") == "ACTIVE":
             params = (su.get("tool_info") or {}).get("parameters") or {}
             arg = next((str(v) for v in params.values() if isinstance(v, (str, int, float)) and str(v).strip()), "")
-            live.step("%s %s" % (su.get("tool_name") or "tool", arg))
+            name = su.get("tool_name") or "tool"
+            watch.tool(name, params)
+            live.step("%s %s" % (name, arg))
 
     rc, out, err = 0, "", ""
     try:
-        kept = cfg.get("_keep") and keep_turn(exe, model, prompt, cwd, write, timeout, cfg.get("_resume"), cfg.get("_keep_title"), on_line)
+        kept = cfg.get("_keep") and keep_turn(exe, model, prompt, cwd, write, timeout, cfg.get("_resume"), cfg.get("_keep_title"), on_line, watch=watch)
         if not kept:
-            rc, out, err = _run(cmd, cwd, clean_env(), timeout + 30, on_line=on_line)
+            rc, out, err = _run(cmd, cwd, clean_env(), watch.hard_timeout + 30, on_line=on_line, watch=watch)
     finally:
         live.close()
         if tmp:
@@ -845,6 +927,7 @@ def backend_codex(cfg, model, prompt, cwd, write, timeout):
         cmd += ["-c", 'web_search="live"']
     cmd += ["--json"] + ([cfg["_resume"]] if cfg.get("_resume") else []) + ["-"]
     live = Live()
+    watch = Watchdog(cfg, timeout)
     box = {}
 
     def on_line(line):  # 事件流只用于实时显示；最终回答仍读 -o 文件
@@ -861,13 +944,17 @@ def backend_codex(cfg, model, prompt, cwd, write, timeout):
         if kind == "agent_message" and typ.endswith("completed") and item.get("text"):
             live.add(str(item["text"]) + "\n\n")
         elif kind == "command_execution" and typ.endswith("started"):
+            watch.tool(kind, item.get("command") or "")
             live.step(str(item.get("command") or "运行命令"))
         elif kind not in ("agent_message", "reasoning", "command_execution") and typ.endswith("started"):
+            if kind in ("mcp_tool_call", "tool_call"):
+                watch.tool("%s:%s" % (item.get("server") or "", item.get("tool") or item.get("name") or kind),
+                           item.get("arguments") or item.get("input") or {})
             live.step(kind)
 
     try:
         try:
-            rc, out, err = _run(cmd, cwd, clean_env(), timeout, stdin_text=prompt, on_line=on_line)
+            rc, out, err = _run(cmd, cwd, clean_env(), watch.hard_timeout, stdin_text=prompt, on_line=on_line, watch=watch)
         finally:
             live.close()
         with open(outfile, encoding="utf-8", errors="replace") as f:
@@ -893,6 +980,7 @@ def backend_dsh(cfg, model, prompt, cwd, write, timeout):
     cmd = [exe, "--patch", DSH_PATCH, "--profile", "headless", "--json"] + \
         (["--session-id", cfg["_resume"]] if cfg.get("_resume") else []) + ["-"]
     live = Live()
+    watch = Watchdog(cfg, timeout)
 
     def on_line(line):
         try:
@@ -909,7 +997,7 @@ def backend_dsh(cfg, model, prompt, cwd, write, timeout):
                                   json.dumps(ev.get("input") or ev.get("args") or "", ensure_ascii=False)[:120]))
 
     try:
-        rc, out, err = _run(cmd, cwd, env, timeout, stdin_text=prompt, on_line=on_line)
+        rc, out, err = _run(cmd, cwd, env, watch.hard_timeout, stdin_text=prompt, on_line=on_line, watch=watch)
     finally:
         live.close()
     final, tok, sid = None, {"in": 0, "out": 0, "cache": 0}, None
@@ -953,7 +1041,8 @@ def backend_claude(cfg, model, prompt, cwd, write, timeout):
     if cfg.get("_images"):
         cmd += ["--add-dir", ATTACH_DIR]
     cmd += ["--output-format", "json"]  # 拿到会话编号，下次追问能续接
-    rc, out, err = _run(cmd, cwd, clean_env(), timeout, stdin_text=prompt)
+    watch = Watchdog(cfg, timeout, streaming=False)
+    rc, out, err = _run(cmd, cwd, clean_env(), watch.hard_timeout, stdin_text=prompt, watch=watch)
     text = out.strip()
     try:
         d = json.loads(text)
@@ -1270,8 +1359,8 @@ def resume_plan(agent, ext, meta, web):
 
 
 def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, quiet=False, note=True, meta=None,
-        spec=None, effort=None, web=False):
-    """调用某个角色。返回 (回答文本, 实际使用的后端描述)。全部后备都失败则抛 BackendError。"""
+        spec=None, effort=None, web=False, tier=None):
+    """调用某个角色。tier="think" 表示动脑的活，改用这位成员的「动脑模型」。返回 (回答文本, 实际使用的后端描述)。全部后备都失败则抛 BackendError。"""
     if agent not in cfg["agents"] and agent in (cfg.get("_disabled_agents") or []):
         raise BackendError(disabled_reason(cfg, agent))
     if agent not in cfg["agents"]:
@@ -1293,6 +1382,11 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
         raise BackendError("%s 没有配置任何后端" % agent)
     if model:
         chain[0] = chain[0].split(":")[0] + ":" + model
+    think_eff = ""
+    if tier == "think" and not spec and not model:  # 动脑的活：动脑模型排第一，失败了再按原来的顺序换备用
+        tsp, think_eff = think_setting(cfg, agent)
+        if tsp:
+            chain = [tsp] + [x for x in chain if x != tsp]
     if spec:  # 旁问里指定的模型排第一，失败了再按这位成员原来的顺序换备用
         chain = [spec] + [x for x in chain if x != spec]
     # 只有当对方还能再找队友时才告诉它可以求助，免得它试了碰壁
@@ -1301,7 +1395,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
         full_prompt += WEB_NOTE
     if (meta or {}).get("kind", "ask") in ("ask", "side") and not (meta or {}).get("run"):  # 用户直接问某位成员：同样照这个写法回
         full_prompt += "\n\n" + USER_STYLE
-    errors = []
+    errors, failed_specs, continuation = [], set(), ""
     meta = meta or {}
     cid = "c_" + uuid.uuid4().hex[:10]
     rec = {"id": cid, "parent": os.environ.get("HUB_PARENT") or None,
@@ -1309,7 +1403,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
            "task": meta.get("task"), "kind": meta.get("kind") or "ask", "title": meta.get("title"),
            "agent": agent, "backend": chain[0], "preferred_backend": chain[0], "status": "running", "start": time.time(), "end": None,
            "secs": None, "write": bool(write), "cwd": cwd, "prompt": prompt, "answer": None,
-           "error": None, "attempts": [], "pid": os.getpid(),
+           "error": None, "attempts": [], "pid": os.getpid(), "tier": "think" if tier == "think" else "work",
            "image": meta.get("image"), "follows": None, "display": None, "chat": meta.get("chat")}
     if web or spec or effort is not None:
         rec["side"] = {"web": bool(web), "effort": effort or "", "spec": spec or ""}
@@ -1345,9 +1439,15 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
             for i, spec_i in enumerate(chain):
                 if _stopping.is_set():
                     break
+                if spec_i in failed_specs:
+                    rec["attempts"].append({"backend": spec_i, "skipped": True,
+                                            "reason": "备用和刚才的是同一个模型，不再重跑"})
+                    write_json(cpath, rec)
+                    continue
                 kind, _, mdl = spec_i.partition(":")
                 fn = BACKENDS.get(kind)
                 if not fn:
+                    failed_specs.add(spec_i)
                     errors.append((spec_i, "未知后端（找不到）"))
                     rec["attempts"].append({"backend": spec_i, "error": "未知后端", "reason": "配置里写了不认识的模型：%s" % spec_i})
                     continue
@@ -1359,6 +1459,8 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
                 _ctx.partial = None
                 try:
                     eff = agent_effort(cfg, agent, spec_i)
+                    if think_eff and i == 0 and think_eff in effort_levels(spec_i):
+                        eff = think_eff
                     if effort is not None and i == 0 and spec:  # 旁问里单独选的档位只用在指定的那个模型上
                         eff = effort if effort in effort_levels(spec_i) else ""
                     run_cfg = dict(cfg, _effort=eff, _web=bool(web), _images=[attachment_path(n) for n in images],
@@ -1372,7 +1474,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
                             text = fn(dict(run_cfg, _resume=resume["sid"]), mdl, resume["prompt"], cwd, write, timeout)
                             rec["resumed"] = resume["from"]
                         except (BackendError, OSError) as e:
-                            if _stopping.is_set():
+                            if _stopping.is_set() or str(e).startswith(WATCHDOG_PREFIXES):
                                 raise
                             rec["attempts"].append({"backend": spec_i, "error": str(e)[:800], "resume_failed": True,
                                                     "reason": "续接上一轮的会话没成功（%s），改为带上前文重新问" % explain_error(str(e))[0]})
@@ -1382,7 +1484,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
                                 eprint("[hub] 续接上一轮会话没成功，改为带上前文重新问…")
                         resume = None
                     if text is None:
-                        text = fn(run_cfg, mdl, full_prompt, cwd, write, timeout)
+                        text = fn(run_cfg, mdl, full_prompt + continuation, cwd, write, timeout)
                     dt = time.time() - t0
                     log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": True,
                               "secs": round(dt, 1), "write": write, "cwd": cwd,
@@ -1398,18 +1500,21 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
                                session=getattr(_ctx, "session", None))
                     return text, spec_i
                 except (BackendError, OSError) as e:
+                    failed_specs.add(spec_i)
                     errors.append((spec_i, str(e)))
                     att = {"backend": spec_i, "error": str(e)[:800], "reason": "%s：%s" % (spec_label(spec_i), explain_error(str(e))[0])}
                     if getattr(_ctx, "partial", None):
                         att["partial"] = _ctx.partial
                         rec["partial"] = _ctx.partial  # 超时等情况下已经写出来的部分，标「未完成」给人看
+                        if str(e).startswith(WATCHDOG_PREFIXES):
+                            continuation = "\n\n（前一位做到一半被停下了，以下是它已经写出的部分，请在此基础上接着做完，不要从头再来：）\n" + _ctx.partial[:6000]
                     rec["attempts"].append(att)
                     log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": False,
                               "secs": round(time.time() - t0, 1), "error": str(e)[:500], "prompt": prompt[:200]})
                     if str(e).startswith(DENIED_PREFIX):  # 权限问题换模型也一样，不浪费额度再试
                         break
                     if not quiet:
-                        nxt = chain[i + 1] if i + 1 < len(chain) else None
+                        nxt = next((x for x in chain[i + 1:] if x not in failed_specs), None)
                         eprint("[hub] %s 没成功（%s）%s" % (spec_label(spec_i), explain_error(str(e))[0],
                                                          "，换 %s 再试…" % spec_label(nxt) if nxt else "。"))
             msg = failure_text(agent, errors)
@@ -1432,9 +1537,10 @@ PLAN_PROMPT = """为平等协作的小团队排工，按成员长处和剩余额
 3. 关键成果（方案、代码、交付用户的结论）值得复核时，再交给另一位成员审查，用 depends_on 接在产出任务后。
 4. 执行工作（查资料、写初稿、写代码、整理）默认给 gemini；claude / gpt 主要定方案、拍板和审查；画图给 gpt，零碎小活给 ds。{quota_rule}gemini 额度不足时再由其他成员接手，并在 why 中说明。
 5. 每个任务的 prompt 必须自包含：队员看不到用户原话，须写全所需背景、约束和输出格式，并要求简洁交付成果与必要说明。依赖其他任务结果时用 depends_on 标出，执行时会自动附上前置结果。
-6. why 用一句话说明成员长处或额度原因；eta_min 填预计分钟数，须为整数。每位成员单次最多有 {timeout_min} 分钟。
-7. 共排 1～{max_tasks} 个任务。创建或修改文件、运行命令、操作本机软件的任务设 write=true（只读任务只能读文件、上网，不能运行任何命令）{write_hint}；两个写任务不得修改同一文件。
-8. 1～2 分钟内排完，只根据已给目标和背景拆分。不要自行读文件、运行命令、上网或执行任务；需要先摸清情况，就把它排为第一个任务。
+6. why 用一句话说明成员长处或额度原因；eta_min 填预计分钟数，须为整数。一般在 {timeout_min} 分钟内做完；确实要更久也可以，只要一直在推进就不会被打断。
+7. kind 标这件活偏哪种：think＝动脑（定方案、做判断、审查把关、疑难分析）；work＝干活（查资料、读文件、写初稿、写代码、批量修改、整理）。拿不准就写 work。成员做 think 的活会换用他更强的模型，更慢也更费额度，别滥用。
+8. 共排 1～{max_tasks} 个任务。创建或修改文件、运行命令、操作本机软件的任务设 write=true（只读任务只能读文件、上网，不能运行任何命令）{write_hint}；两个写任务不得修改同一文件。
+9. 1～2 分钟内排完，只根据已给目标和背景拆分。不要自行读文件、运行命令、上网或执行任务；需要先摸清情况，就把它排为第一个任务。
 
 工作目录：{cwd}
 
@@ -1442,7 +1548,7 @@ PLAN_PROMPT = """为平等协作的小团队排工，按成员长处和剩余额
 {goal}
 
 只输出一个 JSON 对象，不加其他文字或代码块标记：
-{{"summary": "一句话方案", "tasks": [{{"id": "t1", "agent": "gemini", "title": "简短标题", "why": "为什么派给它", "eta_min": 5, "prompt": "给队员的完整指令", "depends_on": [], "write": false}}]}}"""
+{{"summary": "一句话方案", "tasks": [{{"id": "t1", "agent": "gemini", "title": "简短标题", "why": "为什么派给它", "eta_min": 5, "kind": "work", "prompt": "给队员的完整指令", "depends_on": [], "write": false}}]}}"""
 
 USER_STYLE = """【回答写法，必须遵守】用户不是程序员，看不懂技术细节。有固定输出格式（如【派活】）时先守格式，其余一律这样写：
 1. 第一句就给结论或结果，像跟朋友发消息那样说。
@@ -1576,6 +1682,7 @@ def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None
                     deps = [deps]
                 t["depends_on"] = [re.sub(r"[^A-Za-z0-9_-]", "_", str(d)) for d in deps]
                 t["write"] = bool(t.get("write")) and write
+                t["kind"] = "think" if str(t.get("kind") or "").strip().lower() in ("think", "动脑") else "work"
                 if not t.get("prompt"):
                     raise ValueError("任务 %s 缺少 prompt" % tid)
                 t["prompt"] = str(t["prompt"])
@@ -1698,10 +1805,10 @@ def board_text(state, me, share_results=True, footer=True):
     if not share_results:
         lines.append("你负责：%s。（这是会审：其他人同时独立作答，你看不到他们的答案。）问题里提到的文件夹、文件，"
                      "必须先亲自打开看过再下结论，开头一句写明看了哪些；没法看就直说，不要凭印象答。"
-                     "看完关键材料、意见成形就交，不用逐个穷尽检查；%d 分钟是上限，不是要用满的时间。" % (me, cap))
+                     "看完关键材料、意见成形就交，不用逐个穷尽检查。一般 %d 分钟内能交；没有一刀切的时限，但连续几分钟没有任何进展、或反复做同一件事，会被当作卡住停下。" % (me, cap))
     else:
-        lines.append("你负责：%s。任务里提到的文件、文件夹要先亲自打开看过再动手或下结论。%s%d 分钟是硬上限，不是要用满的时间：做到够用就交，别为了穷尽而反复检查。"
-                     % (me, "预计 %s 分钟能做完；" % eta if eta else "", cap))
+        lines.append("你负责：%s。任务里提到的文件、文件夹要先亲自打开看过再动手或下结论。%s确实要更久可以接着做，只要一直在推进；连续几分钟没有任何进展、或反复做同一件事，会被当作卡住停下。做到够用就交，别为了穷尽而反复检查。"
+                     % (me, ("预计 %s 分钟能做完；" % eta) if eta else ("一般 %d 分钟内能做完；" % cap)))
     lines.append("简洁交付结果和必要说明，末尾单独写两行：\n【进度】一句话说明完成情况\n【遗留】未完成事项或提醒；没有则写 无")
     return "\n".join(lines)
 
@@ -1745,7 +1852,7 @@ def _open_run(cfg, goal, cwd, write, **fields):
 
     warn = timeout_warning(cfg["timeout"])
     if warn:
-        eprint("[hub] 提醒：" + warn + "可以在设置里调大「每一步最多等几分钟」。")
+        eprint("[hub] 提醒：" + warn + "可以在设置里调大「一般多久交」。")
         state["timeout_warning"] = warn
     save()
     return run_id, run_dir, state, save
@@ -1784,7 +1891,7 @@ def _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel, share_results=T
         t0 = time.time()
         try:
             text, spec = ask(cfg, t["agent"], p, cwd=cwd, write=t["write"], quiet=True, note=share_results,
-                             meta={"run": run_id, "task": t["id"], "kind": "task", "title": t["title"],
+                             tier="think" if (t.get("kind") == "think" or not share_results) else None, meta={"run": run_id, "task": t["id"], "kind": "task", "title": t["title"],
                                    "on_start": started})
             return {"ok": True, "text": text, "backend": spec, "secs": round(time.time() - t0, 1)}
         except BackendError as e:
@@ -1972,7 +2079,7 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
                 eprint("[hub] 比较意见中（%s）…" % synth)
                 save(status="synthesizing")
                 final, _ = ask(cfg, synth, COUNCIL_SYNTH_PROMPT.format(question=question, results=blob, note=note),
-                               cwd=state["cwd"], note=False, quiet=True,
+                               cwd=state["cwd"], note=False, quiet=True, tier="think",
                                meta={"run": run_id, "kind": "synth", "title": "会审综合：" + (state.get("display") or question)[:40]})
                 if same:
                     final = "> 注意：" + "；".join(same) + "\n\n" + final
@@ -2433,7 +2540,7 @@ def ui_state(cfg):
                                    "synthesizer", "error", "write", "follows", "display", "submission_id",
                                    "participants", "skipped", "timeout_warning", "parent_call", "pressure", "fork", "images")}
         d["mode"] = r.get("mode") or "run"  # 旧记录没有 mode，都是自动分工
-        d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min",
+        d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min", "kind",
                                              "progress", "leftover", "skip_reason", "started",
                                              "backend", "preferred_backend", "secs", "call_id")} for t in (r.get("tasks") or [])]
         for t in d["tasks"]:
@@ -2448,12 +2555,13 @@ def ui_state(cfg):
             "names": load_names(), "naming": _names_running.is_set(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
                        "running": bool(_health_running.is_set())},
-            "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout")},
+            "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout", "idle_timeout", "hard_timeout")},
                            council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
                            council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
                            quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "",
                            disabled_agents=list(cfg.get("disabled_agents") or []), disabled_models=list(cfg.get("disabled_models") or []), pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1],
-                           effort={n: agent_effort(cfg, n, (cfg["agents"][n] or [""])[0]) for n in cfg["agents"]}),
+                           effort={n: agent_effort(cfg, n, (cfg["agents"][n] or [""])[0]) for n in cfg["agents"]},
+                           think={n: dict(zip(("spec", "effort"), think_setting(cfg, n))) for n in cfg["agents"]}),
             "workspace": UI_WORKSPACE, "backends": backend_choices(cfg),
             "ui_version": int(os.path.getmtime(UI_HTML)) if os.path.exists(UI_HTML) else 0}
 
@@ -3721,6 +3829,28 @@ def serve_ui(port, me):
             cur = raw.get("effort") if isinstance(raw.get("effort"), dict) else {}
             cur[ef["agent"]] = ef["level"]
             raw["effort"] = cur
+        th = body.get("think")
+        if "think" in body:
+            if not isinstance(th, dict) or th.get("agent") not in c["agents"]:
+                raise ValueError("动脑模型设置不对")
+            cur = raw.get("think") if isinstance(raw.get("think"), dict) else {}
+            one = dict(cur.get(th["agent"]) if isinstance(cur.get(th["agent"]), dict) else {})
+            if "spec" in th:
+                sp = th["spec"]
+                if sp != "" and sp not in set(o["spec"] for o in backend_choices(c)):
+                    raise ValueError("不认识这个模型：%s" % sp)
+                if sp and sp in (c.get("disabled_models") or []):
+                    raise ValueError("这个模型已停用，先在设置的「可用模型」里勾回来")
+                if sp != one.get("spec"):
+                    one["effort"] = ""  # 换了模型，原来的档位不一定还有
+                one["spec"] = sp
+            if "effort" in th:
+                tsp = one.get("spec") or (c["agents"][th["agent"]] or [""])[0]
+                if th["effort"] != "" and th["effort"] not in effort_levels(tsp):
+                    raise ValueError("这个模型没有「%s」这一档" % th["effort"])
+                one["effort"] = th["effort"]
+            cur[th["agent"]] = one
+            raw["think"] = cur
         ch = body.get("chain")
         if "chain" in body and not isinstance(ch, dict):
             raise ValueError("模型设置格式不对")
@@ -3740,7 +3870,8 @@ def serve_ui(port, me):
                 raise ValueError("位置不对")
             chain[idx] = spec
             raw.setdefault("agents", {})[name] = chain
-        for k, lo, hi in (("max_parallel", 1, 8), ("timeout", 60, 7200)):
+        for k, lo, hi in (("max_parallel", 1, 8), ("timeout", 60, 7200),
+                          ("idle_timeout", 60, 1800), ("hard_timeout", 300, 14400)):
             if k in body:
                 v = body[k]
                 if type(v) is not int:

@@ -114,6 +114,8 @@ class API(unittest.TestCase):
 
     def test_config_validation_and_preservation(self):
         for b in [{'timeout':None},{'timeout':59},{'timeout':7201},{'max_parallel':0},
+                  {'idle_timeout':None},{'idle_timeout':59},{'idle_timeout':1801},{'idle_timeout':True},
+                  {'hard_timeout':None},{'hard_timeout':299},{'hard_timeout':14401},{'hard_timeout':300.5},
                   {'max_parallel':1.5},{'max_parallel':True},{'planner':'missing'},
                   {'codex_effort':'invalid'},{'chain':[]},
                   {'effort':{'agent':'claude','level':'ultra'}},{'effort':{'agent':'nobody','level':'low'}},{'effort':'high'},
@@ -122,10 +124,15 @@ class API(unittest.TestCase):
                   {'chain':{'agent':'gpt','index':0,'spec':'agy:claude-forbidden'}}]:
             with self.subTest(body=b):
                 self.assertEqual(self.request('/api/config',b)[0],400)
-        self.assertEqual(self.request('/api/config',{'timeout':120,'max_parallel':2,
+        self.assertEqual(self.request('/api/config',{'timeout':120,'idle_timeout':60,'hard_timeout':300,'max_parallel':2,
             'chain':{'agent':'gpt','index':0,'spec':'dsh'}})[0],200)
         cfg = json.loads((self.home/'config.json').read_text())
         self.assertEqual(cfg['timeout'],120)
+        self.assertEqual(cfg['idle_timeout'],60)
+        self.assertEqual(cfg['hard_timeout'],300)
+        state = json.loads(self.request('/api/state')[1])
+        self.assertEqual(state['config']['idle_timeout'],60)
+        self.assertEqual(state['config']['hard_timeout'],300)
         self.assertEqual(cfg['agents']['gpt'][0],'dsh')
         self.assertEqual(cfg['planner'],'gemini')
         self.assertEqual(self.request('/api/config',{'effort':{'agent':'claude','level':'xhigh'}})[0],400)  # 现在是 Gemini 假模型，没有这一档

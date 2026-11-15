@@ -889,7 +889,7 @@ function phoneHtml(){            // 只在电脑上显示：打开局域网、�
 }
 function modelSelect(a, i){
   const sp = a.chain[i];
-  if (isRemote()) return '<div class="model-line"><span>' + (i ? '备用模型' : '下次使用') + '</span><span>' + esc((((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp) + '</span></div>';
+  if (isRemote()) return '<div class="model-line"><span>' + (i ? '备用模型' : '干活用') + '</span><span>' + esc((((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp) + '</span></div>';
   const all = usable(S.backends || [{spec:sp, label:sp}], sp);
   let list = all;
   if (!i){        // 首选模型：Gemini 同一系列只列一次，档位到下面「思考等级」里选
@@ -905,7 +905,7 @@ function modelSelect(a, i){
     const label = o.spec === "codex" ? o.label.replace("GPT · 跟随 Codex 设置", "GPT · 沿用本机设置") : o.spec === "dsh" ? "DeepSeek" : !i && gemLevel(o.spec) ? gemFamily(o.label) : o.label;
     return '<option value="' + esc(o.spec) + '"' + (o.spec === sp ? " selected" : "") + '>' + esc(label + (o.off ? "（已停用）" : "")) + '</option>';
   }).join("");
-  return '<label class="model-line"><span>' + (i ? '备用模型' : '下次使用') + '</span><select class="msel" aria-label="' + esc(a.name) + (i ? '备用模型' : '使用模型') + '" data-chain="' + esc(a.name) + ':' + i + '">' + opts + '</select></label>';
+  return '<label class="model-line"><span>' + (i ? '备用模型' : '干活用') + '</span><select class="msel" aria-label="' + esc(a.name) + (i ? '备用模型' : '使用模型') + '" data-chain="' + esc(a.name) + ':' + i + '">' + opts + '</select></label>';
 }
 const liveAgents = () => S ? S.agents.filter(a => !a.disabled) : [];          // 启用的成员
 const usable = (list, cur) => (list || []).filter(o => !o.off || o.spec === cur);   // 停用的模型不出现（当前选着的除外）
@@ -939,6 +939,24 @@ function effortSelect(a){               // 卡片上的「思考等级」：沿�
       [{id: "", desc: ""}].concat(levels).map(e => '<option value="' + esc(e.id) + '"' + (e.id === cur ? " selected" : "") + (e.desc ? ' title="' + esc(e.desc) + '"' : "") + '>' + esc(e.id ? e.id + (EFF_NOTE[e.id] || "") : def) + '</option>').join("") + '</select>');
   }
   return text(kind === "dsh" ? "DeepSeek 不支持调节" : "这个模型不支持调节");
+}
+function thinkSelect(a){                // 卡片上的「动脑用」：定方案、审查、拍板、会审时换用的模型和档位
+  const th = ((S.config || {}).think || {})[a.name] || {}, sp = th.spec || "", base = a.chain[0] || "";
+  const use = sp || base, kind = use.split(":")[0];
+  const lbl = o => o.spec === "codex" ? o.label.replace("GPT · 跟随 Codex 设置", "GPT · 沿用本机设置") : o.spec === "dsh" ? "DeepSeek" : o.label;
+  let h;
+  if (isRemote()) h = '<div class="model-line"><span>动脑用</span><span>' + esc(sp ? specLabel(sp) : "跟干活一样") + '</span></div>';
+  else h = '<label class="model-line"><span>动脑用</span><select class="msel" aria-label="' + esc(a.name) + '动脑用的模型" data-think-spec="' + esc(a.name) + '">' +
+    '<option value=""' + (sp ? "" : " selected") + '>跟干活一样</option>' +
+    usable(S.backends || [], sp).map(o => '<option value="' + esc(o.spec) + '"' + (o.spec === sp ? " selected" : "") + '>' + esc(lbl(o) + (o.off ? "（已停用）" : "")) + '</option>').join("") + '</select></label>';
+  const levels = ((S.backends || []).find(b => b.spec === use) || {}).efforts || [];
+  if ((kind === "codex" || kind === "claude") && levels.length){
+    const cur = th.effort || "";
+    if (isRemote()) h += '<div class="model-line"><span>动脑档位</span><span class="small">' + esc(cur || "跟干活一样") + '</span></div>';
+    else h += '<label class="model-line"><span>动脑档位</span><select class="msel" aria-label="' + esc(a.name) + '动脑思考等级" data-think-eff="' + esc(a.name) + '">' +
+      [{id: "", desc: ""}].concat(levels).map(e => '<option value="' + esc(e.id) + '"' + (e.id === cur ? " selected" : "") + (e.desc ? ' title="' + esc(e.desc) + '"' : "") + '>' + esc(e.id ? e.id + (EFF_NOTE[e.id] || "") : "跟干活一样") + '</option>').join("") + '</select></label>';
+  }
+  return h;
 }
 /* ---------- 旁问小窗：单独问小问题，不进主线 ---------- */
 const specLabel = sp => (((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp;
@@ -1108,8 +1126,10 @@ function settingsHtml(){
     field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
     field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
     field('最多同时做几件', '<input type="number" min="1" max="8" data-cfg="max_parallel" value="' + esc(cfg.max_parallel) + '">', '不是只能两位合作：最多可同时做 8 件，也可由同一位做多件。建议先用 3；依赖前一步结果的任务仍要等。') +
-    field('每一步最多等几分钟', '<input type="number" min="1" max="120" data-cfg="timeout" data-scale="60" value="' + Math.round(cfg.timeout/60) + '">', '超过时间会停止这次尝试，有备用模型时再交给它。建议 15 分钟；长任务可调大。' + (cfg.timeout < (cfg.min_timeout || 900) ? '<br><b class="stuck" style="color:var(--bad)">现在少于 15 分钟：读资料、审查、写长文常常需要 5～15 分钟，时间太短成员容易什么都交不出来。</b>' : '')) + '</section>' +
-    '<section class="box"><h4>模型与额度</h4><p class="small">模型就是成员干活时使用的 AI 版本。团队卡片可换下次使用的模型，详情里可换备用模型；通常保留原设置即可。</p>' +
+    field('一般多久交（分钟）', '<input type="number" min="1" max="120" data-cfg="timeout" data-scale="60" value="' + Math.round(cfg.timeout/60) + '">', '告诉成员大概多久该交。到点不会被掐断：只要还在干活就让它做完。建议 15 分钟。' + (cfg.timeout < (cfg.min_timeout || 900) ? '<br><b class="stuck" style="color:var(--bad)">现在少于 15 分钟：读资料、审查、写长文常常需要 5～15 分钟，成员可能会草草交差。</b>' : '')) +
+    field('多久没动静算卡住（分钟）', '<input type="number" min="1" max="30" data-cfg="idle_timeout" data-scale="60" value="' + Math.round((cfg.idle_timeout || 300)/60) + '">', '连续这么久一点输出都没有，就当它卡住了，停下换人接着做（已写出的部分会交过去）。反复做同一件事也会被停。建议 5 分钟。') +
+    field('最长做多久（分钟）', '<input type="number" min="5" max="240" data-cfg="hard_timeout" data-scale="60" value="' + Math.round((cfg.hard_timeout || 3600)/60) + '">', '一直在动也最多做这么久，防止停不下来。建议 60 分钟。') + '</section>' +
+    '<section class="box"><h4>模型与额度</h4><p class="small">模型就是成员干活时使用的 AI 版本。团队卡片上每位成员分两档：「干活用」管查资料、写初稿、改文件这类动手的活，「动脑用」管定方案、审查、会审这类要想清楚的活（不设就跟干活一样）；详情里可换备用模型；通常保留原设置即可。</p>' +
     '<p class="small">思考等级在团队卡片上按成员调：越深入通常越慢，也可能用更多额度，难题再调高。</p>' +
     modelListHtml() +
     '<button class="btn" data-act="quota">刷新额度</button><p class="small">重新读取剩余额度，不会增加额度，也不会发消息给 AI，不消耗模型额度。平时每 5 分钟自动读取；GPT 显示最近会话留下的数据。</p></section>' +
@@ -1147,7 +1167,7 @@ function renderRail(){
     else h += '<p class="small">' + (a.name === 'claude' ? '额度请在 Claude 应用中查看' : '暂无额度数据，详情中查看说明') + '</p>';
     const liveModels = uniq(S.calls.filter(c => c.agent === a.name && c.status === 'running').map(c => c.backend));
     if (liveModels.length) h += '<div class="small">正在使用：' + liveModels.map(sp => esc(((S.backends || []).find(b => b.spec === sp) || {}).label || sp)).join('、') + '</div>';
-    h += modelSelect(a, 0) + effortSelect(a);
+    h += modelSelect(a, 0) + effortSelect(a) + thinkSelect(a);
     h += '<button class="detail-toggle" data-act="agent-details" data-agent="' + esc(a.name) + '" aria-expanded="' + expanded + '">' + (expanded ? '▾ 收起详情' : '▸ 详情') + '</button>';
     if (expanded){
       h += '<div class="agent-detail">';
@@ -1306,6 +1326,7 @@ function boardHtml(lite){              // 共享进度板：谁在做什么、�
     const st = wait && wait.length ? "等 " + wait.join("、") + " 完成" : (BOARD_ST[t.status] || (t.status ? t.status : "仅方案"));
     const bad = t.status === "fail" || (t.status === "skipped" && !t.skip_reason);
     let h = '<div class="bl"><b style="color:' + agc(t.agent) + '">' + esc(t.agent) + "</b> · " + esc(t.title) + ' · <span class="' + (bad ? "stuck" : "") + '">' + esc(st) + "</span>" +
+      (t.kind === "think" ? ' <span class="small" style="display:inline">· 动脑</span>' : "") +
       (t.eta_min ? ' <span class="small" style="display:inline">· 预计 ' + esc(t.eta_min) + " 分钟</span>" : "");
     if (t.skip_reason) h += '<span class="small">' + esc(t.skip_reason) + "</span>";
     if (t.why) h += '<span class="small">为什么派给它：' + esc(t.why) + "</span>";
@@ -1865,6 +1886,13 @@ document.addEventListener("change", async e => {
     else if (k === "scope") sideScope = el.value === "one" ? "one" : "full";
     else if (k === "web") sideWeb = el.checked;
     el.blur(); last.sideCtl = ""; renderSide(); return;
+  }
+  if (el.dataset && (el.dataset.thinkSpec || el.dataset.thinkEff)){
+    const who = el.dataset.thinkSpec || el.dataset.thinkEff;
+    const body = el.dataset.thinkSpec ? {think: {agent: who, spec: el.value}} : {think: {agent: who, effort: el.value}};
+    try { await api("/api/config", body); toast(who + " 动脑时" + (el.dataset.thinkSpec ? "用的模型" : "的档位") + "已改成「" + el.options[el.selectedIndex].text + "」，下次动脑的活生效"); }
+    catch(err){ toast(err.message); }
+    el.blur(); last.rail = ""; poll(); return;
   }
   if (el.dataset && el.dataset.effort){
     try { await api("/api/config", {effort:{agent:el.dataset.effort, level:el.value}}); toast(el.dataset.effort + " 的思考等级已改成「" + el.options[el.selectedIndex].text + "」，下次干活生效"); }

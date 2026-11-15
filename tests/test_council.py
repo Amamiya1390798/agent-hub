@@ -405,7 +405,8 @@ class ReviewFixTests(Base):
         self.assertIn('必须先亲自打开看过', txt)
         txt = self.g['board_text']({'id': 'x', 'goal': 'g', 'timeout': 900, 'tasks': [{'id': 't1', 'agent': 'gemini', 'title': 't', 'status': 'running', 'eta_min': 6}]}, 't1')
         self.assertIn('预计 6 分钟能做完', txt)
-        self.assertIn('不是要用满的时间', txt)
+        self.assertIn('卡住停下', txt)
+        self.assertNotIn('硬上限', txt)
 
     def test_explicit_members_not_filled(self):
         rc, run, _ = self.council(Fake({}), members=['gemini'])

@@ -56,8 +56,9 @@ for raw in sys.stdin:
             self.g['keep_close'](kid)
 
     def turn(self, prompt='你好', model='normal', sid=None, timeout=5, callback=None):
+        watch = self.g['Watchdog']({'hard_timeout': timeout, 'idle_timeout': timeout * 2}, timeout)
         return self.g['keep_turn'](str(self.fake), model, prompt, self.tmp.name,
-                                   False, timeout, sid, '测试', callback or (lambda line: None))
+                                   False, timeout, sid, '测试', callback or (lambda line: None), watch=watch)
 
     def test_spaced_result_reuses_process_and_returns_clean_metadata(self):
         lines = []
@@ -85,7 +86,7 @@ for raw in sys.stdin:
         self.assertFalse(self.g['_keep_processes'])
         self.assertFalse(self.g['_active_keeps'])
 
-    def test_continuous_output_does_not_reset_timeout(self):
+    def test_continuous_output_does_not_reset_hard_timeout(self):
         started = time.monotonic()
         with self.assertRaisesRegex(self.g['BackendError'], '超时'):
             self.turn('stream', timeout=.2)
