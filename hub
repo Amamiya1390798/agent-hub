@@ -74,9 +74,12 @@ DEFAULT_CONFIG = {
     "auto_title": "ds",        # 项目组做完后由谁起个短名字；""=不自动起名
     "pressure_prompt": "",     # 高压模式：DeepSeek 拆任务前先读到的这段话，由用户在设置里自己写
     "quota_guard": True,       # True：5 小时额度低于 15% 的成员自动跳过；False：照样让他干活（用户可在设置里关）
+    "keep_awake": False,       # 不休眠：面板开着时让电脑不自动睡眠（用系统自带的 caffeinate）；合上盖子仍会睡
     "lan_access": False,       # 手机通过局域网访问面板；默认关闭，只能在电脑上打开
     "gpt_full_access": False,  # True：GPT 在「允许改文件」的任务里不受沙箱限制，才能调用 hub 指挥队友、联网
     "codex_effort": "",        # 旧设置：GPT 的思考强度；成员卡片上单独设过（见 effort）就以那个为准
+    "design": {},              # 审美的活（排版、配色、界面、视觉、挑图）用的模型和思考等级，格式同 think
+    "copy": {},                # 文案的活（标题、广告语、文章润色、对外文字）用的模型和思考等级，格式同 think
     "think": {},               # 动脑的活（定方案、审查、拍板、会审）用的模型和思考等级；没设就跟干活一样
     "effort": {},              # 每位成员的思考等级 {成员: low/medium/high/xhigh/max}，""=沿用该程序自己的默认；对 GPT、Claude 有效，Gemini 的等级写在模型名里
     "profiles": {
@@ -192,15 +195,49 @@ def agent_effort(cfg, agent, spec):
     return e if e and e in effort_levels(spec) else ""
 
 
-def think_setting(cfg, agent):
-    """这位成员做「动脑」的活时用的 (模型, 思考等级)；模型为空=跟干活用的一样。停用的模型不算。"""
-    th = cfg.get("think") if isinstance(cfg.get("think"), dict) else {}
+TIERS = ("think", "design", "copy")          # 除「干活」以外单独配模型的几类活
+TIER_NAMES = {"work": "干活", "think": "动脑", "design": "审美", "copy": "文案"}
+
+
+def think_setting(cfg, agent, tier="think"):
+    """这位成员做某类活（动脑/审美/文案）时用的 (模型, 思考等级)；模型为空=跟干活用的一样。停用的模型不算。"""
+    th = cfg.get(tier) if tier in TIERS and isinstance(cfg.get(tier), dict) else {}
     d = th.get(agent) if isinstance(th.get(agent), dict) else {}
     sp = d.get("spec") if isinstance(d.get("spec"), str) else ""
     if sp in (cfg.get("disabled_models") or []):
         sp = ""
     eff = d.get("effort") if isinstance(d.get("effort"), str) else ""
     return sp, eff
+
+
+def tier_chain(cfg, agent, tier=None):
+    """这位成员做这类活时的模型顺序和首选档位：专门设的模型排第一，后面接原来的备用链。"""
+    chain = list(cfg["agents"].get(agent) or [])
+    eff = ""
+    if tier in TIERS:
+        tsp, eff = think_setting(cfg, agent, tier)
+        if tsp:
+            chain = [tsp] + [x for x in chain if x != tsp]
+    return chain, eff
+
+
+def model_menu(cfg):
+    """排工用的可用模型清单（不含停用的），用户点名模型时照这里的写法填 spec。"""
+    try:
+        return "；".join("%s：%s" % (o["spec"], o["label"]) for o in backend_choices(cfg) if not o.get("off"))
+    except Exception:
+        return "（读不到）"
+
+
+def tier_roster(cfg, agent):
+    """排工名单里的一句：这位成员各类活用什么模型（只列专门设过的）。"""
+    base = (cfg["agents"].get(agent) or [""])[0]
+    bits = ["干活用 %s" % spec_label(base)]
+    for tr in TIERS:
+        sp, eff = think_setting(cfg, agent, tr)
+        if sp or eff:
+            bits.append("%s用 %s%s" % (TIER_NAMES[tr], spec_label(sp or base), "（%s 档）" % eff if eff else ""))
+    return "。各类活：" + "；".join(bits) if len(bits) > 1 else ""
 
 
 def active_cfg(cfg):
@@ -221,8 +258,8 @@ def active_cfg(cfg):
     for k in ("planner", "synthesizer", "default_worker"):
         if c.get(k) not in agents and pref:
             c[k] = pref[0]
-    if c.get("auto_title") not in agents:
-        c["auto_title"] = ""
+    if c.get("auto_title") and c["auto_title"] not in agents:  # 选的起名人停用了：换一位启用的接手（""=用户关了起名，不补）
+        c["auto_title"] = next((x for x in ("ds", "gemini", "gpt", "claude") if x in agents), next(iter(agents), ""))
     c["council_agents"] = [x for x in cfg.get("council_agents") or [] if x in agents]
     return c
 
@@ -512,8 +549,10 @@ def spec_label(spec):
     kind, _, mdl = (spec or "").partition(":")
     m = mdl.lower()
     if kind == "agy":
-        name = "Gemini Carbon" if "carbon" in m else "Gemini Flash" if "flash" in m else "Gemini " + mdl
-        level = next((v for k, v in (("high", "高"), ("medium", "中等"), ("low", "低")) if m.endswith(k)), "")
+        lv = re.match(r"^(.*?)-(xhigh|high|medium|low|max)$", m)
+        base, level = (lv.group(1), {"xhigh": "超高", "high": "高", "medium": "中等", "low": "低", "max": "最高"}[lv.group(2)]) if lv else (m, "")
+        fam = next((w.capitalize() for w in ("carbon", "argon", "hydrogen", "flash", "orchestrator") if w in base), "")
+        name = ("Gemini " + fam) if fam else ("Gemini " + mdl if mdl else "Gemini")
         return name + ("·" + level if level else "")
     if kind == "codex":
         return "GPT" + ("（%s）" % mdl if mdl else "")
@@ -1383,10 +1422,8 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
     if model:
         chain[0] = chain[0].split(":")[0] + ":" + model
     think_eff = ""
-    if tier == "think" and not spec and not model:  # 动脑的活：动脑模型排第一，失败了再按原来的顺序换备用
-        tsp, think_eff = think_setting(cfg, agent)
-        if tsp:
-            chain = [tsp] + [x for x in chain if x != tsp]
+    if tier in TIERS and not spec and not model:  # 动脑/审美/文案的活：那一档的模型排第一，失败了再按原来的顺序换备用
+        chain, think_eff = tier_chain(cfg, agent, tier)
     if spec:  # 旁问里指定的模型排第一，失败了再按这位成员原来的顺序换备用
         chain = [spec] + [x for x in chain if x != spec]
     # 只有当对方还能再找队友时才告诉它可以求助，免得它试了碰壁
@@ -1403,7 +1440,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
            "task": meta.get("task"), "kind": meta.get("kind") or "ask", "title": meta.get("title"),
            "agent": agent, "backend": chain[0], "preferred_backend": chain[0], "status": "running", "start": time.time(), "end": None,
            "secs": None, "write": bool(write), "cwd": cwd, "prompt": prompt, "answer": None,
-           "error": None, "attempts": [], "pid": os.getpid(), "tier": "think" if tier == "think" else "work",
+           "error": None, "attempts": [], "pid": os.getpid(), "tier": tier if tier in TIERS else "work",
            "image": meta.get("image"), "follows": None, "display": None, "chat": meta.get("chat")}
     if web or spec or effort is not None:
         rec["side"] = {"web": bool(web), "effort": effort or "", "spec": spec or ""}
@@ -1531,6 +1568,8 @@ PLAN_PROMPT = """为平等协作的小团队排工，按成员长处和剩余额
 团队成员：
 {roster}
 
+可用模型（写法：说明）：{models}
+
 排工规则：
 1. 简单目标只排 1 个任务，交给最合适的成员。
 2. 有多块独立工作时，拆成 2～4 个可并行任务，尽量分给不同成员；不要重复分派同一份工作。
@@ -1538,7 +1577,13 @@ PLAN_PROMPT = """为平等协作的小团队排工，按成员长处和剩余额
 4. 执行工作（查资料、写初稿、写代码、整理）默认给 gemini；claude / gpt 主要定方案、拍板和审查；画图给 gpt，零碎小活给 ds。{quota_rule}gemini 额度不足时再由其他成员接手，并在 why 中说明。
 5. 每个任务的 prompt 必须自包含：队员看不到用户原话，须写全所需背景、约束和输出格式，并要求简洁交付成果与必要说明。依赖其他任务结果时用 depends_on 标出，执行时会自动附上前置结果。
 6. why 用一句话说明成员长处或额度原因；eta_min 填预计分钟数，须为整数。一般在 {timeout_min} 分钟内做完；确实要更久也可以，只要一直在推进就不会被打断。
-7. kind 标这件活偏哪种：think＝动脑（定方案、做判断、审查把关、疑难分析）；work＝干活（查资料、读文件、写初稿、写代码、批量修改、整理）。拿不准就写 work。成员做 think 的活会换用他更强的模型，更慢也更费额度，别滥用。
+7. kind 标这件活偏哪种，成员会按这一档换用对应的模型（成员名单里写了每档用什么模型）：
+   - think＝动脑：定方案、做判断、审查把关、疑难分析；
+   - design＝审美：排版、配色、界面和视觉设计、挑图、判断好不好看；
+   - copy＝文案：标题、广告语、宣传和对外文字、润色改写；
+   - work＝干活：查资料、读文件、写初稿、写代码、批量修改、整理。拿不准就写 work。
+   design、copy 的活优先派给在这一档专门配了模型的成员。think 用的模型通常更慢、更费额度，别滥用。
+   用户在目标里明确点名要用某个模型时（例如「用 Flash 做」「让 Opus 审」），给那件任务加 "spec": "<可用模型里的写法>"，agent 填这个模型所属的成员；用户点名的模型优先于上面的预设。用户没点名就不要写 spec。
 8. 共排 1～{max_tasks} 个任务。创建或修改文件、运行命令、操作本机软件的任务设 write=true（只读任务只能读文件、上网，不能运行任何命令）{write_hint}；两个写任务不得修改同一文件。
 9. 1～2 分钟内排完，只根据已给目标和背景拆分。不要自行读文件、运行命令、上网或执行任务；需要先摸清情况，就把它排为第一个任务。
 
@@ -1645,10 +1690,10 @@ def extract_json(text):
 
 
 def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None, inject=""):
-    roster = "\n".join("- %s：%s%s" % (k, v, quota_text(k)) for k, v in cfg["profiles"].items() if k in cfg["agents"])
+    roster = "\n".join("- %s：%s%s%s" % (k, v, quota_text(k), tier_roster(cfg, k)) for k, v in cfg["profiles"].items() if k in cfg["agents"])
     prompt = PLAN_PROMPT.format(
         quota_rule=("标注剩余额度低于 15% 的成员不要派活；" if quota_guard_on() else "用户设置了额度低也照样派活，不必因为额度低避开谁；"),
-        roster=roster, max_tasks=max_tasks, cwd=cwd, goal=goal, timeout_min=max(1, round(cfg["timeout"] / 60)),
+        roster=roster, models=model_menu(cfg), max_tasks=max_tasks, cwd=cwd, goal=goal, timeout_min=max(1, round(cfg["timeout"] / 60)),
         write_hint="" if write else "（本次运行为只读模式，所有任务 write 都填 false，成果以文字形式交回）")
     if inject.strip():  # 高压模式：用户自己写的话放在排工说明前面
         prompt = "【用户给排工者的特别要求，请先读并照办】\n" + inject.strip() + "\n\n――――――――\n\n" + prompt
@@ -1682,7 +1727,18 @@ def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None
                     deps = [deps]
                 t["depends_on"] = [re.sub(r"[^A-Za-z0-9_-]", "_", str(d)) for d in deps]
                 t["write"] = bool(t.get("write")) and write
-                t["kind"] = "think" if str(t.get("kind") or "").strip().lower() in ("think", "动脑") else "work"
+                k = str(t.get("kind") or "").strip().lower()
+                k = {"动脑": "think", "审美": "design", "文案": "copy"}.get(k, k)
+                t["kind"] = k if k in TIERS else "work"
+                want = str(t.get("spec") or "").strip()
+                t["spec"] = None
+                if want:  # 用户点名的模型：可用就照用，压过预设；不可用就按预设，并写在 why 里
+                    ok = [o["spec"] for o in backend_choices(cfg) if not o.get("off")]
+                    if want in ok:
+                        t["spec"] = want
+                    else:
+                        t["why"] = (t["why"] + "（点名的模型 %s 现在用不了，按成员预设）" % want)[:300]
+                t["plan_spec"] = t["spec"] or (tier_chain(cfg, t["agent"], t["kind"])[0] or [None])[0]
                 if not t.get("prompt"):
                     raise ValueError("任务 %s 缺少 prompt" % tid)
                 t["prompt"] = str(t["prompt"])
@@ -1890,8 +1946,8 @@ def _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel, share_results=T
 
         t0 = time.time()
         try:
-            text, spec = ask(cfg, t["agent"], p, cwd=cwd, write=t["write"], quiet=True, note=share_results,
-                             tier="think" if (t.get("kind") == "think" or not share_results) else None, meta={"run": run_id, "task": t["id"], "kind": "task", "title": t["title"],
+            text, spec = ask(cfg, t["agent"], p, cwd=cwd, write=t["write"], quiet=True, note=share_results, spec=t.get("spec"),
+                             tier=t.get("kind") if t.get("kind") in TIERS else ("think" if not share_results else None), meta={"run": run_id, "task": t["id"], "kind": "task", "title": t["title"],
                                    "on_start": started})
             return {"ok": True, "text": text, "backend": spec, "secs": round(time.time() - t0, 1)}
         except BackendError as e:
@@ -2028,7 +2084,8 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
         reason, qnote = quota_skip(name)
         t = {"id": "m%d" % (i + 1), "agent": name, "title": "%s 的独立意见" % name, "depends_on": [],
              "write": False, "prompt": COUNCIL_PROMPT.format(question=question), "why": "会审成员（%s）" % qnote,
-             "eta_min": None, "status": "pending", "backend": None, "secs": None, "call_id": None, "answer": None}
+             "eta_min": None, "status": "pending", "backend": None, "secs": None, "call_id": None, "answer": None,
+             "kind": "think", "plan_spec": (tier_chain(cfg, name, "think")[0] or [None])[0]}
         if reason:
             t.update(status="skipped", answer="【已跳过】" + reason, skip_reason=reason)
             skipped.append({"agent": name, "reason": reason})
@@ -2528,7 +2585,11 @@ def ui_state(cfg):
             "last_error": (last.get("error") or "")[:300] if last and last.get("status") == "fail" and last.get("error") != STOP_MSG else None,
         })
     lite_calls = []
-    for c in calls[:200]:
+    # 最近 200 条全给；更早的只给对话主线上的（没有上级、不属于项目组、不是旁问），
+    # 否则长项目的早期几轮掉出窗口，追问链断开，左边一个项目组会被拆成两个
+    for i, c in enumerate(calls):
+        if i >= 200 and (c.get("parent") or c.get("run") or c.get("kind") == "side"):
+            continue
         d = {k: c.get(k) for k in ("id", "parent", "run", "task", "kind", "title", "agent", "backend", "status",
                                    "start", "end", "secs", "write", "cwd", "error", "follows", "display", "submission_id",
                                    "chat", "dispatch", "side", "fork", "resumed", "images", "handoff")}
@@ -2544,7 +2605,7 @@ def ui_state(cfg):
                                    "synthesizer", "error", "write", "follows", "display", "submission_id",
                                    "participants", "skipped", "timeout_warning", "parent_call", "pressure", "fork", "images")}
         d["mode"] = r.get("mode") or "run"  # 旧记录没有 mode，都是自动分工
-        d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min", "kind",
+        d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min", "kind", "plan_spec", "spec",
                                              "progress", "leftover", "skip_reason", "started",
                                              "backend", "preferred_backend", "secs", "call_id")} for t in (r.get("tasks") or [])]
         for t in d["tasks"]:
@@ -2554,18 +2615,18 @@ def ui_state(cfg):
         lite_runs.append(d)
     health = read_json(HEALTH_PATH) or {}
     keeps = [{k: d.get(k) for k in ("id", "model", "write", "title", "start", "last", "turns", "busy")} for d in keep_list()]
-    return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls, "keeps": keeps,
+    return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls, "keeps": keeps, "awake": awake_on(),
             "archived": load_archived(),
-            "names": load_names(), "naming": _names_running.is_set(),
+            "names": load_names(), "naming": _names_running.is_set(), "folders": load_folders(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
                        "running": bool(_health_running.is_set())},
             "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout", "idle_timeout", "hard_timeout")},
                            council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
                            council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
-                           quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "",
+                           quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "", auto_title_live=active_cfg(cfg).get("auto_title") or "",
                            disabled_agents=list(cfg.get("disabled_agents") or []), disabled_models=list(cfg.get("disabled_models") or []), pressure_prompt=str(cfg.get("pressure_prompt") or ""), codex_effort=cfg.get("codex_effort") or "", codex_effort_default=codex_defaults()[1],
                            effort={n: agent_effort(cfg, n, (cfg["agents"][n] or [""])[0]) for n in cfg["agents"]},
-                           think={n: dict(zip(("spec", "effort"), think_setting(cfg, n))) for n in cfg["agents"]}),
+                           tiers={tr: {n: dict(zip(("spec", "effort"), think_setting(cfg, n, tr))) for n in cfg["agents"]} for tr in TIERS}),
             "workspace": UI_WORKSPACE, "backends": backend_choices(cfg),
             "ui_version": int(os.path.getmtime(UI_HTML)) if os.path.exists(UI_HTML) else 0}
 
@@ -2757,9 +2818,12 @@ def follow_context(kind, rid, depth=8):
         a = r.get("final") or r.get("answer") or ""
         if not a and kind == "run":
             a = "\n\n".join("【%s】%s" % (t.get("title"), t.get("answer") or "") for t in r.get("tasks") or [])
-        if turns and len(a) > 1500:  # 只有最近一轮带全文；更早的只留开头，免得每轮都重读一大堆旧汇报
+        hand = r.get("kind") == "handoff"
+        if turns and len(a) > 1500 and not hand:  # 只有最近一轮带全文；更早的只留开头（交接/压缩说明除外，它们本来就是精简过的）
             a = a[:1500].rstrip() + "\n…（较早的内容已省略）"
-        turns.append("【用户当时的要求】\n%s\n\n【当时得到的结果】\n%s" % (q[:6000] if not turns else q[:1500], a[:12000]))
+        turns.append("【用户当时的要求】\n%s\n\n【当时得到的结果】\n%s" % (q[:6000] if not turns else q[:1500], a[:20000 if hand else 12000]))
+        if hand and (r.get("handoff") or {}).get("compact"):
+            break  # 压缩点：更早的都已经压进这份说明里了
         follows = r.get("follows") or {}
         kind, rid = follows.get("type"), follows.get("id")
         if not rid:
@@ -2770,7 +2834,78 @@ def follow_context(kind, rid, depth=8):
             "\n\n===== 用户现在的追问 =====\n")
 
 
-def make_handoff(src, dst, title=""):
+DIGEST_PROMPT = """下面是一个项目组从头到尾的全部来往（用户的要求和每一轮的结果）。把它压缩成一份交接说明，给另一个项目组接手用。
+
+按这几块写，每块用短句逐条列，没有就写「无」：
+1. 目标：这个项目要做成什么，现在做到哪一步。
+2. 已定下的：决定、约定、参数、命名、用户的偏好和要求。数字、路径、文件名、模型名、链接一律原样照抄。
+3. 做出来的东西：文件、目录、脚本、图片、链接在哪，各是什么。
+4. 走过的弯路：试过不行的做法和原因，免得再踩。
+5. 没做完的和要注意的。
+
+只写事实和结论，不写过程，不写客套。后面的说法推翻前面的，以后面的为准。控制在 3000 字以内。
+
+=====
+{body}"""
+
+
+def handoff_digest_text(keys):
+    """把一组里每一轮的要求和结果按顺序拼起来，给压缩用。太长时只留最近的部分。"""
+    parts = []
+    for i, k in enumerate(keys, 1):
+        kind, _, rid = k.partition(":")
+        r = ui_record(kind, rid) or {}
+        if kind == "run":
+            q, a = r.get("display") or r.get("goal") or "", r.get("final") or ""
+            if not a and r.get("tasks"):
+                a = "\n".join("- %s：%s" % (t.get("title") or t.get("id"), _preview(t.get("answer") or "", 400)) for t in r["tasks"])
+        elif r.get("kind") == "handoff":
+            q, a = "（从别的项目组交接进来的内容）", r.get("answer") or ""
+        else:
+            q, a = r.get("display") or r.get("prompt") or "", r.get("answer") or ""
+        if q or a:
+            parts.append("【第 %d 轮】\n用户：%s\n结果：%s" % (i, q[:3000], a[:8000]))
+    text = "\n\n".join(parts)
+    if len(text) > 400000:
+        text = "（太早的内容已省略）\n\n" + text[-400000:]
+    return text
+
+
+def _digest_handoff(cfg, cid, keys):
+    """后台把整组压缩成交接说明，写回那条交接记录；失败就保留原来的最近几轮内容。"""
+    path = os.path.join(CALLS_DIR, cid + ".json")
+    who = cfg.get("handoff_by") if cfg.get("handoff_by") in cfg["agents"] else ("gemini" if "gemini" in cfg["agents"] else cfg.get("synthesizer"))
+    chain = (cfg["agents"].get(who) or [])[:2]
+    prompt = DIGEST_PROMPT.format(body=handoff_digest_text(keys))
+    out, used, err = None, None, ""
+    for spec in chain:
+        bk, _, mdl = spec.partition(":")
+        fn = BACKENDS.get(bk)
+        if not fn:
+            continue
+        try:
+            out = (fn(dict(cfg, _effort=""), mdl, prompt, tempfile.gettempdir(), False, 900) or "").strip()
+            used = spec
+            if out:
+                break
+        except (BackendError, OSError) as e:
+            err = str(e)
+    rec = read_json(path)
+    if not rec:
+        return
+    if out:
+        name = (rec.get("handoff") or {}).get("name") or ""
+        rec["answer"] = (("以下是本组前面 %d 轮的压缩说明，后面接着做时以它为准：\n\n%s" % (len(keys), out)) if rec["handoff"].get("compact") else
+                         "以下是从另一个项目组「%s」交接过来的说明（整组 %d 轮压缩而成），供后面参考：\n\n%s" % (name, len(keys), out))
+        rec["handoff"]["digest"] = "ok"
+        rec["handoff"]["digest_by"] = used
+    else:
+        rec["handoff"]["digest"] = "fail"
+        rec["handoff"]["digest_error"] = explain_error(err)[0] if err else "没有可用的成员"
+    write_json(path, rec)
+
+
+def make_handoff(src, dst, title="", keys=None, cfg=None):
     """把一个项目组做出来的东西交接到另一个项目组：在目标那条线后面加一条「交接」记录，
     内容是来源那组最近几轮的要求和结果（不调用模型）。之后在目标组接着问，就会带上它。"""
     for ref in (src, dst):
@@ -2798,6 +2933,43 @@ def make_handoff(src, dst, title=""):
         "answer": "以下是从另一个项目组「%s」交接过来的要求和结果，供后面参考：\n\n%s" % (name, body),
         "follows": {"type": dst["type"], "id": dst["id"]},
         "handoff": {"from": {"type": src["type"], "id": src["id"]}, "name": name}})
+    if isinstance(keys, list) and keys and cfg:  # 交整组：先放最近几轮顶着，后台压缩整组，好了再换上
+        keys = [k for k in keys if isinstance(k, str) and _ARCHIVE_KEY.match(k)][:600]
+        if keys:
+            rec = read_json(os.path.join(CALLS_DIR, cid + ".json"))
+            rec["handoff"].update(digest="running", rounds=len(keys))
+            write_json(os.path.join(CALLS_DIR, cid + ".json"), rec)
+            threading.Thread(target=_digest_handoff, args=(cfg, cid, keys), daemon=True).start()
+    return cid
+
+
+def make_compact(at, keys, cfg, title=""):
+    """原地压缩：在这条线最后一轮后面加一条「压缩」记录，后台把前面全部来往压成说明。
+    之后接着问，只带这份说明和它之后的几轮，不再往前翻，也不续接原来那个越来越长的会话。"""
+    if not isinstance(at, dict) or at.get("type") not in ("call", "run") or not _ARCHIVE_KEY.match("%s:%s" % (at.get("type"), at.get("id"))):
+        raise ValueError("记录不对")
+    r = ui_record(at["type"], at["id"])
+    if not r:
+        raise ValueError("找不到这条记录")
+    if r.get("status") in ("running", "planning", "synthesizing"):
+        raise ValueError("最后一轮还在做，做完再压缩")
+    keys = [k for k in (keys or []) if isinstance(k, str) and _ARCHIVE_KEY.match(k)][:600]
+    if len(keys) < 2:
+        raise ValueError("这一组才一两轮，不用压缩")
+    body = follow_context(at["type"], at["id"], 8)
+    body = body.replace("===== 之前的对话（背景）=====\n", "", 1).rsplit("\n\n===== 用户现在的追问 =====", 1)[0].strip()
+    name = re.sub(r"[\x00-\x1f\x7f]", "", str(title or ""))[:60]
+    cid = "c_" + uuid.uuid4().hex[:10]
+    now = time.time()
+    write_json(os.path.join(CALLS_DIR, cid + ".json"), {
+        "id": cid, "parent": None, "run": None, "task": None, "kind": "handoff", "title": "压缩：" + (name or "前面的来往"),
+        "agent": "-", "backend": "-", "preferred_backend": "-", "status": "ok", "start": now, "end": now, "secs": 0,
+        "write": False, "cwd": r.get("cwd") or UI_WORKSPACE, "prompt": "", "error": None, "attempts": [], "pid": None,
+        "display": "压缩：把前面 %d 轮压成一份说明" % len(keys),
+        "answer": "以下是本组最近几轮的要求和结果（整组压缩还没完成时先用它）：\n\n%s" % body,
+        "follows": {"type": at["type"], "id": at["id"]},
+        "handoff": {"from": None, "name": name, "compact": True, "digest": "running", "rounds": len(keys)}})
+    threading.Thread(target=_digest_handoff, args=(cfg, cid, keys), daemon=True).start()
     return cid
 
 
@@ -2846,6 +3018,65 @@ def load_names():
     """{记录键: 名字}；手动起的名字优先于自动的。"""
     return {k: v["name"] for k, v in load_names_raw()["names"].items()
             if isinstance(v, dict) and isinstance(v.get("name"), str) and v["name"]}
+
+
+FOLDERS_PATH = os.path.join(HUB_HOME, "folders.json")
+_folders_lock = threading.Lock()
+
+
+def load_folders():
+    """左栏的文件夹：{"folders": [{id, name}], "of": {项目组键: 文件夹 id}}。"""
+    d = read_json(FOLDERS_PATH)
+    d = d if isinstance(d, dict) else {}
+    fs = [f for f in d.get("folders") or [] if isinstance(f, dict) and isinstance(f.get("id"), str) and isinstance(f.get("name"), str)]
+    ids = set(f["id"] for f in fs)
+    of = {k: v for k, v in (d.get("of") or {}).items() if isinstance(k, str) and v in ids}
+    return {"folders": fs, "of": of}
+
+
+def folder_op(body):
+    """建 / 改名 / 删文件夹，或把项目组放进某个文件夹（folder 为空=拿出来）。删文件夹不删里面的记录。"""
+    op = body.get("op")
+
+    def clean(n):
+        if not isinstance(n, str) or not n.strip() or len(n) > 40:
+            raise ValueError("文件夹名字要 1～40 个字")
+        return re.sub(r"[\x00-\x1f\x7f]", "", n).strip()
+    with _folders_lock:
+        d = load_folders()
+        ids = set(f["id"] for f in d["folders"])
+        if op == "create":
+            fid = "f_" + uuid.uuid4().hex[:8]
+            d["folders"].append({"id": fid, "name": clean(body.get("name"))})
+            keys = body.get("keys") or []
+        elif op in ("rename", "delete"):
+            fid = body.get("id")
+            if fid not in ids:
+                raise ValueError("没有这个文件夹")
+            if op == "rename":
+                next(f for f in d["folders"] if f["id"] == fid)["name"] = clean(body.get("name"))
+            else:
+                d["folders"] = [f for f in d["folders"] if f["id"] != fid]
+                d["of"] = {k: v for k, v in d["of"].items() if v != fid}
+            keys = []
+        elif op == "move":
+            fid = body.get("folder") or ""
+            if fid and fid not in ids:
+                raise ValueError("没有这个文件夹")
+            keys = body.get("keys") or []
+        else:
+            raise ValueError("不认识的操作")
+        if not isinstance(keys, list) or len(keys) > 500:
+            raise ValueError("记录不对")
+        for k in keys:
+            if not isinstance(k, str) or not _ARCHIVE_KEY.match(k):
+                raise ValueError("记录不对")
+            if fid:
+                d["of"][k] = fid
+            else:
+                d["of"].pop(k, None)
+        write_json(FOLDERS_PATH, d)
+        return fid
 
 
 def clean_title(t):
@@ -3286,7 +3517,7 @@ class PairLimiter(object):
             self.fails.clear()
 
 
-REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/rename", "/api/handoff", "/api/handoff/undo", "/api/keep/close", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
+REMOTE_POSTS = ("/api/submit", "/api/stop", "/api/quota", "/api/archive", "/api/upload", "/api/rename", "/api/handoff", "/api/handoff/undo", "/api/compact", "/api/keep/close", "/api/awake", "/api/folders", "/api/bye")  # 手机上能做的事；设置、登录等只能在电脑上
 
 
 def gate(ip, host, sock_ip, port, path, cookie, lan_on):
@@ -3608,8 +3839,38 @@ def app_icon_png(size=180):
     return _icon_cache[0]
 
 
+_awake = {"p": None}
+
+
+def awake_on():
+    p = _awake["p"]
+    return bool(p and p.poll() is None)
+
+
+def set_awake(on):
+    """不休眠：开着时跑一个 caffeinate -i -m，面板服务退出它也跟着退出。返回现在是否开着。"""
+    if on:
+        if awake_on():
+            return True
+        exe = shutil.which("caffeinate") or "/usr/bin/caffeinate"
+        if not os.path.exists(exe):
+            raise ValueError("这台电脑上没有 caffeinate，开不了不休眠")
+        _awake["p"] = subprocess.Popen([exe, "-i", "-m", "-w", str(os.getpid())], stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    p, _awake["p"] = _awake["p"], None
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    return False
+
+
 def _reexec_ui(port, me):
     """局域网开关改动后，面板服务换一个监听地址重新启动（进程号不变）。"""
+    set_awake(False)  # 进程号不变，caffeinate 不会自己退；重启后按配置再开
     os.execv(sys.executable, [sys.executable, me, "ui", "--serve", "--port", str(port)])
 
 
@@ -3833,11 +4094,12 @@ def serve_ui(port, me):
             cur = raw.get("effort") if isinstance(raw.get("effort"), dict) else {}
             cur[ef["agent"]] = ef["level"]
             raw["effort"] = cur
-        th = body.get("think")
-        if "think" in body:
+        tr_key = next((k for k in TIERS if k in body), None)
+        if tr_key:
+            th = body.get(tr_key)
             if not isinstance(th, dict) or th.get("agent") not in c["agents"]:
-                raise ValueError("动脑模型设置不对")
-            cur = raw.get("think") if isinstance(raw.get("think"), dict) else {}
+                raise ValueError("%s模型设置不对" % TIER_NAMES[tr_key])
+            cur = raw.get(tr_key) if isinstance(raw.get(tr_key), dict) else {}
             one = dict(cur.get(th["agent"]) if isinstance(cur.get(th["agent"]), dict) else {})
             if "spec" in th:
                 sp = th["spec"]
@@ -3854,7 +4116,7 @@ def serve_ui(port, me):
                     raise ValueError("这个模型没有「%s」这一档" % th["effort"])
                 one["effort"] = th["effort"]
             cur[th["agent"]] = one
-            raw["think"] = cur
+            raw[tr_key] = cur
         ch = body.get("chain")
         if "chain" in body and not isinstance(ch, dict):
             raise ValueError("模型设置格式不对")
@@ -4045,14 +4307,29 @@ def serve_ui(port, me):
                         raise ValueError("图片数据坏了，请重新贴")
                     return self.send(200, {"ok": True, "id": save_attachment(raw)})
                 elif self.path == "/api/handoff":  # 把一组的结果交接到另一组
-                    return self.send(200, {"ok": True, "id": make_handoff(body.get("from"), body.get("to"), body.get("title"))})
+                    return self.send(200, {"ok": True, "id": make_handoff(body.get("from"), body.get("to"), body.get("title"),
+                                                                       keys=body.get("keys"), cfg=active_cfg(load_config()))})
+                elif self.path == "/api/compact":  # 原地压缩这一组
+                    return self.send(200, {"ok": True, "id": make_compact(body.get("at"), body.get("keys"), active_cfg(load_config()), body.get("title"))})
                 elif self.path == "/api/handoff/undo":  # 撤销交接
                     return self.send(200, {"ok": True, "back": undo_handoff(body.get("id"))})
+                elif self.path == "/api/awake":  # 不休眠开关；记进配置，下次打开面板照旧
+                    if not isinstance(body.get("on"), bool):
+                        raise ValueError("开关格式不对")
+                    raw = read_json(CONFIG_PATH) or {}
+                    raw["keep_awake"] = body["on"]
+                    tmp = CONFIG_PATH + ".tmp"
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        json.dump(raw, f, ensure_ascii=False, indent=2)
+                    os.replace(tmp, CONFIG_PATH)
+                    return self.send(200, {"ok": True, "on": set_awake(body["on"])})
                 elif self.path == "/api/keep/close":  # 关掉开着的 Gemini 会话（"all" = 全部）
                     ids = [d["id"] for d in keep_list()] if body.get("id") == "all" else [body.get("id")]
                     return self.send(200, {"ok": True, "closed": sum(1 for k in ids if keep_close(k))})
                 elif self.path == "/api/rename":
                     set_name(body.get("key"), body.get("name"))
+                elif self.path == "/api/folders":
+                    return self.send(200, {"ok": True, "id": folder_op(body)})
                 elif self.path == "/api/title/backfill":  # 给开启自动起名之前的项目组也起名（归档的不起）
                     set_name_since(0)
                 elif self.path == "/api/archive":
@@ -4120,12 +4397,18 @@ def serve_ui(port, me):
 
     srv = Server(("0.0.0.0" if lan_on else "127.0.0.1", port), H)
     write_json(UI_PID, {"pid": os.getpid(), "port": port})
+    if load_config().get("keep_awake") and not os.environ.get("HUB_NO_AWAKE"):
+        try:
+            set_awake(True)
+        except (ValueError, OSError) as e:
+            eprint("[hub] 不休眠没开成：%s" % e)
     eprint("[hub] 面板服务已启动：http://127.0.0.1:%d/%s" % (port, "（手机局域网访问已打开）" if lan_on else ""))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     srv.server_close()
+    set_awake(False)
     if restart["on"]:
         _reexec_ui(port, me)
     return 0

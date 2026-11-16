@@ -96,7 +96,7 @@ assert.ok(/value="follow" selected>接着旁问：旁问一下/.test(h));
   const th=ctx.ui.thumbsHtml(['att-1.png" onerror="x']);
   assert.ok(!th.includes('" onerror="') && th.includes('/api/attachment?id='),'缩略图地址转义');
   assert.equal(ctx.ui.thumbsHtml([]),'');
-  // 交接：两组合成一组，组名用接收的那组；对话里有交接卡片；能选交接到哪
+  // 交接：来源组留着，交接卡片进接收的那组，组名用接收的那组；对话里有交接卡片；能选交接到哪
   {
     const hc=[
       {id:'c_a1',kind:'chat',agent:'claude',status:'ok',start:100,end:101,display:'我想学生图'},
@@ -107,11 +107,11 @@ assert.ok(/value="follow" selected>接着旁问：旁问一下/.test(h));
     ctx.ui.set(Object.assign({},state,{calls:hc,names:{'call:c_a1':'生图扫盲'}}));
     const gs=ctx.ui.groups();
     const merged=gs.projects.find(p=>p.items.some(i=>i.id==='c_h'));
-    assert.ok(merged.items.some(i=>i.id==='c_b1'),'来源那组并进来了');
+    assert.ok(!merged.items.some(i=>i.id==='c_b1'),'来源那组照旧留着，不并进来');
     assert.equal(merged.id,'call:c_a1'); assert.equal(merged.title,'生图扫盲','组名用接收的那组');
     const v=ctx.ui.viewChat(ctx.ui.findItem({type:'call',id:'c_h'}));
     assert.ok(v.includes('交接进来') && v.includes('打开来源那一组') && v.includes('我想学生图'),'对话里有交接卡片和原来的对话');
-    ctx.ui.setSel({type:'call',id:'c_x'}); ctx.ui.setArm('c_x');
+    ctx.ui.setSel({type:'call',id:'c_x'}); ctx.ui.setArm('call:c_x');
     const pk=ctx.ui.handPicker(ctx.ui.findItem({type:'call',id:'c_x'}));
     assert.ok(pk.includes('value="call:c_h"') && pk.includes('生图扫盲'),'交接目标是那一组现在的最后一轮');
   }

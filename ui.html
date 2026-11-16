@@ -137,7 +137,9 @@ input,textarea,select{font:inherit;color:inherit}
 .head h2{font-size:19px;line-height:1.45;margin:0;font-weight:650;flex:1;word-break:break-word;white-space:pre-wrap}
 .meta{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;color:var(--muted);font-size:12.5px;margin-bottom:14px}
 .meta a{color:inherit}
-.acts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:20px}
+.acts{display:flex;gap:6px;flex-wrap:wrap}
+.actbar{position:sticky;top:0;z-index:5;background:var(--bg);margin:0 -28px 20px;padding:8px 28px;border-bottom:1px solid transparent}
+.actbar.stuck{border-bottom-color:var(--line);box-shadow:0 6px 12px -10px rgba(0,0,0,.35)}
 .btn{padding:5px 12px;border-radius:9px;border:1px solid var(--line);background:var(--card);font-size:13px;display:inline-flex;align-items:center;gap:6px}
 .btn:hover{border-color:var(--faint)}
 .btn.danger{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 35%,var(--line))}
@@ -213,6 +215,21 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .ctx button:hover{background:var(--sel)}
 .ctx.off{color:var(--faint);background:transparent;border:1px dashed var(--line)}
 .ctx.fork{color:var(--ink);background:var(--sel)}
+.fh:hover .garch{opacity:1}
+.iwrap .garch{position:absolute;right:34px;bottom:4px;height:26px;border-radius:7px}
+.iwrap:hover .garch{opacity:1}
+.fday{display:flex;align-items:center;justify-content:space-between}
+.fnew{font-size:11px;color:var(--muted);padding:1px 6px;border-radius:6px}
+.fnew:hover{background:var(--hover);color:var(--ink)}
+.fcard{border-radius:10px;margin:2px 0 6px}
+.fh{display:flex;align-items:center;gap:2px}
+.fmain{flex:1;min-width:0;text-align:left;padding:6px 8px;border-radius:8px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fmain:hover{background:var(--hover)}
+.fbody{padding-left:4px;border-left:1px solid var(--line);margin-left:7px}
+.fempty{padding:6px 8px}
+.dropon{outline:2px dashed var(--faint);outline-offset:-2px;background:var(--hover)}
+.ctxwarn{font-size:12px;color:var(--muted);margin:0 0 6px 2px;line-height:1.5}
+.ctxwarn.bad{color:var(--bad)}
 .ag.off{opacity:.6}
 .onoff{position:relative;display:inline-block;width:34px;height:20px;flex:none;cursor:pointer}
 .onoff input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
@@ -338,7 +355,7 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
   .side{position:fixed;left:0;top:0;bottom:0;width:300px;z-index:20;transform:translateX(-100%);transition:transform .2s;box-shadow:var(--shadow)}
   body.side-open .side{transform:none} body.side-open .scrim{display:block}
   .topbar .menu{display:inline-flex}
-  .wrap{padding:18px 16px}.composer{padding:0 12px 12px}.sugs{grid-template-columns:1fr}
+  .wrap{padding:18px 16px}.actbar{margin:0 -16px 16px;padding:8px 16px}.composer{padding:0 12px 12px}.sugs{grid-template-columns:1fr}
   .hero{padding-top:4vh}.hero h1{font-size:22px}
 }
 
@@ -430,7 +447,18 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
   .gitem,.gtask{min-height:40px}
   .rh{min-height:44px}
 }
-@media(max-width:760px){.intro{grid-template-columns:1fr;gap:6px}.intro li{padding:8px 12px}.intro span{margin-top:2px}.rail,.side{max-width:calc(100vw - 24px)}.chint .r{display:none}.hero{padding-top:10px}}
+@media(max-width:760px){.intro{grid-template-columns:1fr;gap:6px}.intro li{padding:8px 12px}.intro span{margin-top:2px}.chint .r{display:none}.hero{padding-top:10px}}
+.mopt{display:none!important}
+@media(max-width:760px){
+  body:not(.copts) .crow>.seg,body:not(.copts) #contact,body:not(.copts) #wtog,body:not(.copts) #dtog,body:not(.copts) #cwd,body:not(.copts) .chint{display:none!important}
+  .crow{flex-wrap:wrap}.mopt{display:inline-flex!important;max-width:58vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #tb-awake .tx{display:none} #tb-awake,#tb-side{padding:6px 10px;flex:none}
+  .actbar .acts{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:2px}
+  .actbar .acts::-webkit-scrollbar{display:none}
+  .actbar .acts>*{flex:none;white-space:nowrap}
+  .keepbox{max-height:34vh;overflow:auto}
+  #txt{min-height:44px}
+}
 .keepbox{margin:4px 8px 10px;padding:8px 10px;border:1px solid var(--line,#ddd);border-radius:10px;font-size:12.5px}
 .keepbox .kh{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
 .keepbox .krow{display:flex;align-items:center;gap:6px;padding:3px 0}
@@ -452,6 +480,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
     <div class="topbar">
       <button class="iconbtn menu" data-act="side" title="记录">☰</button>
       <b style="flex:1" id="tb-title">Hub</b>
+      <button class="btn" data-act="awake" id="tb-awake" title="打开后，面板开着时电脑不会自动睡眠，团队可以安心跑长任务（合上盖子仍会睡）">☾ 会休眠</button>
       <button class="btn" data-act="sidewin" id="tb-side" title="开个小窗单独问个小问题，不影响主线">旁问</button>
       <button class="btn" data-act="rail" id="tb-team">团队</button>
       <div class="mtabs" id="mtabs" role="tablist"><button data-act="tab" data-v="list">记录</button><button class="on" data-act="tab" data-v="view">详情</button><button data-act="tab" data-v="team">团队</button></div>
@@ -468,6 +497,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
           <select id="contact" aria-label="谁来对接" style="display:none"></select>
           <button class="tog" id="wtog" data-act="write" title="允许团队成员在工作目录里创建、修改文件">✎ 允许改文件</button>
           <button class="tog" id="dtog" data-act="cwd" title="指定工作目录">▸ 目录</button>
+          <button class="tog mopt" id="mopt" data-act="mopt" title="展开或收起发送选项">选项</button>
           <button class="tog" data-act="att-pick" data-w="main" title="附上图片（也可以直接粘贴或拖进来）">＋图片</button>
           <input type="file" id="file-main" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
           <button class="send" id="send" data-act="send" disabled>发送</button>
@@ -689,7 +719,7 @@ function groups(){
     if (i.follows && i.follows.type && i.follows.id && !i.fork) union(k, i.follows.type + ":" + i.follows.id);   // 分叉另起一组
     if (i.type === "run" && i.rec && i.rec.parent_call) union(k, "call:" + i.rec.parent_call);
     if (i.type === "call" && i.rec && i.rec.dispatch && i.rec.dispatch.run) union(k, "run:" + i.rec.dispatch.run);
-    if (i.type === "call" && i.rec && i.rec.handoff && i.rec.handoff.from) union(k, i.rec.handoff.from.type + ":" + i.rec.handoff.from.id);   // 交接过来的那组并进来
+    // 交接只是把结果抄一份过去：来源那组照旧留着，还能再交接给别的组
   }
   for (const i of all){
     const r = find(i.type + ":" + i.id);
@@ -756,6 +786,84 @@ function groups(){
 
 /* ---------- 左栏 ---------- */
 const shortTime = ts => { const d = dayLabel(ts); return (d === "今天" ? "" : d + " ") + clock(ts); };
+function cardHtml(g){                 // 左栏一个项目组
+  let h = "";
+  const isOpen = openGroups.has(g.id), si = stInfo(g.status, g.error);
+  const groupSel = g.items.some(i => sel && sel.type === i.type && sel.id === i.id);
+  h += '<div class="gcard' + (isOpen ? " open" : "") + (groupSel ? " has-sel" : "") + '" draggable="true" data-drag="' + esc(g.id) + '"><div class="gh">' +
+    '<button class="gtog" data-act="group" data-id="' + esc(g.id) + '" aria-expanded="' + isOpen + '" title="' + (isOpen ? "收起项目组" : "展开项目组") + '">' + (isOpen ? "▾" : "▸") + "</button>" +
+    '<button class="gmain' + (!isOpen && groupSel ? " sel" : "") + '" data-act="select" data-type="' + esc(g.latest.type) + '" data-id="' + esc(g.latest.id) + '">' +
+    '<span class="st">' + icon(si.k) + "</span>" +
+    '<div class="t">' + esc(g.title || "（无内容）") + "</div>" +
+    '<div class="m"><span class="dots">' + g.agents.map(a => '<i class="dot" style="background:' + agc(a) + '" title="' + esc(a) + '"></i>').join("") + "</span>" +
+    esc(g.kind) + " · " + g.count + " 件 · " + shortTime(g.time) + (longOf(g) >= LONG_BAD ? ' · <span class="stuck" title="' + esc(LONG_WARN(longOf(g))) + '">偏长</span>' : "") + "</div></button>" +
+    '<button class="garch" data-act="rename" data-key="' + esc(g.id) + '" data-name="' + esc(g.title || "") + '" title="重命名这个项目组" aria-label="重命名">✎</button>' + (handSrc(g.latest) ? '<button class="garch" data-act="handoff-arm" data-id="' + esc(g.id) + '" title="把这一组的成果抄一份交接给另一个项目组" aria-label="交接">⇢</button>' : "") + folderBtn(g.id) +
+    (RUNNING[g.status] ? "" : '<button class="garch" data-act="archive" data-keys="' + esc(g.items.map(akey).join(" ")) + '" data-on="' + (g.archived ? "0" : "1") + '" title="' + (g.archived ? "取消归档，放回列表" : "归档这个项目组") + '" aria-label="' + (g.archived ? "取消归档" : "归档") + '">' + (g.archived ? "↩" : ARCH_ICON) + "</button>") +
+    "</div>";
+  if (isOpen){
+    h += '<div class="gbody">';
+    for (const i of g.items){
+      const isi = stInfo(i.status, i.error), isSel = !!(sel && sel.type === i.type && sel.id === i.id);
+      const who = i.type === "run" ? (i.council ? "会审" : i.pressure ? "高压" : "协作") : (i.rec.agent || "提问");
+      const whoStyle = i.type === "run" ? "" : ' style="color:' + agc(i.rec.agent) + '"';
+      h += '<button class="gitem' + (isSel ? " sel" : "") + '" data-act="select" data-type="' + esc(i.type) + '" data-id="' + esc(i.id) + '">' +
+        '<span class="gwho"' + whoStyle + ">" + esc(who) + '</span><span class="gsep"> · </span>' +
+        '<span class="gwhat">' + (i.image ? "🎨 " : "") + esc(i.title || "（无内容）") + "</span>" +
+        '<span class="gst ' + isi.k + '">' + esc(isi.t) + "</span></button>";
+      if (i.type === "run" && (i.rec.tasks || []).length){
+        h += '<div class="gtasks">';
+        for (const t of i.rec.tasks){
+          const tsi = t.status ? stInfo(t.status) : {k:"wait", t:"仅方案"};
+          h += '<button class="gtask" data-act="select" data-type="run" data-id="' + esc(i.id) + '">' +
+            '<span class="gwho" style="color:' + agc(t.agent) + '">' + esc(t.agent || "") + '</span><span class="gsep"> · </span>' +
+            '<span class="gwhat">' + esc(t.title || t.id || "") + "</span>" +
+            '<span class="gst ' + tsi.k + '">' + esc(tsi.t) + "</span></button>";
+        }
+        h += "</div>";
+      }
+    }
+    h += "</div>";
+  }
+  h += "</div>";
+  return h + folderPick(g.id) + (handoffArm === g.id ? handPicker(g.latest) : "");
+}
+function soloHtml(i){                 // 左栏一条单独提问
+  let h = "";
+  const si = stInfo(i.status, i.error);
+  const ia = isArch(i);
+  h += '<div class="iwrap" draggable="true" data-drag="' + esc(akey(i)) + '"><button class="item' + (sel && sel.type === i.type && sel.id === i.id ? " sel" : "") + '" data-act="select" data-type="' + esc(i.type) + '" data-id="' + esc(i.id) + '">' +
+    '<span class="st">' + icon(si.k) + "</span>" +
+    '<div class="t">' + (i.image ? "🎨 " : "") + esc(nameOf(i) || "（无内容）") + "</div>" +
+    '<div class="m"><span class="dots">' + uniq(i.agents).map(a => '<i class="dot" style="background:' + agc(a) + '" title="' + esc(a) + '"></i>').join("") + "</span>" +
+    (i.image ? "画图" : esc(i.rec.agent || "")) + " · " + shortTime(i.start) + " · " + tick(i.start, i.end, i.rec.secs) + "</div></button>" +
+    (RUNNING[i.status] ? "" : '<button class="iarch" data-act="archive" data-keys="' + esc(akey(i)) + '" data-on="' + (ia ? "0" : "1") + '" title="' + (ia ? "取消归档，放回列表" : "归档这条") + '" aria-label="' + (ia ? "取消归档" : "归档") + '">' + (ia ? "↩" : ARCH_ICON) + "</button>") +
+    folderBtn(akey(i)) + "</div>";
+  return h + folderPick(akey(i));
+}
+const openFolders = new Set((() => { try { return JSON.parse(localStorage.getItem("hub-folders-open") || "[]"); } catch(e){ return []; } })());
+const saveOpenFolders = () => { try { localStorage.setItem("hub-folders-open", JSON.stringify([...openFolders])); } catch(e){} };
+let folderArm = null;                   // 正在选「放进哪个文件夹」的那一项
+function folderBtn(key){ return '<button class="garch" data-act="folder-pick" data-key="' + esc(key) + '" title="放进文件夹 / 拿出来" aria-label="放进文件夹">📁</button>'; }
+function folderPick(key){
+  if (folderArm !== key) return "";
+  const FD = (S && S.folders) || {folders: [], of: {}}, cur = (FD.of || {})[key] || "";
+  return '<div class="handpick"><select data-folder-move="' + esc(key) + '" aria-label="放进哪个文件夹"><option value="">' + (cur ? "拿出来，不放文件夹" : "选一个文件夹…") + '</option>' +
+    FD.folders.filter(f => f.id !== cur).map(f => '<option value="' + esc(f.id) + '">📁 ' + esc(f.name) + '</option>').join("") +
+    '<option value="__new">＋ 新建文件夹…</option></select><button class="btn" data-act="folder-cancel">取消</button></div>';
+}
+async function folderMove(keys, folder){
+  try {
+    if (folder === "__new"){
+      const name = (prompt("新文件夹叫什么？") || "").trim();
+      if (!name){ folderArm = null; last.list = ""; renderList(); return; }
+      const r = await api("/api/folders", {op: "create", name, keys}); openFolders.add(r.id); saveOpenFolders(); toast("已新建文件夹「" + name + "」并放进去");
+    } else {
+      await api("/api/folders", {op: "move", folder, keys}); toast(folder ? "已放进文件夹" : "已拿出文件夹");
+      if (folder){ openFolders.add(folder); saveOpenFolders(); }
+    }
+  } catch(err){ toast(err.message); }
+  folderArm = null; last.list = ""; poll();
+}
 function renderList(){
   let {projects, solos} = groups();
   const nArch = projects.filter(g => g.archived).length + solos.filter(isArch).length;
@@ -777,64 +885,33 @@ function renderList(){
     projects = projects.filter(g => (g.title || "").toLowerCase().indexOf(q) >= 0 || g.items.some(i => (i.title || "").toLowerCase().indexOf(q) >= 0));
     solos = solos.filter(i => (nameOf(i) + " " + (i.title || "")).toLowerCase().indexOf(q) >= 0);
   }
+  const FD = (S && S.folders) || {folders: [], of: {}}, fOf = FD.of || {};
+  const filtering = !!q || filter !== "all";
   let h = keepBox();
-  if (projects.length){
-    h += '<div class="day">项目组</div>';
-    for (const g of projects){
-      const isOpen = openGroups.has(g.id), si = stInfo(g.status, g.error);
-      const groupSel = g.items.some(i => sel && sel.type === i.type && sel.id === i.id);
-      h += '<div class="gcard' + (isOpen ? " open" : "") + (groupSel ? " has-sel" : "") + '"><div class="gh">' +
-        '<button class="gtog" data-act="group" data-id="' + esc(g.id) + '" aria-expanded="' + isOpen + '" title="' + (isOpen ? "收起项目组" : "展开项目组") + '">' + (isOpen ? "▾" : "▸") + "</button>" +
-        '<button class="gmain' + (!isOpen && groupSel ? " sel" : "") + '" data-act="select" data-type="' + esc(g.latest.type) + '" data-id="' + esc(g.latest.id) + '">' +
-        '<span class="st">' + icon(si.k) + "</span>" +
-        '<div class="t">' + esc(g.title || "（无内容）") + "</div>" +
-        '<div class="m"><span class="dots">' + g.agents.map(a => '<i class="dot" style="background:' + agc(a) + '" title="' + esc(a) + '"></i>').join("") + "</span>" +
-        esc(g.kind) + " · " + g.count + " 件 · " + shortTime(g.time) + "</div></button>" +
-        '<button class="garch" data-act="rename" data-key="' + esc(g.id) + '" data-name="' + esc(g.title || "") + '" title="重命名这个项目组" aria-label="重命名">✎</button>' +
-        (RUNNING[g.status] ? "" : '<button class="garch" data-act="archive" data-keys="' + esc(g.items.map(akey).join(" ")) + '" data-on="' + (g.archived ? "0" : "1") + '" title="' + (g.archived ? "取消归档，放回列表" : "归档这个项目组") + '" aria-label="' + (g.archived ? "取消归档" : "归档") + '">' + (g.archived ? "↩" : ARCH_ICON) + "</button>") +
-        "</div>";
-      if (isOpen){
-        h += '<div class="gbody">';
-        for (const i of g.items){
-          const isi = stInfo(i.status, i.error), isSel = !!(sel && sel.type === i.type && sel.id === i.id);
-          const who = i.type === "run" ? (i.council ? "会审" : i.pressure ? "高压" : "协作") : (i.rec.agent || "提问");
-          const whoStyle = i.type === "run" ? "" : ' style="color:' + agc(i.rec.agent) + '"';
-          h += '<button class="gitem' + (isSel ? " sel" : "") + '" data-act="select" data-type="' + esc(i.type) + '" data-id="' + esc(i.id) + '">' +
-            '<span class="gwho"' + whoStyle + ">" + esc(who) + '</span><span class="gsep"> · </span>' +
-            '<span class="gwhat">' + (i.image ? "🎨 " : "") + esc(i.title || "（无内容）") + "</span>" +
-            '<span class="gst ' + isi.k + '">' + esc(isi.t) + "</span></button>";
-          if (i.type === "run" && (i.rec.tasks || []).length){
-            h += '<div class="gtasks">';
-            for (const t of i.rec.tasks){
-              const tsi = t.status ? stInfo(t.status) : {k:"wait", t:"仅方案"};
-              h += '<button class="gtask" data-act="select" data-type="run" data-id="' + esc(i.id) + '">' +
-                '<span class="gwho" style="color:' + agc(t.agent) + '">' + esc(t.agent || "") + '</span><span class="gsep"> · </span>' +
-                '<span class="gwhat">' + esc(t.title || t.id || "") + "</span>" +
-                '<span class="gst ' + tsi.k + '">' + esc(tsi.t) + "</span></button>";
-            }
-            h += "</div>";
-          }
-        }
-        h += "</div>";
-      }
-      h += "</div>";
-    }
+  const rp = projects.filter(g => !fOf[g.id]), rs = solos.filter(i => !fOf[akey(i)]);
+  let fh2 = "";
+  for (const f of FD.folders){
+    const ps = projects.filter(g => fOf[g.id] === f.id), ss = solos.filter(i => fOf[akey(i)] === f.id);
+    if (filtering && !ps.length && !ss.length) continue;
+    const open = openFolders.has(f.id) || (filtering && (ps.length + ss.length) > 0);
+    const run = ps.some(g => RUNNING[g.status]) || ss.some(i => RUNNING[i.status]);
+    fh2 += '<div class="fcard' + (open ? " open" : "") + '" data-drop="' + esc(f.id) + '"><div class="fh">' +
+      '<button class="fmain" data-act="folder-tog" data-id="' + esc(f.id) + '" aria-expanded="' + open + '">' + (open ? "▾" : "▸") + ' 📁 <b>' + esc(f.name) + '</b><span class="small" style="display:inline"> · ' + (ps.length + ss.length) + ' 个' + (run ? " · 有在做的" : "") + '</span></button>' +
+      '<button class="garch" data-act="folder-rename" data-id="' + esc(f.id) + '" data-name="' + esc(f.name) + '" title="给文件夹改名" aria-label="改名">✎</button>' +
+      '<button class="garch" data-act="folder-del" data-id="' + esc(f.id) + '" data-name="' + esc(f.name) + '" title="删掉文件夹（里面的项目组放回外面，不会删记录）" aria-label="删除文件夹">✕</button></div>';
+    if (open) fh2 += '<div class="fbody">' + (ps.length || ss.length ? ps.map(cardHtml).join("") + ss.map(soloHtml).join("") : '<div class="small fempty">空的。把项目组拖到这里，或点项目组上的 📁 放进来。</div>') + '</div>';
+    fh2 += '</div>';
   }
-  if (solos.length){
-    h += '<div class="day">单独提问</div>';
-    for (const i of solos){
-      const si = stInfo(i.status, i.error);
-      const ia = isArch(i);
-      h += '<div class="iwrap"><button class="item' + (sel && sel.type === i.type && sel.id === i.id ? " sel" : "") + '" data-act="select" data-type="' + esc(i.type) + '" data-id="' + esc(i.id) + '">' +
-        '<span class="st">' + icon(si.k) + "</span>" +
-        '<div class="t">' + (i.image ? "🎨 " : "") + esc(nameOf(i) || "（无内容）") + "</div>" +
-        '<div class="m"><span class="dots">' + uniq(i.agents).map(a => '<i class="dot" style="background:' + agc(a) + '" title="' + esc(a) + '"></i>').join("") + "</span>" +
-        (i.image ? "画图" : esc(i.rec.agent || "")) + " · " + shortTime(i.start) + " · " + tick(i.start, i.end, i.rec.secs) + "</div></button>" +
-        (RUNNING[i.status] ? "" : '<button class="iarch" data-act="archive" data-keys="' + esc(akey(i)) + '" data-on="' + (ia ? "0" : "1") + '" title="' + (ia ? "取消归档，放回列表" : "归档这条") + '" aria-label="' + (ia ? "取消归档" : "归档") + '">' + (ia ? "↩" : ARCH_ICON) + "</button>") +
-        "</div>";
-    }
+  if (FD.folders.length || rp.length) h += '<div class="day fday" data-drop="">文件夹<button class="fnew" data-act="folder-new" title="新建一个文件夹，把项目组拖进去">＋ 新建</button></div>' + fh2;
+  if (rp.length){
+    h += '<div class="day" data-drop="">项目组</div>';
+    for (const g of rp) h += cardHtml(g);
   }
-  if (!projects.length && !solos.length) h = '<div class="empty">' + (wantArch ? "还没有归档的记录<br>在记录详情顶上点「归档」就会收到这里" : items().length ? "没有符合条件的记录" : "还没有记录<br>在右边下一个任务试试") + "</div>";
+  if (rs.length){
+    h += '<div class="day" data-drop="">单独提问</div>';
+    for (const i of rs) h += soloHtml(i);
+  }
+  if (!projects.length && !solos.length && !FD.folders.length) h = keepBox() + '<div class="empty">' + (wantArch ? "还没有归档的记录<br>在记录详情顶上点「归档」就会收到这里" : items().length ? "没有符合条件的记录" : "还没有记录<br>在右边下一个任务试试") + "</div>";
   if (h !== last.list){ const st = $("list").scrollTop; $("list").innerHTML = h; $("list").scrollTop = st; last.list = h; ticks(); }
 }
 
@@ -946,45 +1023,51 @@ function ownModels(a, cur){              // 这位成员自家的模型（Claude
   const k = HOME_KIND[a.name] || kindOf(a.chain[0]);
   return usable(S.backends || [], cur).filter(o => kindOf(o.spec) === k || o.spec === cur);
 }
-function thinkSelect(a){                // 卡片上的「动脑用」+「动脑档位」：定方案、审查、拍板、会审时用
-  const th = ((S.config || {}).think || {})[a.name] || {}, sp = th.spec || "", base = a.chain[0] || "";
+const TIER_LIST = [["think", "动脑", "定方案、审查、拍板、会审"], ["design", "审美", "排版、配色、界面视觉、挑图"], ["copy", "文案", "标题、广告语、对外文字、润色"]];
+const TIER_NAME = {work: "干活", think: "动脑", design: "审美", copy: "文案"};
+function plannedSpec(agent, kind){       // 任务还没开工时，按成员卡片推算会用哪个模型
+  const a = ((S && S.agents) || []).find(x => x.name === agent) || {chain: []};
+  const th = (((S && S.config && S.config.tiers) || {})[kind] || {})[agent] || {};
+  return th.spec || a.chain[0] || "";
+}
+function taskModel(t){                 // 「审美 · Gemini Flash」：开工后写实际在用的模型（中途换了备用也跟着变），没开工写预计
+  const c = t.call_id && ((S && S.calls) || []).find(x => x.id === t.call_id);
+  const real = t.backend || (c && c.backend);
+  const sp = real || t.plan_spec || plannedSpec(t.agent, t.kind);
+  return (TIER_NAME[t.kind] || "干活") + " · " + specLabel(sp) + (t.spec ? "（你点名的）" : "") + (real || t.status === "skipped" ? "" : "（预计）");
+}
+function tierRow(a, tier, name, hint){  // 卡片上一行：某类活用的模型 + 档位，不设就跟干活一样
+  const th = (((S.config || {}).tiers || {})[tier] || {})[a.name] || {}, sp = th.spec || "", base = a.chain[0] || "";
   const use = sp || base, kind = kindOf(use);
   const lbl = o => o.spec === "codex" ? o.label.replace("GPT · 跟随 Codex 设置", "GPT · 沿用本机设置") : o.spec === "dsh" ? "DeepSeek" : o.label;
-  const sel = (aria, attr, opts) => '<select class="msel" aria-label="' + esc(a.name) + aria + '" ' + attr + '="' + esc(a.name) + '">' + opts + '</select>';
   const opt = (v, t, on) => '<option value="' + esc(v) + '"' + (on ? " selected" : "") + '>' + esc(t) + '</option>';
-  const row = (name, inner) => '<label class="model-line"><span>' + name + '</span>' + inner + '</label>';
-  const txt = (name, t) => '<div class="model-line"><span>' + name + '</span><span class="small">' + esc(t) + '</span></div>';
-  const mine = ownModels(a, sp);
-  const g = gemLevel(use);
+  const sel = (what, attr, opts) => '<select class="msel" aria-label="' + esc(a.name + name + what) + '" ' + attr + '="' + esc(a.name) + '" data-tier="' + tier + '">' + opts + '</select>';
+  const wrap = inner => '<label class="model-line" title="' + esc(name + "的活：" + hint) + '"><span>' + name + '</span>' + inner + '</label>';
+  const mine = ownModels(a, sp), g = gemLevel(use);
   if (isRemote()){
-    const lv = g ? gemLabel((S.backends || []).find(b => b.spec === use) || {spec: use}) : (th.effort || "跟干活一样");
-    return txt("动脑用", sp ? gemFamily(specLabel(sp)) : "跟干活一样") + txt("动脑档位", lv);
+    const lv = g ? gemLabel((S.backends || []).find(b => b.spec === use) || {spec: use}) : (th.effort || "");
+    return '<div class="model-line"><span>' + name + '</span><span class="small">' + esc(sp ? gemFamily(specLabel(sp)) : "跟干活一样") + (lv ? " · " + esc(lv) : "") + '</span></div>';
   }
-  let h;
-  if (g){                                // Gemini：档位写在模型名里，系列和档位分两栏选
+  if (g){                                // Gemini：档位写在模型名里，系列和档位分两个下拉框
     const fams = [];
     mine.forEach(o => { const m = gemLevel(o.spec); const f = m ? m[1] : o.spec; if (!fams.some(x => x.f === f)) fams.push({f, o}); });
-    const pick = f => {                  // 换系列时尽量保持当前档位
+    const pick = f => {
       const sib = mine.filter(o => (gemLevel(o.spec) || [])[1] === f);
       return (sib.find(o => gemLevel(o.spec)[2] === g[2]) || sib.find(o => gemLevel(o.spec)[2] === "medium") || sib[0] || {spec: f}).spec;
     };
-    h = row("动脑用", sel("动脑用的模型", "data-think-spec", opt("", "跟干活一样", !sp) +
-      fams.map(x => { const m = gemLevel(x.o.spec); return opt(m ? pick(m[1]) : x.o.spec, m ? gemFamily(x.o.label) : lbl(x.o), sp && (m ? m[1] === g[1] : x.o.spec === sp)); }).join("")));
     const sib = mine.filter(o => { const m = gemLevel(o.spec); return m && m[1] === g[1]; })
       .sort((x, y) => GEM_ORDER.indexOf(gemLevel(x.spec)[2]) - GEM_ORDER.indexOf(gemLevel(y.spec)[2]));
-    h += sib.length > 1 ? row("动脑档位", sel("动脑思考等级", "data-think-spec", (sp ? "" : opt("", "跟干活一样", true)) + sib.map(o => opt(o.spec, gemLabel(o), sp === o.spec)).join("")))
-                        : txt("动脑档位", "只有这一档");
-    return h;
+    return wrap(sel("模型", "data-tier-spec", opt("", "跟干活一样", !sp) +
+        fams.map(x => { const m = gemLevel(x.o.spec); return opt(m ? pick(m[1]) : x.o.spec, m ? gemFamily(x.o.label) : lbl(x.o), sp && (m ? m[1] === g[1] : x.o.spec === sp)); }).join("")) +
+      (sp && sib.length > 1 ? sel("档位", "data-tier-spec", sib.map(o => opt(o.spec, gemLabel(o), sp === o.spec)).join("")) : ""));
   }
-  const others = mine.filter(o => !gemLevel(o.spec));
-  h = others.length > 1 || sp ? row("动脑用", sel("动脑用的模型", "data-think-spec", opt("", "跟干活一样", !sp) + others.map(o => opt(o.spec, lbl(o), o.spec === sp)).join("")))
-                              : txt("动脑用", "跟干活一样（只有这一个模型）");
+  let h = sel("模型", "data-tier-spec", opt("", "跟干活一样", !sp) + mine.filter(o => !gemLevel(o.spec)).map(o => opt(o.spec, lbl(o), o.spec === sp)).join(""));
   const levels = ((S.backends || []).find(b => b.spec === use) || {}).efforts || [];
   if ((kind === "codex" || kind === "claude") && levels.length)
-    h += row("动脑档位", sel("动脑思考等级", "data-think-eff", [{id: "", desc: ""}].concat(levels).map(e => opt(e.id, e.id ? e.id + (EFF_NOTE[e.id] || "") : "跟干活一样", e.id === (th.effort || ""))).join("")));
-  else h += txt("动脑档位", kind === "dsh" ? "DeepSeek 不支持调节" : "这个模型不支持调节");
-  return h;
+    h += sel("档位", "data-tier-eff", [{id: "", desc: ""}].concat(levels).map(e => opt(e.id, e.id ? e.id + (EFF_NOTE[e.id] || "") : "档位同干活", e.id === (th.effort || ""))).join(""));
+  return wrap(h);
 }
+function tierRows(a){ return '<div class="small" style="margin-top:10px">按活儿换模型（不设就跟干活一样）</div>' + TIER_LIST.map(t => tierRow(a, t[0], t[1], t[2])).join(""); }
 /* ---------- 旁问小窗：单独问小问题，不进主线 ---------- */
 const specLabel = sp => (((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp;
 function sideState(){                   // 当前小窗里选中的成员、模型、档位、上下文
@@ -1150,7 +1233,7 @@ function settingsHtml(){
     field('谁来拆任务', '<select data-cfg="planner">' + optA(cfg.planner) + '</select>', '收到目标后，由它决定分几步、交给谁。建议日常用 Gemini，复杂目标再选更擅长规划的成员；拆任务也会花它的额度。') +
     field('谁来汇总', '<select data-cfg="synthesizer">' + optA(cfg.synthesizer) + '</select>', '把大家的回答整理成一份结果；会审时由它比较共同点和分歧。建议用 Gemini；只有一个子任务时直接交回结果。') +
     field('谁参加会审', '<span class="council-pick">' + S.agents.map(a => '<label style="display:inline-flex;gap:4px;margin-right:10px' + (a.disabled ? ';opacity:.5' : '') + '"><input type="checkbox" data-council="' + esc(a.name) + '"' + ((cfg.council_agents || []).indexOf(a.name) >= 0 ? " checked" : "") + (a.disabled ? " disabled" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</label>').join("") + '</span>', '会审时勾选的成员同时各自作答，互相看不到答案，再由汇总的人比较。默认 Gemini、GPT、DeepSeek；Claude 默认不参加，想让它参加就勾上。') +
-    field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
+    field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + (cfg.auto_title && !liveAgents().some(a => a.name === cfg.auto_title) ? '<option value="' + esc(cfg.auto_title) + '" selected>由 ' + esc(cfg.auto_title) + ' 起名（已停用，现由 ' + esc(cfg.auto_title_live || '无人') + ' 代起）</option>' : '') + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
     field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
     field('最多同时做几件', '<input type="number" min="1" max="8" data-cfg="max_parallel" value="' + esc(cfg.max_parallel) + '">', '不是只能两位合作：最多可同时做 8 件，也可由同一位做多件。建议先用 3；依赖前一步结果的任务仍要等。') +
     field('一般多久交（分钟）', '<input type="number" min="1" max="120" data-cfg="timeout" data-scale="60" value="' + Math.round(cfg.timeout/60) + '">', '告诉成员大概多久该交。到点不会被掐断：只要还在干活就让它做完。建议 15 分钟。' + (cfg.timeout < (cfg.min_timeout || 900) ? '<br><b class="stuck" style="color:var(--bad)">现在少于 15 分钟：读资料、审查、写长文常常需要 5～15 分钟，成员可能会草草交差。</b>' : '')) +
@@ -1194,7 +1277,7 @@ function renderRail(){
     else h += '<p class="small">' + (a.name === 'claude' ? '额度请在 Claude 应用中查看' : '暂无额度数据，详情中查看说明') + '</p>';
     const liveModels = uniq(S.calls.filter(c => c.agent === a.name && c.status === 'running').map(c => c.backend));
     if (liveModels.length) h += '<div class="small">正在使用：' + liveModels.map(sp => esc(((S.backends || []).find(b => b.spec === sp) || {}).label || sp)).join('、') + '</div>';
-    h += modelSelect(a, 0) + effortSelect(a) + thinkSelect(a);
+    h += modelSelect(a, 0) + effortSelect(a) + tierRows(a);
     h += '<button class="detail-toggle" data-act="agent-details" data-agent="' + esc(a.name) + '" aria-expanded="' + expanded + '">' + (expanded ? '▾ 收起详情' : '▸ 详情') + '</button>';
     if (expanded){
       h += '<div class="agent-detail">';
@@ -1311,25 +1394,43 @@ function headHtml(it, extraMeta){
     const f = findItem(it.follows);
     h += '<span>' + (it.fork ? "⑂ 分叉自" : "追问自") + ' <a href="#" data-act="select" data-type="' + esc(it.follows.type) + '" data-id="' + esc(it.follows.id) + '">' + esc(f ? (f.title || "").slice(0, 24) : "上一条") + "</a></span>";
   }
-  h += '</div><div class="acts">' +
-    (running ? (stopArm === tgt.id ? '<button class="btn danger" data-act="stop" data-sure="1" data-type="' + esc(tgt.type) + '" data-id="' + esc(tgt.id) + '" style="background:var(--bad);color:#fff">再点一次确认停止</button>' : '<button class="btn danger" data-act="stop" data-type="' + esc(tgt.type) + '" data-id="' + esc(tgt.id) + '" title="' + (tgt === it ? "停止这一条" : "停止这段对话里还在进行的：" + esc((tgt.title || "").slice(0, 30))) + '">■ 停止</button>') : '<button class="btn" data-act="retry">↻ 重新执行</button><button class="btn" data-act="fork" data-type="' + esc(it.type) + '" data-id="' + esc(it.id) + '" title="带上到这里为止的上下文，另开一条线接着做，原来这条不受影响">⑂ 从这里分叉</button>') +
-    (isRemote() ? '' : '<button class="btn" data-act="opendir" title="' + esc(it.rec.cwd || "") + '">打开工作目录</button>') + renBtn(it) + handBtn(it) + archBtn(it) + '</div>' + handPicker(it);
+  h += '</div><div class="actbar"><div class="acts">' +
+    (running ? (stopArm === tgt.id ? '<button class="btn danger" data-act="stop" data-sure="1" data-type="' + esc(tgt.type) + '" data-id="' + esc(tgt.id) + '" style="background:var(--bad);color:#fff">再点一次确认停止</button>' : '<button class="btn danger" data-act="stop" data-type="' + esc(tgt.type) + '" data-id="' + esc(tgt.id) + '" title="' + (tgt === it ? "停止这一条" : "停止这段对话里还在进行的：" + esc((tgt.title || "").slice(0, 30))) + '">■ 停止</button>') : '<button class="btn" data-act="retry">↻ 重新执行</button><button class="btn" data-act="fork" data-type="' + esc(it.type) + '" data-id="' + esc(it.id) + '" title="带上到「' + esc((it.title || "").slice(0, 30)) + '」这一轮为止的上下文，另开一条线接着做，原来这条不受影响。想从更早的某一轮分，点那一轮回答下面的「⑂ 从这里分叉」">⑂ ' + (chainEnd(it) === it ? "从最新这轮分叉" : "从选中这轮分叉") + '</button>') +
+    (isRemote() ? '' : '<button class="btn" data-act="opendir" title="' + esc(it.rec.cwd || "") + '">打开工作目录</button>') + renBtn(it) + handBtn(it) + compactBtn(it) + archBtn(it) + '</div>' + handPicker(it) + '</div>';
   if (it.rec && it.rec.images && it.rec.kind !== "chat") h += thumbsHtml(it.rec.images);   // 对话页在每轮气泡里显示
   return h;
 }
 const chainEnd = it => { const c = chainOf(it); return c[c.length - 1] || it; };   // 一条线现在的最后一轮
+function handSrc(latest){                // 交接时取这条线上最后一轮已经做完的（还在做的那轮不算）
+  const ch = chainOf(latest);
+  for (let k = ch.length - 1; k >= 0; k--) if (!RUNNING[ch[k].status]) return ch[k];
+  return null;
+}
 function handBtn(it){
   const g = groupOf(it);
   if (!g) return "";
-  return g.running ? '<button class="btn" disabled title="这一组还在做，做完才能交接">⇢ 交接到…</button>'
-    : '<button class="btn" data-act="handoff-arm" data-id="' + esc(it.id) + '" title="把这一组做出来的东西交给另一个项目组，之后在那边接着问就能用上">⇢ 交接到…</button>';
+  return !handSrc(g.latest) ? '<button class="btn" disabled title="还没有做完的内容可以交接">⇢ 交接到…</button>'
+    : '<button class="btn" data-act="handoff-arm" data-id="' + esc(g.key) + '" title="把这一组做出来的东西抄一份给另一个项目组，之后在那边接着问就能用上；这一组照旧留着，可以交接给好几组' + (g.running ? "。还在做的那一轮不算，只交已经做完的" : "") + '">⇢ 交接到…</button>' + handedTo(g);
+}
+function handedTo(g){                   // 这一组已经交接给了哪些组
+  const mine = new Set(g.items.map(i => i.type + ":" + i.id)), seen = new Set(), out = [];
+  for (const c of (S.calls || [])){
+    const f = c.kind === "handoff" && c.handoff && c.handoff.from;
+    if (!f || !mine.has(f.type + ":" + f.id)) continue;
+    const dg = groupOf({type: "call", id: c.id, follows: c.follows, rec: c});
+    if (!dg || seen.has(dg.key)) continue;
+    seen.add(dg.key);
+    out.push('<button class="job" data-act="select" data-type="call" data-id="' + esc(c.id) + '">' + esc((dg.title || "").slice(0, 16) || "（无标题）") + "</button>");
+  }
+  return out.length ? '<span class="small" style="display:inline">已交接给：' + out.join(" ") + "</span>" : "";
 }
 function handPicker(it){
-  if (handoffArm !== it.id) return "";
-  const me = groupOf(it), {projects, solos} = groups();
+  const me = groupOf(it);
+  if (!me || handoffArm !== me.key) return "";
+  const {projects, solos} = groups();
   const targets = projects.filter(p => p.id !== me.key && !p.archived).concat(solos.filter(x => akey(x) !== me.key && !isArch(x)).map(x => ({id: akey(x), title: nameOf(x), latest: x})));
   if (!targets.length) return '<div class="handpick small">没有别的项目组可以交接。<button class="btn" data-act="handoff-cancel">取消</button></div>';
-  return '<div class="handpick"><span>把「' + esc((me.title || "").slice(0, 20)) + '」的结果交接到：</span><select data-handoff="' + esc(it.id) + '" aria-label="交接到哪个项目组"><option value="">选一个项目组…</option>' +
+  return '<div class="handpick"><span>把「' + esc((me.title || "").slice(0, 20)) + '」的结果交接到：</span><select data-handoff="' + esc(me.key) + '" aria-label="交接到哪个项目组"><option value="">选一个项目组…</option>' +
     targets.map(t => { const e = chainEnd(t.latest); return '<option value="' + esc(e.type + ":" + e.id) + '" data-title="' + esc(t.title || "") + '">' + esc((t.title || "（无内容）").slice(0, 40)) + '</option>'; }).join("") +
     '</select><button class="btn" data-act="handoff-cancel">取消</button></div>';
 }
@@ -1353,7 +1454,7 @@ function boardHtml(lite){              // 共享进度板：谁在做什么、�
     const st = wait && wait.length ? "等 " + wait.join("、") + " 完成" : (BOARD_ST[t.status] || (t.status ? t.status : "仅方案"));
     const bad = t.status === "fail" || (t.status === "skipped" && !t.skip_reason);
     let h = '<div class="bl"><b style="color:' + agc(t.agent) + '">' + esc(t.agent) + "</b> · " + esc(t.title) + ' · <span class="' + (bad ? "stuck" : "") + '">' + esc(st) + "</span>" +
-      (t.kind === "think" ? ' <span class="small" style="display:inline">· 动脑</span>' : "") +
+      ' <span class="small" style="display:inline">· ' + esc(taskModel(t)) + '</span>' +
       (t.eta_min ? ' <span class="small" style="display:inline">· 预计 ' + esc(t.eta_min) + " 分钟</span>" : "");
     if (t.skip_reason) h += '<span class="small">' + esc(t.skip_reason) + "</span>";
     if (t.why) h += '<span class="small">为什么派给它：' + esc(t.why) + "</span>";
@@ -1364,8 +1465,8 @@ function boardHtml(lite){              // 共享进度板：谁在做什么、�
   return '<div class="board"><h4>共享进度板 <span class="small" style="display:inline;font-weight:400">每位成员开工前都能看到这块板' + (lite.mode === "council" ? "（会审时只看到分工，看不到别人的答案）" : "和别人已完成的摘要") + "</span></h4>" + rows + "</div>";
 }
 const T_ST = {pending:"待开始", running:"在做", ok:"完成", fail:"没完成", skipped:"跳过"};
-function taskChips(tasks){            // 一排小标签：谁、做什么、到哪了
-  return '<div class="chips">' + tasks.map(t => '<span class="chip ' + esc(t.status || "") + '" title="' + esc(t.agent + "：" + (t.title || "")) + '"><span class="dot" style="background:' + agc(t.agent) + '"></span>' +
+function taskChips(tasks){            // 一排小标签：谁、做什么、到哪了（悬停看用的模型）
+  return '<div class="chips">' + tasks.map(t => '<span class="chip ' + esc(t.status || "") + '" title="' + esc(t.agent + "：" + (t.title || "") + "\n" + taskModel(t)) + '"><span class="dot" style="background:' + agc(t.agent) + '"></span>' +
     esc(t.agent) + '<span class="t">' + esc(t.title || "") + '</span><span class="s small" style="display:inline">' + esc(T_ST[t.status] || "仅方案") + "</span></span>").join("") + "</div>";
 }
 function stepperHtml(lite, hasSyn){     // 一眼看懂走到哪一步：拆任务 → 分头做 → 汇总 → 结果
@@ -1499,6 +1600,25 @@ function viewCall(it){
   }
   return h;
 }
+const LONG_SOFT = 20, LONG_BAD = 40;
+const longOf = g => { try { return roundsTo(g.latest); } catch(e){ return 0; } };     // 一条追问链接了多少轮算长
+function roundsTo(it){                    // 从这条线开头数到这一轮，一共几轮
+  const ch = chainOf(it), base = it.type === "run" && it.rec.parent_call ? ch.find(i => i.type === "call" && i.id === it.rec.parent_call) : it;
+  let k = ch.indexOf(base || it);
+  if (k < 0) k = ch.length - 1;
+  let from = 0;                           // 压缩过的话，从最近一次压缩那里重新数
+  for (let j = k; j >= 0; j--) if (ch[j].rec && ch[j].rec.handoff && ch[j].rec.handoff.compact){ from = j; break; }
+  return k - from + 1;
+}
+const LONG_WARN = n => n >= LONG_BAD ? "这条线已经接了 " + n + " 轮，回答会明显变慢、更费额度，早期定下的细节也容易被忘。可以点「🗜 压缩」把前面压成一份说明，接着在这一组做。"
+  : n >= LONG_SOFT ? "这条线已经接了 " + n + " 轮，开始变长了。一个阶段做完时，可以点「🗜 压缩」。" : "";
+function compactBtn(it){                // 原地压缩：前面的来往压成一份说明，之后只带它往后的
+  const g = groupOf(it);
+  if (!g || g.items.length < 3) return "";
+  const end = chainEnd(g.latest);
+  return RUNNING[end.status] ? '<button class="btn" disabled title="最后一轮还在做，做完再压缩">🗜 压缩</button>'
+    : '<button class="btn" data-act="compact" data-key="' + esc(g.key) + '" title="把这一组前面的来往压成一份说明，之后接着问只带这份说明和后面几轮：更快、更省额度，早期定下的也不会忘">🗜 压缩</button>';
+}
 function chainOf(it){                 // 一串连续追问：从最早一条到最新一条
   const all = items(), byKey = {};
   all.forEach(i => { byKey[i.type + ":" + i.id] = i; });
@@ -1523,12 +1643,16 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
   for (const t of turns){
     const r = t.rec;
     if (r.kind === "handoff"){
-      const full = need("call", r.id, "ok") || {}, hf = r.handoff || {}, key = "hand:" + r.id;
+      const full = need("call", r.id, "ok" + ((r.handoff || {}).digest || "")) || {}, hf = r.handoff || {}, key = "hand:" + r.id;
       if (full.answer) copyStore[key] = full.answer;
-      h += '<div class="handcard"><div class="who">⇢ 交接进来：「' + esc(hf.name || "") + '」的结果</div>' +
+      const dg = hf.digest === "running" && Date.now() / 1000 - (r.start || 0) < 1800 ? "正在把整组 " + (hf.rounds || "") + " 轮压缩成交接说明，好了会自动换上…"
+        : hf.digest === "ok" ? "整组 " + (hf.rounds || "") + " 轮已压缩成交接说明" : hf.digest ? "整组压缩没成功（" + (hf.digest_error || "原因不明") + "），先用的是最近几轮的内容" : "";
+      const cp = !!hf.compact;
+      const dg2 = cp ? dg.replace("交接说明", "说明") : dg;
+      h += '<div class="handcard"><div class="who">' + (cp ? "🗜 压缩：前面 " + esc(hf.rounds || "") + " 轮压成了一份说明，后面只带它往后的" : "⇢ 交接进来：「" + esc(hf.name || "") + "」的结果") + '</div>' + (dg2 ? '<div class="small">' + esc(dg2) + '</div>' : "") +
         (hf.from ? '<button class="job" data-act="select" data-type="' + esc(hf.from.type) + '" data-id="' + esc(hf.from.id) + '">打开来源那一组</button>' : "") +
-        '<button class="job" data-act="handoff-undo" data-id="' + esc(r.id) + '" title="去掉这次交接，两个项目组重新分开">↩ 撤销交接</button>' +
-        '<details><summary>看交接的内容</summary>' + (full.answer ? '<div class="md">' + md(full.answer) + '</div>' : '<div class="small">载入中…</div>') + '</details></div>';
+        '<button class="job" data-act="handoff-undo" data-id="' + esc(r.id) + '" title="' + (cp ? "去掉这次压缩，之后追问照旧带上前面的来往" : "从这一组里去掉这次交接，之后追问不再带上它") + '">↩ 撤销' + (cp ? "压缩" : "交接") + '</button>' +
+        '<details><summary>' + (cp ? "看压缩出来的说明" : "看交接的内容") + '</summary>' + (full.answer ? '<div class="md">' + md(full.answer) + '</div>' : '<div class="small">载入中…</div>') + '</details></div>';
       continue;
     }
     h += '<div class="me">' + esc(t.title || "") + thumbsHtml(r.images) + "</div>";
@@ -1578,7 +1702,7 @@ function renderView(){
   if (s && !s.isCollapsed && $("view").contains(s.anchorNode)) return;   // 用户正在选文字，先不重绘
   const v = $("view"), st = v.scrollTop, keep = last.viewKey === (sel ? sel.type + sel.id : "new"),
     atEnd = v.scrollHeight - v.scrollTop - v.clientHeight < 60;   // 原来就停在最底下
-  v.innerHTML = h; last.view = h; last.viewKey = sel ? sel.type + sel.id : "new";
+  v.innerHTML = h; last.view = h; last.viewKey = sel ? sel.type + sel.id : "new"; syncActbar();
   const sticks = {};
   v.querySelectorAll("[data-stick]").forEach((el, i) => { sticks[i] = el; });
   const isChat = it && it.type === "call" && (it.rec.kind === "chat" || it.rec.kind === "handoff");
@@ -1616,6 +1740,8 @@ function renderComposer(){
   $("cwd").style.display = showCwd && mode !== "image" ? "" : "none";
   $("cwd").placeholder = "工作目录，留空则用 " + (S ? S.workspace : "默认目录");
   $("dtog").textContent = (showCwd ? "▾" : "▸") + " 目录";
+  const mm = ms.find(m => m[0] === mode);
+  $("mopt").textContent = (mm ? mm[1] : mode) + (mode === "chat" && contact !== "auto" ? "·" + contact : "") + (mode === "image" ? "" : allowWrite ? " · 放开" : " · 只读") + (document.body && document.body.classList && document.body.classList.contains("copts") ? " ▴" : " ▾");
   let it = ctx && findItem(ctx);
   if (ctx && !it) ctx = null;
   if (it && mode === "image") it = null;   // 画图时不带上文
@@ -1625,6 +1751,10 @@ function renderComposer(){
   $("ctx").innerHTML = it && forking ? '<div class="ctx fork"><span>⑂ 从「' + esc((it.title || "").slice(0, 30)) + '」分叉：另开一条线，带上到这里为止的上下文</span><button data-act="noctx" title="取消分叉">✕</button></div>'
     : it ? '<div class="ctx"><span>↩ 接着这条追问：' + esc((it.title || "").slice(0, 40)) + (partial ? "（上一轮还在做，只带上已完成的部分）" : "") + '</span><button data-act="noctx" title="不带上文，作为新任务">✕</button></div>'
     : back ? '<div class="ctx off"><span>作为新任务发送，不带上文</span><button data-act="yesctx" title="重新接着当前这条追问">↩ 改回接着追问</button></div>' : "";
+  if (it && !forking){                    // 追问链太长：提醒另起一组
+    const n = roundsTo(it), w = LONG_WARN(n);
+    if (w){ const g = groupOf(it); $("ctx").innerHTML += '<div class="ctxwarn' + (n >= LONG_BAD ? " bad" : "") + '">' + esc(w) + (g && !RUNNING[chainEnd(g.latest).status] ? ' <button class="job" data-act="compact" data-key="' + esc(g.key) + '">🗜 现在压缩</button>' : "") + '</div>'; }
+  }
   $("txt").placeholder = it && forking ? "在新的分叉里说点什么…" : it ? "接着说，会带上前面的对话和结果…" : mode === "image" ? "描述想要的画面…" : mode === "chat" ? "跟对接人说说你想做什么…" : "想让团队做什么？";
   $("send").disabled = sending || !$("txt").value.trim();
 }
@@ -1664,6 +1794,7 @@ async function send(){
     if (body.fork){ forking = false; toast("已分叉出一条新线"); }
     if (body.images){ pendImgs.main = []; renderAtt("main"); }
     if ($("txt").value.trim() === text) $("txt").value = "";
+    if (document.body.classList) document.body.classList.remove("copts");
     saveDraft();
     autosize();
     toast("已交给" + (mode === "chat" ? "对接人" : mode === "run" ? "团队" : mode === "pressure" ? "高压团队" : mode === "council" ? "会审" : mode === "image" ? " gpt 画图" : " " + mode));
@@ -1712,7 +1843,12 @@ async function poll(){
     const n = items().find(i => i.rec.submission_id === pendingSubmission);
     if (n){ sel = {type:n.type, id:n.id}; ctx = sel; followLatest = false; }
   }
-  checkDone(); renderList(); renderRail(); renderView(); renderComposer(); renderSide();
+  checkDone(); renderList(); renderRail(); renderView(); renderComposer(); renderSide(); renderAwake();
+}
+function renderAwake(){
+  const b = $("tb-awake"); if (!b || !b.classList || !S) return;
+  b.classList.toggle("primary", !!S.awake);
+  b.innerHTML = S.awake ? '☀<span class="tx"> 不休眠中</span>' : '☾<span class="tx"> 会休眠</span>';
 }
 function syncTabs(){
   const b = document.body.classList, v = b.contains("side-open") ? "list" : b.contains("rail-open") ? "team" : "view";
@@ -1726,6 +1862,27 @@ function select(type, id){
 }
 
 /* ---------- 事件 ---------- */
+// 记录页往下翻时，操作按钮那一行一直贴在顶上；翻过标题后加一道分隔线
+const syncActbar = () => { const v = $("view"), b = v && v.querySelector && v.querySelector(".actbar"); if (b) b.classList.toggle("stuck", v.scrollTop > (b.offsetTop || 0) - 4 && v.scrollTop > 0); };
+document.addEventListener("scroll", e => { if (e.target && e.target.id === "view") syncActbar(); }, true);
+// 左栏拖放：把项目组拖到文件夹上放进去，拖到「项目组」「单独提问」标题上拿出来
+document.addEventListener("dragstart", e => {
+  const d = e.target.closest && e.target.closest("[data-drag]");
+  if (d){ e.dataTransfer.setData("text/hub-key", d.dataset.drag); e.dataTransfer.effectAllowed = "move"; }
+});
+document.addEventListener("dragover", e => {
+  const z = e.target.closest && e.target.closest("[data-drop]");
+  if (z && [...e.dataTransfer.types].includes("text/hub-key")){ e.preventDefault(); document.querySelectorAll(".dropon").forEach(x => x !== z && x.classList.remove("dropon")); z.classList.add("dropon"); }
+});
+document.addEventListener("dragleave", e => { const z = e.target.closest && e.target.closest("[data-drop]"); if (z && !z.contains(e.relatedTarget)) z.classList.remove("dropon"); });
+document.addEventListener("drop", e => {
+  const z = e.target.closest && e.target.closest("[data-drop]"), k = e.dataTransfer.getData("text/hub-key");
+  document.querySelectorAll(".dropon").forEach(x => x.classList.remove("dropon"));
+  if (!z || !k) return;
+  e.preventDefault();
+  const cur = (((S && S.folders) || {}).of || {})[k] || "";
+  if (cur !== z.dataset.drop) folderMove([k], z.dataset.drop);
+});
 document.addEventListener("click", async e => {
   const el = e.target.closest("[data-act]");
   if (!el) return;
@@ -1770,15 +1927,42 @@ document.addEventListener("click", async e => {
     else if (act === "noctx"){ if (forking){ forking = false; ctx = sel; } else ctx = null; renderComposer(); }
     else if (act === "fork"){ ctx = {type: el.dataset.type, id: el.dataset.id}; forking = true; renderComposer(); $("txt").focus(); toast("已准备分叉：发出的话会另开一条线"); }
     else if (act === "yesctx"){ ctx = sel; renderComposer(); $("txt").focus(); }
+    else if (act === "mopt"){ document.body.classList.toggle("copts"); last.modes = null; renderComposer(); }
+    else if (act === "awake"){
+      try { const r = await api("/api/awake", {on: !(S && S.awake)}); if (S) S.awake = r.on; renderAwake(); toast(r.on ? "已打开不休眠：面板开着时电脑不会自动睡眠（合上盖子仍会睡）" : "已关闭不休眠，电脑恢复平时的睡眠设置"); }
+      catch(err){ toast(err.message); }
+    }
     else if (act === "sidewin"){ sideOpen = !sideOpen; last.side = last.sideCtl = last.rail = ""; renderSide(); renderRail(); if (sideOpen) $("sw-txt").focus(); }
     else if (act === "side-send") await sendSide();
-    else if (act === "handoff-arm"){ handoffArm = el.dataset.id; last.view = ""; renderView(); }
+    else if (act === "handoff-arm"){ handoffArm = handoffArm === el.dataset.id ? null : el.dataset.id; last.view = last.list = ""; renderView(); renderList(); }
     else if (act === "handoff-undo"){
-      if (!confirm("撤销这次交接？两个项目组会重新分开，交接内容不再带给后面的追问。")) return;
+      if (!confirm("撤销这次交接？这一组里的交接内容会去掉，之后追问不再带上它；来源那组不受影响。")) return;
       try { const r = await api("/api/handoff/undo", {id: el.dataset.id}); toast("已撤销交接"); await poll(); if (r.back) select(r.back.type, r.back.id); else select(null); }
       catch (e){ toast(e.message || "撤销失败"); }
     }
-    else if (act === "handoff-cancel"){ handoffArm = null; last.view = ""; renderView(); }
+    else if (act === "handoff-cancel"){ handoffArm = null; last.view = last.list = ""; renderView(); renderList(); }
+    else if (act === "compact"){
+      const {projects, solos} = groups(), pg = projects.find(p => p.id === el.dataset.key);
+      if (!pg) return;
+      const end = chainEnd(pg.latest);
+      if (!confirm("把「" + (pg.title || "这一组") + "」前面的 " + pg.items.length + " 件来往压成一份说明？\n要一两分钟，压好自动换上。之后在这一组接着问，只带这份说明和后面的几轮。原来的记录都还在，也可以撤销。")) return;
+      try { const r = await api("/api/compact", {at: {type: end.type, id: end.id}, keys: pg.items.map(akey), title: pg.title || ""}); toast("开始压缩，好了会自动换上"); await poll(); select("call", r.id); }
+      catch(err){ toast(err.message); }
+    }
+    else if (act === "folder-new"){
+      const name = (prompt("新文件夹叫什么？") || "").trim();
+      if (name){ try { const r = await api("/api/folders", {op: "create", name}); openFolders.add(r.id); saveOpenFolders(); toast("已新建「" + name + "」，把项目组拖进去或点项目组上的 📁"); } catch(err){ toast(err.message); } last.list = ""; poll(); }
+    }
+    else if (act === "folder-tog"){ const id = el.dataset.id; openFolders.has(id) ? openFolders.delete(id) : openFolders.add(id); saveOpenFolders(); last.list = ""; renderList(); }
+    else if (act === "folder-rename"){
+      const name = (prompt("文件夹改叫什么？", el.dataset.name || "") || "").trim();
+      if (name && name !== el.dataset.name){ try { await api("/api/folders", {op: "rename", id: el.dataset.id, name}); } catch(err){ toast(err.message); } last.list = ""; poll(); }
+    }
+    else if (act === "folder-del"){
+      if (confirm("删掉文件夹「" + (el.dataset.name || "") + "」？里面的项目组会放回外面，记录不会删。")){ try { await api("/api/folders", {op: "delete", id: el.dataset.id}); toast("文件夹已删，里面的项目组放回外面了"); } catch(err){ toast(err.message); } last.list = ""; poll(); }
+    }
+    else if (act === "folder-pick"){ folderArm = folderArm === el.dataset.key ? null : el.dataset.key; last.list = ""; renderList(); }
+    else if (act === "folder-cancel"){ folderArm = null; last.list = ""; renderList(); }
     else if (act === "rename"){
       const v = prompt("给它起个名字（清空就恢复成自动的名字）", el.dataset.name || "");
       if (v === null) return;
@@ -1801,7 +1985,7 @@ document.addEventListener("click", async e => {
     }
     else if (act === "side"){ document.body.classList.toggle("side-open"); syncTabs(); }
     else if (act === "settings"){ settingsOpen = !settingsOpen; railBusyUntil = 0; if (settingsOpen) loadPair(); renderRail(); $("rail").scrollTop = 0; }
-    else if (act === "tab"){
+    else if (act === "tab"){ document.body.classList.remove("copts");
       const v = el.dataset.v;
       document.body.classList.toggle("side-open", v === "list");
       document.body.classList.toggle("rail-open", v === "team");
@@ -1888,13 +2072,16 @@ document.addEventListener("change", async e => {
     catch(err){ toast(err.message); el.blur(); last.rail = ""; poll(); }
     return;
   }
+  if (el.dataset && el.dataset.folderMove !== undefined){ folderMove([el.dataset.folderMove], el.value); return; }
   if (el.dataset && el.dataset.handoff && el.value){
-    const it = findItem(sel), me = it && groupOf(it), src = me && chainEnd(me.latest);
+    const {projects, solos} = groups(), key = el.dataset.handoff;
+    const pg = projects.find(p => p.id === key), si = !pg && solos.find(x => akey(x) === key);
+    const me = pg ? {title: pg.title, latest: pg.latest, keys: pg.items.map(akey)} : si ? {title: nameOf(si), latest: si, keys: [akey(si)]} : null, src = me && handSrc(me.latest);
     const opt = el.options[el.selectedIndex], dstTitle = opt.dataset.title || opt.text, [type, id] = el.value.split(":");
-    if (!src || !confirm("把「" + (me.title || "") + "」做出来的结果交接到「" + dstTitle + "」？\n之后在那一组接着问，就会带上这些内容；两组会在左边合成一组。")){ el.value = ""; return; }
+    if (!src || !confirm("把「" + (me.title || "") + "」做出来的结果交接到「" + dstTitle + "」？\n会把整组 " + me.keys.length + " 轮压缩成一份交接说明（要一两分钟，先用最近几轮顶着）。之后在那一组接着问，就会带上它；这一组照旧留着，以后还能再交接给别的组。")){ el.value = ""; return; }
     try {
-      const r = await api("/api/handoff", {from: {type: src.type, id: src.id}, to: {type, id}, title: me.title || ""});
-      handoffArm = null; toast("已交接到「" + dstTitle + "」，在那边接着问就能用上"); await poll(); select("call", r.id);
+      const r = await api("/api/handoff", {from: {type: src.type, id: src.id}, to: {type, id}, title: me.title || "", keys: me.keys});
+      handoffArm = null; last.list = ""; toast("已交接到「" + dstTitle + "」，在那边接着问就能用上"); await poll(); select("call", r.id);
     } catch(err){ toast(err.message || "没交接成功"); el.value = ""; }
     return;
   }
@@ -1914,10 +2101,10 @@ document.addEventListener("change", async e => {
     else if (k === "web") sideWeb = el.checked;
     el.blur(); last.sideCtl = ""; renderSide(); return;
   }
-  if (el.dataset && (el.dataset.thinkSpec || el.dataset.thinkEff)){
-    const who = el.dataset.thinkSpec || el.dataset.thinkEff;
-    const body = el.dataset.thinkSpec ? {think: {agent: who, spec: el.value}} : {think: {agent: who, effort: el.value}};
-    try { await api("/api/config", body); toast(who + " 动脑时" + (el.dataset.thinkSpec ? "用的模型" : "的档位") + "已改成「" + el.options[el.selectedIndex].text + "」，下次动脑的活生效"); }
+  if (el.dataset && (el.dataset.tierSpec || el.dataset.tierEff)){
+    const who = el.dataset.tierSpec || el.dataset.tierEff, tier = el.dataset.tier, nm = TIER_NAME[tier] || tier;
+    const body = {[tier]: el.dataset.tierSpec ? {agent: who, spec: el.value} : {agent: who, effort: el.value}};
+    try { await api("/api/config", body); toast(who + " 做" + nm + "的活时" + (el.dataset.tierSpec ? "用的模型" : "的档位") + "已改成「" + el.options[el.selectedIndex].text + "」，下次生效"); }
     catch(err){ toast(err.message); }
     el.blur(); last.rail = ""; poll(); return;
   }

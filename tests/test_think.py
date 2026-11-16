@@ -52,6 +52,25 @@ class Think(unittest.TestCase):
         self.assertIn('"kind": "work"', self.g["PLAN_PROMPT"])
         self.assertNotIn("最多有", self.g["PLAN_PROMPT"])
 
+    def test_design_and_copy_tiers(self):
+        self.cfg["design"] = {"gemini": {"spec": "agy:m-flash", "effort": ""}}
+        _, spec = self.run_ask("gemini", tier="design")
+        self.assertEqual(spec, "agy:m-flash")
+        _, spec = self.run_ask("gemini", tier="copy")
+        self.assertEqual(spec, "agy:m-medium", "文案没设就跟干活一样")
+        self.assertIn("审美用", self.g["tier_roster"](self.cfg, "gemini"))
+        self.assertIn("design", self.g["PLAN_PROMPT"])
+
+    def test_plan_prompt_allows_named_model(self):
+        P = self.g["PLAN_PROMPT"]
+        self.assertIn("{models}", P)
+        self.assertIn("点名", P)
+
+    def test_spec_label_families(self):
+        L = self.g["spec_label"]
+        self.assertEqual(L("agy:gemini-4-hydrogen-xhigh"), "Gemini Hydrogen·超高")
+        self.assertEqual(L("agy:gemini-4-argon-low"), "Gemini Argon·低")
+
     def test_chat_prompt_states_permission(self):
         P = self.g["CHAT_PROMPT"]
         self.assertIn("{perm_note}", P)

@@ -90,6 +90,17 @@ class HubTests(unittest.TestCase):
             self.assertIsNone(g['stop_record']('call', 'c_abc'))
         self.assertEqual(g['read_json'](path)['error'], g['STOP_MSG'])
 
+    def test_plan_named_model(self):
+        g = self.g
+        tasks = [dict(id='a', agent='gemini', prompt='p', spec='agy:flash'), dict(id='b', agent='gemini', prompt='p', spec='agy:gone')]
+        with patch.dict(g, {'ask': lambda *a, **k: (json.dumps({'tasks': tasks}), 'fake'),
+                            'backend_choices': lambda c: [{'spec': 'agy:flash', 'label': 'F'}, {'spec': 'agy:gone', 'label': 'G', 'off': True}]}):
+            plan = g['make_plan'](self.cfg, 'test', self.tmp.name, False, 'gemini', 6)
+        a, b = plan['tasks']
+        self.assertEqual((a['spec'], a['plan_spec']), ('agy:flash', 'agy:flash'))
+        self.assertIsNone(b['spec'])
+        self.assertIn('用不了', b['why'])
+
     def test_plan_rejects_cycle_and_dry_saved(self):
         g = self.g
         def task(tid, deps):

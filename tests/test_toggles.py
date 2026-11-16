@@ -27,7 +27,8 @@ class ToggleTests(unittest.TestCase):
         cfg["disabled_models"] = ["codex", "dsh"]
         a = g["active_cfg"](cfg)
         self.assertEqual(a["agents"], {"gpt": ["agy:x"]}, "停用的模型从备用链里去掉；全被去掉的成员也不参与")
-        self.assertEqual(a["auto_title"], "", "起名的人用不了就不起名")
+        self.assertEqual(a["auto_title"], "gpt", "起名的人用不了就换一位启用的接手")
+        self.assertEqual(g["active_cfg"](dict(cfg, auto_title=""))["auto_title"], "", "用户关了起名就不补人")
         self.assertIn("ds", a["_disabled_agents"])
 
     def test_ask_and_roster(self):

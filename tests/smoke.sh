@@ -7,6 +7,7 @@ trap 'rm -rf "$HUB_TEST_HOME"' EXIT HUP INT TERM
 export HUB_HOME="$HUB_TEST_HOME"
 unset HUB_PARENT HUB_RUN HUB_DEPTH HUB_META HUB_READONLY
 export PYTHONDONTWRITEBYTECODE=1
+export HUB_NO_AWAKE=1
 export HUB_NO_AUTOTITLE=1  # 自动起名会真的叫模型，离线测试里关掉
 python3 - <<'PY'
 import ast
@@ -33,6 +34,9 @@ python3 tests/test_toggles.py
 python3 tests/test_denied.py
 python3 tests/test_busy.py
 python3 tests/test_think.py
+python3 tests/test_awake.py
+python3 tests/test_folders.py
+python3 tests/test_digest.py
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js
