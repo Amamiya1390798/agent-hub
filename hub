@@ -1414,8 +1414,8 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
     if _stopping.is_set():
         raise BackendError(STOP_MSG)
     cwd = os.path.abspath(cwd or os.getcwd())
-    if not os.path.isdir(cwd):
-        raise BackendError("工作目录不存在：%s" % cwd)
+    if not ensure_cwd(cwd):
+        raise BackendError("工作目录不存在，也没法自动建：%s" % cwd)
     timeout = timeout or cfg["timeout"]
     chain = list(cfg["agents"][agent])
     if not chain:
@@ -1878,10 +1878,29 @@ def write_board_md(run_dir, state):
         pass
 
 
+def ensure_cwd(cwd):
+    """工作目录不存在时自动建好：默认的 workspace 一律建；用户填的目录只在家目录里才建（防止手滑建到系统目录）。
+    建不了返回 False。"""
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    if os.path.isdir(cwd):
+        return True
+    if os.path.exists(cwd):
+        return False  # 同名的是个文件
+    home = os.path.realpath(HOME)
+    real = os.path.realpath(cwd)
+    if not (os.path.abspath(cwd) == os.path.abspath(UI_WORKSPACE) or real.startswith(home + os.sep)):
+        return False
+    try:
+        os.makedirs(cwd, exist_ok=True)
+    except OSError:
+        return False
+    return os.path.isdir(cwd)
+
+
 def _open_run(cfg, goal, cwd, write, **fields):
     cwd = os.path.abspath(cwd or os.getcwd())
-    if not os.path.isdir(cwd):
-        raise BackendError("工作目录不存在：%s" % cwd)
+    if not ensure_cwd(cwd):
+        raise BackendError("工作目录不存在，也没法自动建：%s" % cwd)
     os.makedirs(RUNS_DIR, exist_ok=True)
     run_id = time.strftime("%Y%m%d-%H%M%S")
     while True:
@@ -4009,8 +4028,9 @@ def serve_ui(port, me):
                 side.append("--web")
         if mode == "chat" and agent not in list(c["agents"]) + ["auto"]:
             raise ValueError("没有这个联络人")
-        if not os.path.isdir(cwd):
-            raise ValueError("工作目录不存在：%s" % (body.get("cwd") or cwd))
+        if not ensure_cwd(cwd):
+            raise ValueError("工作目录不存在，也没法自动建（只会在你的个人文件夹里自动建）：%s" % (body.get("cwd") or cwd))
+        cwd = os.path.abspath(cwd)
         meta = {"display": text, "submission_id": uuid.uuid4().hex}
         imgs = body.get("images") or []
         if not isinstance(imgs, list) or len(imgs) > MAX_IMAGES or not all(attachment_path(n) for n in imgs):

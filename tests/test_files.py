@@ -43,6 +43,17 @@ class Files(unittest.TestCase):
         with self.assertRaises(ValueError):
             v(os.path.join(self.home, ".ssh/id_rsa"))
 
+    def test_ensure_cwd(self):
+        e = self.g["ensure_cwd"]
+        import shutil
+        shutil.rmtree(self.ws)
+        self.assertTrue(e(self.ws) and os.path.isdir(self.ws), "默认工作目录被删了也会重建")
+        new = os.path.join(self.home, "Documents/新项目/子目录")
+        self.assertTrue(e(new) and os.path.isdir(new), "家目录里填的新目录自动建")
+        self.assertFalse(e(os.path.join(self.home, "Documents/项目/out.txt")), "同名是文件时不建")
+        outside = os.path.join(tempfile.mkdtemp(), "x")
+        self.assertFalse(e(outside) or os.path.exists(outside), "家目录外的不自动建")
+
     def test_open_ext(self):
         self.assertNotIn(".command", self.g["FILE_OPEN_EXT"])
         self.assertNotIn(".app", self.g["FILE_OPEN_EXT"])
