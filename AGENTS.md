@@ -35,6 +35,8 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 
 默认分工（写在提示词和 `profiles` 里）：Gemini 干执行类的活并默认负责排工和汇总；Claude、GPT 负责拍板和审查，画图只有 GPT 能做；DeepSeek 做零碎小活。
 
+**找命令行程序**：`find_bin(cfg, name)` 先看配置 `bins` 里的完整路径（不存在就忽略，改按名字找），再依次找当前 PATH、家目录常见目录（`BIN_DIRS`：`.local/bin`、`.npm-global/bin`、`.bun/bin` 等）、`/opt/homebrew/bin` 等（`SYS_BIN_DIRS`）、应用包里自带的（`APP_BINS`），最后问一次登录 shell 的 PATH（`login_shell_path()`，有缓存；测试里设 `HUB_NO_SHELL_PATH=1` 关掉）。因为从 Hub.app 或访达启动时 PATH 往往只有 `/usr/bin:/bin`。`clean_env()` 也把这些目录补进子进程的 PATH。找不到时报错用 `missing_bin_text()`，以「这台电脑上没找到」开头。
+
 前一个模型失败（超时、未登录、额度用完）时，`ask()` 会按链顺序自动换下一个，记录里会标明实际用了哪个。
 
 **思考等级**：配置 `effort` 是 `{成员: 档位}`，档位名沿用各模型自己的（`effort_levels(spec)`）：GPT 读 `~/.codex/models_cache.json` 里该模型的 `supported_reasoning_levels`，以 `-c model_reasoning_effort=…` 传入；Claude 是 `low/medium/high/xhigh/max`，以 `--effort` 传入；Gemini 的档位是不同的模型名（如 `gemini-4-carbon-high`），面板通过换模型来调；DeepSeek 不支持。模型不支持所选档位时不传。旧配置 `codex_effort` 只在成员没单独设过时作为 GPT 的后备。

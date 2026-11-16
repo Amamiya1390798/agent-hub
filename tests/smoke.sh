@@ -8,6 +8,7 @@ export HUB_HOME="$HUB_TEST_HOME"
 unset HUB_PARENT HUB_RUN HUB_DEPTH HUB_META HUB_READONLY
 export PYTHONDONTWRITEBYTECODE=1
 export HUB_NO_AWAKE=1
+export HUB_NO_SHELL_PATH=1  # 找命令行时不去问登录 shell，测试结果不受本机环境影响
 export HUB_NO_AUTOTITLE=1  # 自动起名会真的叫模型，离线测试里关掉
 python3 - <<'PY'
 import ast
@@ -38,6 +39,7 @@ python3 tests/test_awake.py
 python3 tests/test_folders.py
 python3 tests/test_digest.py
 python3 tests/test_files.py
+python3 tests/test_bins.py
 node tests/test_ui_files.js
 node tests/test_ui.js
 node tests/test_ui_layout.js

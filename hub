@@ -271,18 +271,71 @@ def disabled_reason(cfg, agent):
     return "%s 的模型都停用了（在设置的「可用模型」里勾回来）" % agent
 
 
+_SHELL_PATH = {}
+
+
+def login_shell_path():
+    """用户终端里的 PATH。从 Hub.app、访达或开机启动时进程拿到的 PATH 很短（常常只有 /usr/bin:/bin），
+    装在 Homebrew、npm 全局目录等处的命令行就找不到，所以问一次登录 shell 并缓存。"""
+    if "v" not in _SHELL_PATH:
+        v = ""
+        sh = os.environ.get("SHELL") or "/bin/zsh"
+        if os.path.isfile(sh) and not os.environ.get("HUB_NO_SHELL_PATH"):
+            try:
+                out = subprocess.run([sh, "-lic", "printf '__HUBPATH__%s__HUBPATH__' \"$PATH\""], stdin=subprocess.DEVNULL,
+                                     capture_output=True, text=True, timeout=8).stdout
+                m = re.search(r"__HUBPATH__(.*?)__HUBPATH__", out or "", re.S)
+                v = m.group(1).strip() if m else ""
+            except (OSError, subprocess.SubprocessError):
+                v = ""
+        _SHELL_PATH["v"] = v
+    return _SHELL_PATH["v"]
+
+
+BIN_DIRS = (".local/bin", "bin", ".npm-global/bin", ".bun/bin", ".volta/bin", ".cargo/bin", ".antigravity/bin", ".codex/bin", ".claude/local")
+SYS_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin")
+APP_BINS = {
+    "codex": ["/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex", "/Applications/Codex.app/Contents/Resources/codex"],
+    "dsh": ["/Applications/DeepSeek Harness.app/Contents/Resources/bin/dsh", "/Applications/DeepSeek Harness.app/Contents/MacOS/dsh"],
+}
+
+
 def find_bin(cfg, name):
-    p = cfg["bins"].get(name) or ""
+    p = (cfg.get("bins") or {}).get(name) or ""
+    ok = lambda x: bool(x) and os.path.isfile(x) and os.access(x, os.X_OK)
     if p and os.path.sep in p:
-        return p if (os.path.isfile(p) and os.access(p, os.X_OK)) else None
-    found = shutil.which(p or name) or shutil.which(name, path=os.path.join(HOME, ".local/bin"))
+        p = os.path.expanduser(p)
+        if ok(p):
+            return p
+        p = ""  # 填的路径在这台电脑上不存在（比如照搬了别人的配置）：照常按名字找
+    base = os.path.basename(p) if p else name
+    extra = os.pathsep.join([os.path.join(HOME, d) for d in BIN_DIRS] + list(SYS_BIN_DIRS))
+    found = shutil.which(base) or shutil.which(base, path=extra)
     if found:
         return found
+    for c in APP_BINS.get(name, []):
+        if ok(c):
+            return c
     if name == "claude":
         cands = sorted(glob.glob(os.path.join(
             HOME, "Library/Application Support/Claude/claude-code/*/*/claude.app/Contents/MacOS/claude")))
-        return cands[-1] if cands else None
-    return None
+        if cands:
+            return cands[-1]
+    sp = login_shell_path()
+    return (shutil.which(base, path=sp) if sp else None) or None
+
+
+BIN_HELP = {
+    "agy": "这台电脑上没找到 Antigravity 的命令行工具 agy（只装了 Antigravity 软件还不够，要另外装它的命令行）",
+    "codex": "这台电脑上没找到 Codex 命令行（装 ChatGPT 桌面版或 Codex 命令行都行）",
+    "claude": "这台电脑上没找到 Claude Code 命令行",
+    "dsh": "这台电脑上没找到 DeepSeek Harness 的命令行 dsh",
+}
+
+
+def missing_bin_text(name):
+    return BIN_HELP.get(name, "这台电脑上没找到 %s 的命令行程序" % name) + \
+        "。装好后回 Hub 点「检查全部」；装在不常见的位置的话，可以在 ~/.agent-hub/config.json 的 bins 里写上完整路径；暂时不用这位成员，就在团队页把他关掉。"
 
 
 def shq(v):
@@ -307,7 +360,11 @@ def clean_env(extra=None):
         env["HUB_PARENT"] = _ctx.call_id
     if getattr(_ctx, "run_id", None):
         env["HUB_RUN"] = _ctx.run_id
-    env["PATH"] = os.path.join(HOME, ".local/bin") + os.pathsep + env.get("PATH", "")
+    parts = [os.path.join(HOME, ".local/bin")] + env.get("PATH", "").split(os.pathsep)
+    # 从 Hub.app 启动时 PATH 很短：补上常见目录，不然 npm 装的命令行（#!/usr/bin/env node）找不到 node
+    parts += [os.path.join(HOME, d) for d in BIN_DIRS] + list(SYS_BIN_DIRS) + (_SHELL_PATH.get("v") or "").split(os.pathsep)
+    seen = set()
+    env["PATH"] = os.pathsep.join(x for x in parts if x and not (x in seen or seen.add(x)))
     if os.environ.get("HUB_READONLY") == "1" or not getattr(_ctx, "write", True):
         env["HUB_READONLY"] = "1"  # 只读任务里队友再调 hub 也只能只读（会审等不能被绕成可写）
     if extra:
@@ -568,6 +625,7 @@ DENIED_PREFIX = "权限不够"
 ERROR_KINDS = [  # (匹配原始报错的关键词, 一句人话, 一句建议)；按顺序先匹配先用
     ((DENIED_PREFIX,), "没有权限：只读模式下不能读工作目录以外的文件、运行命令或操作别的软件",
      "这件事需要更多权限：发送时勾上「可改文件」再试；只是要读资料的话，把文件放进工作目录"),
+    (("这台电脑上没找到",), "这台电脑上没装这位成员要用的命令行软件", "装好后点「检查全部」；暂时不用就在团队页把这位成员关掉"),
     (("已手动停止", "signal 15", "sigterm"), "被手动停止了", "需要的话可以点「重新执行」"),
     (("卡住了（",), "有一阵子没有任何动静，已经停下了", "可以换一位成员接着做，已写出的部分会保留"),
     (("空转（",), "一直反复做同一件事，已经停下了", "换一位成员接着做，或说清楚下一步要做什么"),
@@ -867,7 +925,7 @@ def agy_perm_args(write):
 def backend_agy(cfg, model, prompt, cwd, write, timeout):
     exe = find_bin(cfg, "agy")
     if not exe:
-        raise BackendError("未安装 agy（Antigravity CLI）")
+        raise BackendError(missing_bin_text("agy"))
     tmp = None
     if len(prompt.encode("utf-8")) > 60000:  # 太长就落盘到工作目录，让它自己读
         try:
@@ -949,7 +1007,7 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
 def backend_codex(cfg, model, prompt, cwd, write, timeout):
     exe = find_bin(cfg, "codex")
     if not exe:
-        raise BackendError("未找到 codex CLI")
+        raise BackendError(missing_bin_text("codex"))
     fd, outfile = tempfile.mkstemp(suffix=".txt", prefix="hub-codex-")
     os.close(fd)
     sandbox = ("danger-full-access" if cfg.get("gpt_full_access") else "workspace-write") if write else "read-only"
@@ -1015,7 +1073,7 @@ def backend_codex(cfg, model, prompt, cwd, write, timeout):
 def backend_dsh(cfg, model, prompt, cwd, write, timeout):
     exe = find_bin(cfg, "dsh")
     if not exe:
-        raise BackendError("未安装 dsh")
+        raise BackendError(missing_bin_text("dsh"))
     env = clean_env({"DSH_PERMISSION_MODE": "danger-full-access" if write else "read-only"})
     cmd = [exe, "--patch", DSH_PATCH, "--profile", "headless", "--json"] + \
         (["--session-id", cfg["_resume"]] if cfg.get("_resume") else []) + ["-"]
@@ -1069,7 +1127,7 @@ def backend_dsh(cfg, model, prompt, cwd, write, timeout):
 def backend_claude(cfg, model, prompt, cwd, write, timeout):
     exe = find_bin(cfg, "claude")
     if not exe:
-        raise BackendError("未找到 claude CLI")
+        raise BackendError(missing_bin_text("claude"))
     cmd = [exe, "-p", "--model", model or "opus",
            "--permission-mode", "bypassPermissions" if write else "plan"]  # 允许改文件=无人值守：命令、本机软件都放行（和 Gemini 一致）；acceptEdits 只放行改文件，命令会被拦
     if cfg.get("_effort") in CLAUDE_EFFORTS:
@@ -3353,7 +3411,7 @@ def open_login(cfg, kind):
         return
     exe = find_bin(cfg, kind)
     if not exe:
-        raise ValueError("找不到 %s 的命令行程序" % kind)
+        raise ValueError(missing_bin_text(kind))
     tail = {"claude": " /login", "codex": " login", "agy": ""}.get(kind)
     if tail is None:
         raise ValueError("不知道怎么登录 %s" % kind)
