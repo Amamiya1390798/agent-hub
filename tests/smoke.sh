@@ -37,6 +37,8 @@ python3 tests/test_think.py
 python3 tests/test_awake.py
 python3 tests/test_folders.py
 python3 tests/test_digest.py
+python3 tests/test_files.py
+node tests/test_ui_files.js
 node tests/test_ui.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js

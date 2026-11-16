@@ -26,6 +26,7 @@ import heapq
 import json
 import os
 import re
+from urllib.parse import unquote, urlparse
 import shutil
 import signal
 import subprocess
@@ -2796,6 +2797,61 @@ def ui_run(rid):
     return r
 
 
+FILE_TEXT_EXT = {".md", ".markdown", ".txt", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".py", ".js", ".ts", ".html", ".css", ".sh", ".log", ".srt", ".lrc", ".xml", ".toml", ".ini", ".rtf"}
+FILE_IMG_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+FILE_OPEN_EXT = FILE_TEXT_EXT | set(FILE_IMG_EXT) | {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".key", ".pages", ".numbers", ".mp3", ".wav", ".flac", ".aiff", ".aif", ".m4a", ".ogg", ".mp4", ".mov", ".mid", ".midi", ".svg", ".zip"}
+_SECRET_NAME = re.compile(r"(secret|token|passw|credential|private|id_rsa|id_ed25519|\.pem$|\.p12$|\.key$|api[_-]?key|\.env)", re.I)
+
+
+def file_target(path, rec=None):
+    """把回答里提到的文件（file:// 链接、绝对路径、~ 开头或相对路径）落到本机真实路径。
+    只认家目录里的、不在隐藏目录里的、名字不像密钥的；找不到就返回 None。"""
+    if not isinstance(path, str) or not path.strip() or len(path) > 2000:
+        return None
+    p = path.strip()
+    if p.lower().startswith("file://"):
+        p = unquote(urlparse(p).path)
+    p = p.split("#")[0]
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        bases = [b for b in ((rec or {}).get("cwd"), UI_WORKSPACE) if isinstance(b, str) and b]
+        p = next((os.path.join(b, p) for b in bases if os.path.exists(os.path.join(b, p))), os.path.join(bases[0] if bases else UI_WORKSPACE, p))
+    p = os.path.realpath(p)
+    home, hub_home = os.path.realpath(HOME), os.path.realpath(HUB_HOME)
+    if not os.path.exists(p) or not (p == home or p.startswith(home + os.sep)):
+        return None
+    inside_hub = p.startswith(os.path.join(hub_home, "workspace") + os.sep) or p.startswith(os.path.realpath(RUNS_DIR) + os.sep)
+    rel = os.path.relpath(p, home)
+    if not inside_hub and any(part.startswith(".") for part in rel.split(os.sep)):
+        return None
+    if p.startswith(hub_home + os.sep) and not inside_hub:
+        return None
+    if os.path.isfile(p) and _SECRET_NAME.search(os.path.basename(p)):
+        return None
+    return p
+
+
+def file_view(path, rec=None):
+    """给面板里的查看窗用：文字文件返回内容，图片只说明是图片。"""
+    p = file_target(path, rec)
+    if not p:
+        raise ValueError("找不到这个文件，或者它不在能看的范围里")
+    name = os.path.basename(p) or p
+    if os.path.isdir(p):
+        items = sorted(x for x in os.listdir(p) if not x.startswith("."))[:300]
+        return {"ok": True, "kind": "dir", "name": name, "path": p, "items": [x + ("/" if os.path.isdir(os.path.join(p, x)) else "") for x in items]}
+    ext = os.path.splitext(p)[1].lower()
+    if ext in FILE_IMG_EXT:
+        return {"ok": True, "kind": "image", "name": name, "path": p}
+    if ext in FILE_TEXT_EXT:
+        if os.path.getsize(p) > 2 * 1024 * 1024:
+            return {"ok": True, "kind": "big", "name": name, "path": p}
+        with open(p, "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+        return {"ok": True, "kind": "md" if ext in (".md", ".markdown") else "text", "name": name, "path": p, "text": text}
+    return {"ok": True, "kind": "other", "name": name, "path": p}
+
+
 def ui_record(kind, rid):
     return ui_run(rid) if kind == "run" else ui_call(rid) if kind == "call" else None
 
@@ -4261,6 +4317,19 @@ def serve_ui(port, me):
                 ctype = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}[p.rsplit(".", 1)[1]]
                 with open(p, "rb") as f:
                     return self.send(200, f.read(), ctype)
+            if u.path == "/api/file":
+                rec = ui_record(q.get("type"), q.get("id")) if q.get("id") else None
+                try:
+                    v = file_view(q.get("path"), rec)
+                except (ValueError, OSError) as e:
+                    return self.send(404, {"ok": False, "error": str(e)})
+                if q.get("raw"):
+                    ctype = FILE_IMG_EXT.get(os.path.splitext(v["path"])[1].lower())
+                    if v["kind"] != "image" or not ctype:
+                        return self.send(404, {"ok": False, "error": "不是图片"})
+                    with open(v["path"], "rb") as f:
+                        return self.send(200, f.read(), ctype)
+                return self.send(200, v)
             if u.path == "/api/image":
                 c = ui_call(q.get("id"))
                 p = (c or {}).get("image")
@@ -4374,7 +4443,14 @@ def serve_ui(port, me):
                     pair_reset()
                     limiter.clear()  # 重置后给新配对码一个干净的开始
                 elif self.path == "/api/open":
-                    r = ui_record(body.get("type"), body.get("id"))
+                    r = ui_record(body.get("type"), body.get("id")) if body.get("id") else None
+                    if body.get("what") == "file":
+                        p = file_target(body.get("path"), r)
+                        if not p:
+                            raise ValueError("找不到这个文件，或者它不在能打开的范围里")
+                        reveal = body.get("reveal") or not (os.path.isdir(p) or os.path.splitext(p)[1].lower() in FILE_OPEN_EXT)
+                        subprocess.call(["open", "-R", p] if reveal else ["open", p])  # 不认识的类型（比如程序）只在访达里标出来，不直接运行
+                        return self.send(200, {"ok": True, "revealed": bool(reveal)})
                     if not r:
                         raise ValueError("没有这条记录")
                     if body.get("what") == "image" and r.get("image") and os.path.isfile(r["image"]):

@@ -1,0 +1,23 @@
+'use strict';
+// 回答里提到的本机文件要能点开；网页链接照旧，其他协议不认
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const source=fs.readFileSync('ui.html','utf8').match(/<script>([\s\S]*)<\/script>/)[1];
+const nodes={};
+const node=id=>nodes[id]||(nodes[id]={innerHTML:'',value:'',style:{},dataset:{},scrollTop:0,classList:{add(){},remove(){},toggle(){}},addEventListener(){},querySelectorAll(){return []},focus(){},contains(){return false}});
+const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []}},window:{},localStorage:{getItem(){return null}},sessionStorage:{getItem(){return null}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},getSelection:()=>null};
+vm.createContext(ctx);
+vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);', 'globalThis.ui={md,isFileRef};'),ctx);
+const {md,isFileRef}=ctx.ui;
+let h=md('写好了：[手册.md](file:///Users/x/hub%20work/手册.md)');
+assert.ok(h.includes('class="flink"') && h.includes('data-path="file:///Users/x/hub%20work/手册.md"') && h.includes('手册.md</a>'), h);
+h=md('看 [结果](out/report.md) 和 [官网](https://example.com)');
+assert.ok(h.includes('data-path="out/report.md"') && h.includes('href="https://example.com"'), h);
+h=md('文件在 `/Users/x/a b/c.md`，命令是 `ls -la`');
+assert.ok(h.includes('data-path="/Users/x/a b/c.md"') && h.includes('<code>ls -la</code>') && !h.includes('data-path="ls -la"'), h);
+h=md('[坏](javascript:alert(1)) [信](mailto:a@b.c)');
+assert.ok(!h.includes('flink') && !h.includes('href="javascript') && !h.includes('mailto'), h);
+h=md('[x](/tmp/a"onmouseover="alert(1).md)');
+assert.ok(!/data-path="[^"]*"onmouseover/.test(h), '引号被转义：'+h);
+for (const ok of ['file:///a/b.md','/Users/x/a.md','~/Desktop/图.png','out/r.md','报告.docx','/Users/x/项目/']) assert.ok(isFileRef(ok), ok);
+for (const no of ['https://a.com','mailto:a@b.c','javascript:x','www.a.com','ls -la','/','hello']) assert.ok(!isFileRef(no), no);
+console.log('ui files: file links clickable, web links kept, other schemes rejected passed');

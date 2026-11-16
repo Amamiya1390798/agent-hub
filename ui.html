@@ -264,6 +264,21 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .ctx.off button{width:auto;height:auto;padding:1px 7px;color:var(--ink)}
 .sidewin{position:fixed;right:18px;bottom:18px;width:410px;max-width:calc(100vw - 24px);height:min(640px,calc(100vh - 36px));background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.28);display:flex;flex-direction:column;z-index:40}
 .sidewin[hidden]{display:none}
+.flink{color:var(--live);text-decoration:none;border-bottom:1px dashed currentColor;cursor:pointer;word-break:break-all}
+.flink:hover{border-bottom-style:solid}
+.fview{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:45;display:flex;align-items:center;justify-content:center;padding:24px}
+.fview[hidden]{display:none}
+.fv-box{background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.3);width:min(860px,100%);height:min(88vh,100%);display:flex;flex-direction:column;overflow:hidden}
+.fv-head{display:flex;align-items:center;gap:8px;padding:12px 14px 4px}
+.fv-head b{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fv-acts{display:flex;gap:6px;flex:none}
+.fv-path{padding:0 14px 8px;border-bottom:1px solid var(--line);word-break:break-all}
+.fv-body{flex:1;overflow:auto;padding:14px 18px}
+.fv-body pre{white-space:pre-wrap;word-break:break-word;font-size:12.5px}
+.fv-body img{max-width:100%;height:auto;border-radius:8px}
+.fv-body .fv-dir button{display:block;width:100%;text-align:left;padding:6px 8px;border-radius:6px}
+.fv-body .fv-dir button:hover{background:var(--hover)}
+@media(max-width:760px){.fview{padding:0}.fv-box{width:100%;height:100%;border-radius:0;padding-top:env(safe-area-inset-top)}.fv-acts .btn{min-height:36px;padding:4px 10px}}
 .sw-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
 .sw-head .small{flex:1;margin:0}
 .sw-hist{flex:1;overflow:auto;padding:10px 12px}
@@ -509,6 +524,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
   <aside class="rail scroll" id="rail"></aside>
 </div>
 <div class="scrim" data-act="closedrawers"></div>
+<div class="fview" id="fview" hidden role="dialog" aria-label="查看文件"><div class="fv-box"><div class="fv-head"><b id="fv-name"></b><span class="fv-acts" id="fv-acts"></span><button class="iconbtn" data-act="fv-close" aria-label="关闭">✕</button></div><div class="fv-path small" id="fv-path"></div><div class="fv-body scroll" id="fv-body"></div></div></div>
 <div class="sidewin" id="sidewin" hidden role="dialog" aria-label="旁问">
   <div class="sw-head"><b>旁问</b><p class="small">单独问个小问题，不进主线，也不打断团队</p><button class="iconbtn" data-act="sidewin" aria-label="关闭旁问">✕</button></div>
   <div class="sw-hist scroll" id="sw-hist"></div>
@@ -597,13 +613,24 @@ function inline(s){
   s = esc(String(s).replace(/[\u0000-\u0002]/g, "")).replace(/`([^`\n]+)`/g, (m,c) => { codes.push(c); return "\u0000" + (codes.length-1) + "\u0000"; });
   const links = [];
   s = s.replace(/\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g, (m,t,u) => {
-    if (!/^https?:\/\//i.test(u)) return t;
-    links.push(u.replace(/\u0000(\d+)\u0000/g, (m,i) => codes[+i])); return "\u0001" + (links.length-1) + "\u0001" + t + "\u0002";
+    const url = u.replace(/\u0000(\d+)\u0000/g, (m,i) => codes[+i]);
+    if (!/^https?:\/\//i.test(url) && !isFileRef(url)) return t;
+    links.push(url); return "\u0001" + (links.length-1) + "\u0001" + t + "\u0002";
   });
   s = s.replace(/\*\*([^*\n]+?)\*\*/g, "<strong>$1</strong>").replace(/__([^_\n]+?)__/g, "<strong>$1</strong>");
   s = s.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\w)/g, "$1<em>$2</em>").replace(/~~([^~\n]+?)~~/g, "<del>$1</del>");
-  s = s.replace(/\u0001(\d+)\u0001/g, (m,i) => '<a href="' + links[+i] + '" target="_blank" rel="noopener noreferrer">').replace(/\u0002/g, "</a>");
-  return s.replace(/\u0000(\d+)\u0000/g, (m,i) => "<code>" + codes[+i] + "</code>");
+  s = s.replace(/\u0001(\d+)\u0001/g, (m,i) => /^https?:\/\//i.test(links[+i]) ? '<a href="' + links[+i] + '" target="_blank" rel="noopener noreferrer">' : '<a href="#" class="flink" data-act="file" data-path="' + links[+i] + '" title="点开看这个文件">📄 ').replace(/\u0002/g, "</a>");
+  return s.replace(/\u0000(\d+)\u0000/g, (m,i) => isFileRef(codes[+i]) && /^(\/|~\/|file:)/.test(unesc(codes[+i])) ? '<a href="#" class="flink" data-act="file" data-path="' + codes[+i] + '" title="点开看这个文件"><code>' + codes[+i] + "</code></a>" : "<code>" + codes[+i] + "</code>");
+}
+// 回答里提到的本机文件：file:// 链接、/ 或 ~/ 开头的路径、带扩展名的相对路径（已转义的文字）
+const unesc = s => String(s).replace(/&(amp|lt|gt|quot|#39);/g, (m,k) => ({amp:"&",lt:"<",gt:">",quot:'"',"#39":"'"}[k]));
+function isFileRef(u){
+  u = unesc(u).trim();
+  if (!u || u.length > 1000 || /\s{2}|\n/.test(u)) return false;
+  if (/^file:\/\//i.test(u)) return true;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(u)) return false;   // 其他协议（mailto: 之类）不认
+  if (/^(\/|~\/)/.test(u)) return /\/[^/]+(\.[A-Za-z0-9]{1,8}|\/)$/.test(u) || /^(\/|~\/)[^/]+\/[^/]+/.test(u);
+  return /^[^\/][^<>|*?]*\.[A-Za-z0-9]{1,8}$/.test(u) && !/^www\./i.test(u);
 }
 function md(src){
   const L = String(src || "").replace(/\r/g, "").split("\n"), out = [];
@@ -1662,7 +1689,7 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
     }
     const full = r.kind === "chat" || r.kind === "ask" ? need("call", r.id, r.status + "|" + (r.secs || "") + "|" + (r.live || 0) + "|" + JSON.stringify(r.dispatch || {})) || {} : {};
     const ci = r.chat || {};
-    h += '<div class="them"><div class="who" style="color:' + agc(r.agent) + '">' + esc(r.agent) + (r.kind === "chat" ? " · 对接人" + (ci.mode === "manual" ? "（你指定）" : "（自动选）") : "") + (r.resumed ? '<span class="small" title="直接接着上一轮的原会话，没有重发前文，缓存命中更高"> · 续接原会话</span>' : "") + "</div>";
+    h += '<div class="them" data-rt="call" data-rid="' + esc(r.id) + '"><div class="who" style="color:' + agc(r.agent) + '">' + esc(r.agent) + (r.kind === "chat" ? " · 对接人" + (ci.mode === "manual" ? "（你指定）" : "（自动选）") : "") + (r.resumed ? '<span class="small" title="直接接着上一轮的原会话，没有重发前文，缓存命中更高"> · 续接原会话</span>' : "") + "</div>";
     if (ci.handoff) h += '<div class="handoff">' + esc(ci.handoff) + "</div>";
     if (full.answer){ const key = "chat:" + r.id; copyStore[key] = full.answer; h += '<div class="md">' + md(full.answer) + '</div><div class="lab"><span></span><span><button class="copy" data-act="fork" data-type="call" data-id="' + esc(r.id) + '" title="带上到这一轮为止的对话，另开一条线">⑂ 从这里分叉</button><button class="copy" data-act="copy" data-key="' + esc(key) + '">复制</button></span></div>'; }
     else if (r.status === "running") h += liveHtml(full.live, r.agent);
@@ -1845,6 +1872,25 @@ async function poll(){
   }
   checkDone(); renderList(); renderRail(); renderView(); renderComposer(); renderSide(); renderAwake();
 }
+/* ---------- 查看回答里提到的文件 ---------- */
+const fview = {path: "", rec: null};
+async function openFile(path, rec){
+  const q = "path=" + encodeURIComponent(path) + (rec && rec.id ? "&type=" + encodeURIComponent(rec.type) + "&id=" + encodeURIComponent(rec.id) : "");
+  let v;
+  try { v = await api("/api/file?" + q); } catch (err) { toast(err.message || "打不开这个文件"); return; }
+  fview.path = v.path; fview.rec = rec && rec.id ? {type: rec.type, id: rec.id} : null;
+  $("fv-name").textContent = v.name;
+  $("fv-path").textContent = v.path;
+  $("fv-acts").innerHTML = isRemote() ? "" : '<button class="btn" data-act="fv-open">在电脑上打开</button><button class="btn" data-act="fv-open" data-reveal="1">在访达中显示</button>';
+  const b = $("fv-body");
+  b.innerHTML = v.kind === "md" ? '<div class="md">' + md(v.text) + "</div>"
+    : v.kind === "text" ? "<pre>" + esc(v.text) + "</pre>"
+    : v.kind === "image" ? '<img alt="' + esc(v.name) + '" src="/api/file?raw=1&' + q.replace(/^path=[^&]*/, "path=" + encodeURIComponent(v.path)) + '">'
+    : v.kind === "dir" ? '<div class="fv-dir">' + (v.items.length ? v.items.map(x => '<button class="flink" data-act="file" data-path="' + esc(v.path + "/" + x.replace(/\/$/, "")) + '">' + (x.endsWith("/") ? "📁 " : "📄 ") + esc(x) + "</button>").join("") : '<p class="small">这个文件夹是空的</p>') + "</div>"
+    : '<p class="small">' + (v.kind === "big" ? "文件太大，面板里不直接显示。" : "这种文件面板里看不了。") + (isRemote() ? "请在电脑上打开。" : "点上面的「在电脑上打开」。") + "</p>";
+  b.scrollTop = 0;
+  $("fview").hidden = false;
+}
 function renderAwake(){
   const b = $("tb-awake"); if (!b || !b.classList || !S) return;
   b.classList.toggle("primary", !!S.awake);
@@ -1927,6 +1973,9 @@ document.addEventListener("click", async e => {
     else if (act === "noctx"){ if (forking){ forking = false; ctx = sel; } else ctx = null; renderComposer(); }
     else if (act === "fork"){ ctx = {type: el.dataset.type, id: el.dataset.id}; forking = true; renderComposer(); $("txt").focus(); toast("已准备分叉：发出的话会另开一条线"); }
     else if (act === "yesctx"){ ctx = sel; renderComposer(); $("txt").focus(); }
+    else if (act === "file"){ e.preventDefault(); const holder = el.closest("[data-rid]"); await openFile(el.dataset.path, holder ? {type: holder.dataset.rt, id: holder.dataset.rid} : fview.rec || sel); }
+    else if (act === "fv-close"){ $("fview").hidden = true; }
+    else if (act === "fv-open"){ const r = await api("/api/open", Object.assign({what: "file", path: fview.path, reveal: el.dataset.reveal === "1"}, fview.rec && fview.rec.id ? {type: fview.rec.type, id: fview.rec.id} : {})); toast(r.revealed ? "已在访达中标出这个文件" : "已在电脑上打开"); }
     else if (act === "mopt"){ document.body.classList.toggle("copts"); last.modes = null; renderComposer(); }
     else if (act === "awake"){
       try { const r = await api("/api/awake", {on: !(S && S.awake)}); if (S) S.awake = r.on; renderAwake(); toast(r.on ? "已打开不休眠：面板开着时电脑不会自动睡眠（合上盖子仍会睡）" : "已关闭不休眠，电脑恢复平时的睡眠设置"); }
@@ -2133,6 +2182,8 @@ function saveDraft(){   // 草稿只存在当前窗口；不保存「允许改�
   try { const v = $("txt").value; v.trim() ? sessionStorage.setItem("hub.draft", JSON.stringify({text:v, mode})) : sessionStorage.removeItem("hub.draft"); } catch(e){}
 }
 $("txt").addEventListener("input", () => { autosize(); saveDraft(); $("send").disabled = sending || !$("txt").value.trim(); });
+$("fview").addEventListener("click", e => { if (e.target === $("fview")) $("fview").hidden = true; });
+document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("fview").hidden) $("fview").hidden = true; });
 $("txt").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)){ e.preventDefault(); send(); } });
 bindImageInput("main", "txt", () => document.querySelector && document.querySelector(".cbox"), "file-main");
 bindImageInput("side", "sw-txt", () => $("sidewin"), "file-side");

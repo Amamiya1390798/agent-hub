@@ -86,6 +86,7 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 - **文件夹**：`folders.json` 存 `{folders: [{id, name}], of: {组键: 文件夹id}}`，`/api/folders {op: create|rename|delete|move, ...}` 由 `folder_op()` 处理；只影响左栏显示。左栏组卡片可拖进文件夹或点 📁 放进去。
 - **成员 / 模型开关**：配置里的 `disabled_agents`、`disabled_models` 由 `active_cfg()` 过滤，所有干活的命令（排工、会审、对接、旁问、备用模型）只看得到启用的；平时的对接人都停用时，`choose_contact` 改找启用的成员。面板通过 `/api/config` 的 `agent_enabled`、`model_enabled` 切换。
 - **权限被拒**：agy 在只读模式下被拒权限（`denied_actions` 非空且回答为空）时，`agy_denied_text()` 从它的对话记录里找出被拒的那一步，报错以 `DENIED_PREFIX` 开头；`ask()` 遇到这种报错不再换备用模型重试。只读时 `backend_agy` 传 `--settings {"permissions":{"allow":["read_file(/)"]}}`，让它能读任何位置的文件（但不能写、不能运行命令）；面板的「允许改文件」开关记在 localStorage 的 `hub-write`。
+- **回答里的文件**：前端 `isFileRef()` 把 Markdown 链接里的 `file://`、绝对路径、`~/`、带扩展名的相对路径，以及反引号里的绝对路径，渲染成 `.flink`（`data-act="file"`），点了用 `openFile()` 弹出查看窗。后端 `file_target(path, rec)` 解析路径（相对路径先找记录的 `cwd` 再找 `workspace`），只认家目录里、不在隐藏目录里（Hub 自己的 `workspace`、`runs` 除外）、名字不像密钥（`_SECRET_NAME`）的文件。`GET /api/file?path=&type=&id=` 由 `file_view()` 返回文字内容、图片（加 `raw=1` 取原图，只给位图）或文件夹清单；`POST /api/open {what:"file", path, reveal?}` 只在本机可用，扩展名在 `FILE_OPEN_EXT` 里的直接打开，其他（比如程序）只在访达中标出。
 - **手机布局**（宽度 ≤760px）：顶部「记录 / 详情 / 团队」三个标签，左栏和团队页铺满全屏；输入区平时只显示一个写着当前模式和权限的「选项」按钮（`#mopt`，点开给 `body` 加 `copts`），发送或切换标签后自动收起；详情页的操作按钮排成一行横向滑动。
 - **面板布局**：团队页依次是返回对话、标题（过长收两行）、步骤条（`stepperHtml`）、结果，然后是可折叠的过程和进度板（`fold()`，默认开关由是否有结果决定）；对话页的团队卡片带每件任务的小标签（`taskChips`），页面顶部有进行中总览（`liveBar`）；对话页在有进行中的轮次或团队时也显示停止按钮（`liveTarget`）。
 - **追问进行中的记录**：上一轮还在做时也可以带 `context` 提交，`follow_context` 只会带上已有的内容。
@@ -116,7 +117,7 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 
 `hub ui` 启动 `ThreadingHTTPServer`，默认只监听 `127.0.0.1:8765`。
 
-- GET：`/`、`/api/state?c=<客户端id>`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
+- GET：`/`、`/api/state?c=<客户端id>`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/file?path=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
 - POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/handoff/undo`、`/api/compact`、`/api/folders`、`/api/awake`、`/api/keep/close`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
 - `/api/bye` 不需要令牌，只用于页面关闭时登记。
 
