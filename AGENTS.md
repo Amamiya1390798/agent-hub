@@ -28,7 +28,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 
 | 后端 | 调用的命令 | 说明 |
 | :--- | :--- | :--- |
-| `agy:<model>` | Antigravity CLI `agy --print=<prompt> --output-format stream-json` | 只配置 `gemini-*` 模型。 |
+| `agy:<model>` | Antigravity CLI `agy --print=<prompt> --output-format stream-json` | 默认用 `gemini-*`；也收 `claude-*`（`is_agy_claude()`，额度和 Gemini 分开算，在 Antigravity 里和 GPT 共用一份）。`refresh_models()` 只收这两类；`agy_label()` 给 Claude 名字加「· Antigravity」，档位括号留在最后。面板把 `agy:claude-…` 归到 Claude 成员（前端 `homeOf()`），首选是它时成员卡片显示这份额度（`quota_agy_all()`）。 |
 | `codex[:<model>]` | `codex exec ... --json -`（提示词走 stdin） | 只读用 `-s read-only`；写模式用 `workspace-write`，配置 `gpt_full_access: true` 时用 `danger-full-access`。思考强度来自 `codex_effort`。 |
 | `dsh` | DeepSeek Harness `dsh --patch <HUB_HOME>/dsh.patch.yml --profile headless --json -` | patch 让无界面模式复用桌面版已登录的账号，不复制密钥。 |
 | `claude:<model>` | Claude Code `claude -p --model <m>`（提示词走 stdin） | 只读用 `--permission-mode plan`，写模式用 `acceptEdits`；调用前会清掉 `CLAUDE*`、`ANTHROPIC_*` 环境变量。 |
@@ -66,10 +66,10 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑一个已经失败过的同名模型；因为上面三种原因停下、并且已有部分输出时，会把前 6000 字附给下一个模型，让它接着做。进度板还要求队员先亲自打开问题里提到的文件，并在开头写明看了哪些。
 
 **按活的类型分档选模型**：
-- 除了「干活」用的首选模型，每位成员还可以分别设「动脑」「审美」「文案」三档（`TIERS = ("think","design","copy")`）。配置 `think` / `design` / `copy` 都是 `{成员: {spec, effort}}`，`spec` 为空表示和干活用同一个模型、只换档位。`think_setting(cfg, agent, tier)` 会忽略已停用的模型。
+- 除了「干活」用的首选模型，每位成员还可以分别设「对接」「动脑」「审美」「文案」四档（`TIERS = ("think","design","copy","chat")`；只有前三档是任务类型，见 `TASK_TIERS`）。「对接」只管这位成员当对接人聊天时用的模型（`run_chat` 里 `tier="chat"`），不设就沿用原来的规则（包括 `CHAT_FAST` 换轻模型）。配置 `chat` / `think` / `design` / `copy` 都是 `{成员: {spec, effort}}`，`spec` 为空表示和干活用同一个模型、只换档位。`think_setting(cfg, agent, tier)` 会忽略已停用的模型。
 - `ask(..., tier=...)` 把该档模型排在最前，原来的后备链接在后面。
 - 排工 JSON 里每个任务有 `kind: think|design|copy|work`（中文「动脑/审美/文案」也认）。排工提示里的 `{models}` 由 `model_menu()` / `tier_roster()` 写明每人每档用什么模型；任务里的 `spec` 是用户点名的模型，必须是已启用的 `backend_choices`，用不了就按预设并在任务里说明。任务记录带 `plan_spec`（预计用的模型），面板任务标签显示预计/实际在用的模型，换备用也跟着变。会审的每位成员和会审综合固定走动脑档。
-- 面板成员卡片上「干活用」「思考等级」两栏之外，每档一行（模型 + 档位），修改时调用 `/api/config {think|design|copy: {agent, spec?, effort?}}`。Gemini 的档位写在模型名里，所以改档位就是改 `spec`。卡片上只列这位成员自家的模型（`HOME_KIND`），备用模型不受这个限制。
+- 面板成员卡片上「干活用」「思考等级」两栏之外，每档一行（模型 + 档位），修改时调用 `/api/config {chat|think|design|copy: {agent, spec?, effort?}}`。Gemini 的档位写在模型名里，所以改档位就是改 `spec`。卡片上只列这位成员自家的模型（`HOME_KIND`），备用模型不受这个限制。
 
 **不休眠**：配置 `keep_awake` 为真时，面板服务用 `caffeinate -i -m -w <面板进程号>` 阻止电脑自动睡眠（屏幕仍会熄灭，合盖仍会睡），`/api/awake {on}` 切换。离线测试设 `HUB_NO_AWAKE=1`。
 
@@ -77,7 +77,9 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 
 **回答写法**：`USER_STYLE` 是给用户看的统一写法（先结论、默认 200 字内、不用表格和行话），拼在对接人、汇总、会审综合和直接提问的提示词里。
 
-**历史读取缓存**：`_RecordCache` 按文件的 mtime/大小缓存解析好的调用和项目记录，`/api/state` 只重读变过的文件。
+**历史读取缓存**：`_RecordCache` 按文件的 mtime/大小缓存解析好的调用和项目记录，`/api/state` 只重读变过的文件；`shared=True` 返回缓存本身不复制，只给只读的调用方用。
+
+**回答抬头的型号**：对话气泡抬头用前端 `callModel(r)` 显示这一轮实际用的子型号（`r.backend`），和 `preferred_backend` 不同时注明「首选用不了，换了备用」。
 
 - **分叉**：提交时 `fork: true` 加 `context`，记录带 `fork: true`。面板把分叉作为独立项目组，追问链在分叉处断开；后端带上到分叉点为止的上下文，并且不续接原会话。
 - **图片**：`/api/upload` 收 `{data: base64}`，按文件头只认 PNG/JPEG/WebP/GIF（≤10MB），存到 `<HUB_HOME>/workspace/attachments/att-时间-随机.扩展名`；提交时 `images: [文件名]`（≤6 张）。`image_note()` 把图片路径写进提示词；GPT 另以 `--image=路径` 直接附图，Gemini/Claude 加 `--add-dir` 放行附件目录，DeepSeek 用自带的 `read_image` 工具读。`/api/attachment?id=` 只返回位图。
@@ -120,13 +122,19 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 
 `hub ui` 启动 `ThreadingHTTPServer`，默认只监听 `127.0.0.1:8765`。
 
-- GET：`/`、`/api/state?c=<客户端id>`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/file?path=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
+- GET：`/`、`/api/state?c=<客户端id>[&compact=1&v=<版本>]`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/file?path=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
 - POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/handoff/undo`、`/api/compact`、`/api/folders`、`/api/awake`、`/api/keep/close`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
 - `/api/bye` 不需要令牌，只用于页面关闭时登记。
 
 安全措施：检查 Host 头；图片接口只返回位图（不返回 SVG，防止 XSS）；设置 CSP 和 `X-Frame-Options`。局域网模式（`lan_access`）默认关闭，开启后只接受私有网段，需要配对码加 HttpOnly cookie，配对码输错有限速；设置、登录、开关局域网这些操作只能在本机做（见 `gate()` 和 `REMOTE_POSTS`）。
 
-前端每 1.5 秒轮询 `/api/state`。`ui_version` 变化时页面会自动刷新。
+前端用 `schedulePoll()` 轮询 `/api/state?compact=1&v=<上一版>`：页面可见时每 1.5 秒，切到后台时每 10 秒。
+
+- **精简状态**：`compact=1` 时列表记录只带 `ui_call_summary()` / `ui_run_summary()` 里的字段，每条带 `rev`（文件版本）。长回答、完整指令等点开时才走 `/api/call`、`/api/run` 取。
+- **增量更新**：服务端按「本机 / 手机」各留最近 8 版快照（`get_state()`）。版本没变只回 `{version}`；变了回 `changes`，其中 `calls` / `runs` 用 `history_patch()` 给出 upsert / remove / order；对不上的旧版本回全量。
+- **压缩**：`send()` 在请求头接受 gzip（`accepts_gzip()`）时压缩 JSON 和页面，页面压缩结果按文件版本缓存（`dashboard_html()`）。
+- **前端重画**：`md()` 按原文缓存排版结果（`MD_CACHE`），长对话刷新时不用把几百条回答重排一遍；详情陆续返回时合并成一次重画；数据没变就不重画。
+- `ui_version` 变化时页面会自动刷新。
 
 ## 7. 修改时的规则
 

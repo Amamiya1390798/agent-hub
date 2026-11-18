@@ -193,7 +193,7 @@ class Server(unittest.TestCase):
         status, page, _ = self.req(ip, '/')
         self.assertEqual(status, 401)
         self.assertNotIn(self.token.encode(), page)
-        for path in ['/api/state', '/api/run?id=x', '/api/call?id=c_1', '/api/image?id=c_1', '/api/pair', '/icon.png']:
+        for path in ['/api/state', '/api/state?compact=1', '/api/run?id=x', '/api/call?id=c_1', '/api/image?id=c_1', '/api/pair', '/icon.png']:
             self.assertEqual(self.req(ip, path)[0], 401, path)
         self.assertEqual(self.req(ip, '/api/submit', {'mode': 'ask', 'agent': 'gemini', 'text': 'x'})[0], 401)
         self.assertEqual(self.req(ip, '/api/state', host='evil.example:%d' % self.port)[0], 403)
@@ -204,6 +204,13 @@ class Server(unittest.TestCase):
         cookie = {'Cookie': headers['Set-Cookie'].split(';')[0]}
         st = json.loads(self.req(ip, '/api/state', headers=cookie)[1])
         self.assertEqual(st['client'], {'remote': True})
+        compact = '/api/state?compact=1'
+        local = json.loads(self.req('127.0.0.1', compact)[1])
+        phone = json.loads(self.req(ip, compact + '&v=' + local['version'], headers=cookie)[1])
+        self.assertEqual(phone['client'], {'remote': True})
+        self.assertNotEqual(phone['version'], local['version'])
+        update = json.loads(self.req(ip, compact + '&v=' + phone['version'], headers=cookie)[1])
+        self.assertNotIn('calls', update)
         self.assertIn(self.token.encode(), self.req(ip, '/', headers=cookie)[1])
         # 手机上禁止的事
         self.assertEqual(self.req(ip, '/api/pair', headers=cookie)[0], 403)

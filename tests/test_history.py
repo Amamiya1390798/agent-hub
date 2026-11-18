@@ -81,9 +81,9 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(self.g['load_calls']()), 1)
         real_load = self.g['_load_call']
 
-        def disappear(name, st):
+        def disappear(name, st, **options):
             path.unlink()
-            return real_load(name, st)
+            return real_load(name, st, **options)
 
         # 缓存命中可以返回扫描时的快照；下一轮必须反映删除。
         with patch.dict(self.g, _load_call=disappear):

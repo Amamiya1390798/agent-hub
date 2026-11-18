@@ -22,6 +22,7 @@ import base64
 import binascii
 import copy
 import glob
+import gzip
 import heapq
 import json
 import os
@@ -57,7 +58,7 @@ DEFAULT_CONFIG = {
     "agents": {
         "gemini": ["agy:gemini-4-carbon-high", "agy:gemini-3.8-flash-high"],
         # Claude 只走本机 Claude CLI（需自行登录）；不可用时退到 Gemini。
-        # 注意：Antigravity 里的 Claude 等模型额度通常很少，默认 agy 只跑 Gemini。
+        # Antigravity（agy）里也有 Claude 模型（agy:claude-…，额度和 Gemini 分开算），想用可在面板里给 Claude 成员选。
         "claude": ["claude:opus", "agy:gemini-4-carbon-high"],
         "gpt": ["codex", "agy:gemini-4-carbon-high"],
         "ds": ["dsh", "agy:gemini-3.8-flash-high"],
@@ -80,7 +81,8 @@ DEFAULT_CONFIG = {
     "gpt_full_access": False,  # True：GPT 在「允许改文件」的任务里不受沙箱限制，才能调用 hub 指挥队友、联网
     "codex_effort": "",        # 旧设置：GPT 的思考强度；成员卡片上单独设过（见 effort）就以那个为准
     "design": {},              # 审美的活（排版、配色、界面、视觉、挑图）用的模型和思考等级，格式同 think
-    "copy": {},                # 文案的活（标题、广告语、文章润色、对外文字）用的模型和思考等级，格式同 think
+    "copy": {},
+    "chat": {},                # 当对接人跟用户聊天时用的模型和思考等级，格式同 think；不设就用干活的模型                # 文案的活（标题、广告语、文章润色、对外文字）用的模型和思考等级，格式同 think
     "think": {},               # 动脑的活（定方案、审查、拍板、会审）用的模型和思考等级；没设就跟干活一样
     "effort": {},              # 每位成员的思考等级 {成员: low/medium/high/xhigh/max}，""=沿用该程序自己的默认；对 GPT、Claude 有效，Gemini 的等级写在模型名里
     "profiles": {
@@ -164,7 +166,7 @@ _EFFORT_ID = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
 def codex_model_efforts(model):
     """某个 GPT 模型自己支持的思考档位 [(名字, 说明)]，读 Codex 的模型清单；读不到就用常见的五档。"""
     model = model or codex_defaults()[0]
-    cm = read_json(os.path.join(HOME, ".codex", "models_cache.json")) or {}
+    cm = _model_records.read(os.path.join(HOME, ".codex", "models_cache.json"), shared=True) or {}
     for m in cm.get("models") or []:
         if isinstance(m, dict) and m.get("slug") == model:
             out = [(str(x.get("effort")), str(x.get("description") or "")) for x in m.get("supported_reasoning_levels") or []
@@ -196,8 +198,9 @@ def agent_effort(cfg, agent, spec):
     return e if e and e in effort_levels(spec) else ""
 
 
-TIERS = ("think", "design", "copy")          # 除「干活」以外单独配模型的几类活
-TIER_NAMES = {"work": "干活", "think": "动脑", "design": "审美", "copy": "文案"}
+TIERS = ("think", "design", "copy", "chat")  # 除「干活」以外单独配模型的几类活
+TASK_TIERS = ("think", "design", "copy")     # 排工时任务能标的类型（「对接」只给对接人聊天用）
+TIER_NAMES = {"work": "干活", "think": "动脑", "design": "审美", "copy": "文案", "chat": "对接"}
 
 
 def think_setting(cfg, agent, tier="think"):
@@ -234,7 +237,7 @@ def tier_roster(cfg, agent):
     """排工名单里的一句：这位成员各类活用什么模型（只列专门设过的）。"""
     base = (cfg["agents"].get(agent) or [""])[0]
     bits = ["干活用 %s" % spec_label(base)]
-    for tr in TIERS:
+    for tr in TASK_TIERS:
         sp, eff = think_setting(cfg, agent, tr)
         if sp or eff:
             bits.append("%s用 %s%s" % (TIER_NAMES[tr], spec_label(sp or base), "（%s 档）" % eff if eff else ""))
@@ -602,6 +605,11 @@ def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None, watch=None):
     return p.returncode, "".join(outs), "".join(errs)
 
 
+def is_agy_claude(spec):
+    """agy:claude-… —— 通过 Antigravity 用的 Claude 模型（额度和 Gemini 分开算）。"""
+    return (spec or "").startswith("agy:claude-")
+
+
 def spec_label(spec):
     """后端写法 → 给人看的名字，例如 agy:gemini-4-carbon-medium → Gemini Carbon·中等。"""
     kind, _, mdl = (spec or "").partition(":")
@@ -609,6 +617,10 @@ def spec_label(spec):
     if kind == "agy":
         lv = re.match(r"^(.*?)-(xhigh|high|medium|low|max)$", m)
         base, level = (lv.group(1), {"xhigh": "超高", "high": "高", "medium": "中等", "low": "低", "max": "最高"}[lv.group(2)]) if lv else (m, "")
+        if base.startswith("claude-"):
+            ver = re.match(r"^claude-([a-z]+)-(\d+)-(\d+)$", base)
+            name = ("Claude %s %s.%s" % (ver.group(1).capitalize(), ver.group(2), ver.group(3))) if ver else ("Claude " + base[7:])
+            return name + ("·" + level if level else "") + "（Antigravity）"
         fam = next((w.capitalize() for w in ("carbon", "argon", "hydrogen", "flash", "orchestrator") if w in base), "")
         name = ("Gemini " + fam) if fam else ("Gemini " + mdl if mdl else "Gemini")
         return name + ("·" + level if level else "")
@@ -1230,8 +1242,13 @@ def _iso_to_epoch(sv):
         return None
 
 
-def quota_agy(cfg):
-    """Antigravity 自带的额度查询（不消耗模型额度）。"""
+def quota_agy(cfg, group="gemini"):
+    """Antigravity 自带的额度查询（不消耗模型额度）。group：gemini 或 claude（Claude 和 GPT 合用一份额度）。"""
+    return (quota_agy_all(cfg) or {}).get(group)
+
+
+def quota_agy_all(cfg):
+    """{"gemini": {...}, "claude": {...}}：Antigravity 里 Gemini、Claude 两份额度。"""
     exe = find_bin(cfg, "agy")
     if not exe:
         return None
@@ -1241,20 +1258,22 @@ def quota_agy(cfg):
         return None
     if rc != 0:
         return None
-    wins = []
+    groups = {}
     for line in out.splitlines():
         p = [x.strip() for x in line.split("\t")]
-        if len(p) >= 4 and p[0].lower().startswith("gemini") and p[2].endswith("%"):
+        grp = "gemini" if p[0].lower().startswith("gemini") else "claude" if p[0].lower().startswith("claude") else ""
+        if len(p) >= 4 and grp and p[2].endswith("%"):
             try:
                 pct = float(p[2].rstrip("%"))
                 if not 0 <= pct <= 100:
                     continue
             except ValueError:
                 continue
-            wins.append({"label": "5 小时" if "five" in p[1].lower() else "本周" if "week" in p[1].lower() else p[1],
-                         "remaining": pct, "resets": _iso_to_epoch(p[3])})
-    wins.sort(key=lambda w: 0 if w["label"] == "5 小时" else 1)
-    return {"windows": wins, "ts": time.time()} if wins else None
+            groups.setdefault(grp, []).append({"label": "5 小时" if "five" in p[1].lower() else "本周" if "week" in p[1].lower() else p[1],
+                                               "remaining": pct, "resets": _iso_to_epoch(p[3])})
+    for wins in groups.values():
+        wins.sort(key=lambda w: 0 if w["label"] == "5 小时" else 1)
+    return {g: {"windows": w, "ts": time.time()} for g, w in groups.items()}
 
 
 def quota_codex():
@@ -1338,14 +1357,20 @@ def quota_ds():
 
 def fetch_quota(cfg):
     q = {}
-    g = quota_agy(cfg)
-    if g:
-        q["gemini"] = g
+    agy = quota_agy_all(cfg) or {}
+    if agy.get("gemini"):
+        q["gemini"] = agy["gemini"]
     c = quota_codex()
     if c:
         q["gpt"] = c
     q["claude"] = {"note": "读不到：Claude 命令行未提供额度查询。可在 Claude App 的 设置 → 用量 里看。"}
     q["ds"] = quota_ds()
+    for name, chain in (cfg.get("agents") or {}).items():  # 首选走 Antigravity 的成员看 Antigravity 的那份额度
+        first = (chain or [""])[0]
+        if first.startswith("agy:"):
+            g = agy.get("claude" if is_agy_claude(first) else "gemini")
+            if g:
+                q[name] = dict(g, note="Antigravity 里的 Claude 额度（和 Antigravity 的 GPT 共用）") if is_agy_claude(first) else g
     out = {"ts": time.time(), "agents": q}
     write_json(QUOTA_PATH, out)
     return out
@@ -1788,7 +1813,7 @@ def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None
                 t["write"] = bool(t.get("write")) and write
                 k = str(t.get("kind") or "").strip().lower()
                 k = {"动脑": "think", "审美": "design", "文案": "copy"}.get(k, k)
-                t["kind"] = k if k in TIERS else "work"
+                t["kind"] = k if k in TASK_TIERS else "work"
                 want = str(t.get("spec") or "").strip()
                 t["spec"] = None
                 if want:  # 用户点名的模型：可用就照用，压过预设；不可用就按预设，并写在 why 里
@@ -2025,7 +2050,7 @@ def _exec_tasks(cfg, run_id, run_dir, state, save, max_parallel, share_results=T
         t0 = time.time()
         try:
             text, spec = ask(cfg, t["agent"], p, cwd=cwd, write=t["write"], quiet=True, note=share_results, spec=t.get("spec"),
-                             tier=t.get("kind") if t.get("kind") in TIERS else ("think" if not share_results else None), meta={"run": run_id, "task": t["id"], "kind": "task", "title": t["title"],
+                             tier=t.get("kind") if t.get("kind") in TASK_TIERS else ("think" if not share_results else None), meta={"run": run_id, "task": t["id"], "kind": "task", "title": t["title"],
                                    "on_start": started})
             return {"ok": True, "text": text, "backend": spec, "secs": round(time.time() - t0, 1)}
         except BackendError as e:
@@ -2398,8 +2423,9 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
     full = bool(write) or os.environ.get("HUB_FULL") == "1"
     perm = ("你现在可以读写文件、运行命令、上网查，别说自己没有权限。" if full else
             "这次是只读：你能读文件、上网查，但不能改文件、不能运行命令；需要动手时交给团队，并跟用户说一句是因为只读。")
+    own = any(think_setting(cfg, name, "chat"))  # 成员卡片上单独设了「对接」模型/档位：就用它，不再自动换轻模型
     text, spec = ask(cfg, name, CHAT_PROMPT.format(team=team, phase_note=note, message=message, perm_note=perm), cwd=cwd,
-                     write=False, note=False, spec=fast,
+                     write=False, note=False, spec=None if own else fast, tier="chat" if own else None,
                      meta={"kind": "chat", "title": "联络：" + shown[:40], "chat": info, "on_start": cid_box.append,
                            "defer": True,
                            "resume_prompt": CHAT_PROMPT.format(team=team, phase_note=note, message=shown, perm_note=perm) if top_meta().get("display") else None})
@@ -2485,14 +2511,14 @@ def pid_alive(pid):
 
 
 class _RecordCache:
-    """只解析变化的历史文件；有界缓存，返回副本供详情页补充字段。"""
+    """按文件版本缓存解析结果。shared=True 仅供读数据的调用方使用。"""
 
     def __init__(self, limit):
         self.limit = limit
         self.records = OrderedDict()
         self.lock = threading.Lock()
 
-    def read(self, path, st=None):
+    def read(self, path, st=None, *, shared=False):
         with self.lock:
             try:
                 st = st or os.stat(path)
@@ -2507,19 +2533,20 @@ class _RecordCache:
                 if len(self.records) > self.limit:
                     self.records.popitem(last=False)
             self.records.move_to_end(path)
-            return copy.deepcopy(cached[1])
+            return cached[1] if shared else copy.deepcopy(cached[1])
 
 
 _call_records = _RecordCache(1024)  # 最近 400 次调用，加上项目里的旧任务和当前详情
 _run_records = _RecordCache(64)
+_model_records = _RecordCache(2)
 
 
-def _load_call(path, st=None):
+def _load_call(path, st=None, *, shared=False):
     try:
         st = st or os.stat(path)
     except OSError:
         return None
-    c = _call_records.read(path, st)
+    c = _call_records.read(path, st, shared=shared)
     if not isinstance(c, dict) or "id" not in c:
         return None
     if c.get("status") == "running" and not pid_alive(c.get("pid")):
@@ -2534,8 +2561,8 @@ def _load_call(path, st=None):
     return c
 
 
-def _load_run(path):
-    r = _run_records.read(path)
+def _load_run(path, *, shared=False):
+    r = _run_records.read(path, shared=shared)
     if not isinstance(r, dict):
         return None
     if r.get("status") in ("planning", "running", "synthesizing") and not pid_alive(r.get("pid")):
@@ -2552,7 +2579,7 @@ def _load_run(path):
     return r
 
 
-def load_calls(limit=400):
+def load_calls(limit=400, *, shared=False):
     try:
         paths = []
         with os.scandir(CALLS_DIR) as entries:
@@ -2569,21 +2596,21 @@ def load_calls(limit=400):
              else sorted(paths, key=key, reverse=True)[:limit])
     out = []
     for p, st in paths:
-        c = _load_call(p, st)
+        c = _load_call(p, st, shared=shared)
         if c is not None:
             out.append(c)
     out.sort(key=lambda c: c.get("start") or 0, reverse=True)
     return out
 
 
-def load_runs(limit=40):
+def load_runs(limit=40, *, shared=False):
     try:
         ids = sorted(os.listdir(RUNS_DIR), reverse=True)
     except OSError:
         return []
     out = []
     for rid in ids:
-        r = _load_run(os.path.join(RUNS_DIR, rid, "run.json"))
+        r = _load_run(os.path.join(RUNS_DIR, rid, "run.json"), shared=shared)
         if r is None:
             continue
         out.append(r)
@@ -2626,8 +2653,53 @@ def call_preferred(c):
     return c.get("preferred_backend") or (attempts[0].get("backend") if attempts else c.get("backend"))
 
 
-def ui_state(cfg):
-    calls, runs = load_calls(), load_runs()
+def record_version(path):
+    try:
+        st = os.stat(path)
+        return "%x:%x:%x:%x" % (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    except OSError:
+        return ""
+
+
+def ui_call_summary(c):
+    d = {k: c[k] for k in ("id", "parent", "run", "kind", "agent", "backend", "status", "start",
+                           "end", "secs", "write", "cwd", "error", "follows", "submission_id",
+                           "side", "fork", "resumed", "images", "handoff") if c.get(k) is not None}
+    # 保留列表中可搜索的标题。完整指令、回答和对接人的交接文字走详情接口。
+    if c.get("display") and not (c.get("parent") or c.get("run") or c.get("kind") == "side"):
+        d["display"] = c["display"]
+    elif c.get("kind") == "image" and c.get("title") and not (c.get("run") or c.get("parent")):
+        d["title"] = c["title"]
+    else:
+        d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
+    if c.get("chat"):
+        d["chat"] = {k: c["chat"][k] for k in ("mode", "write") if k in c["chat"]}
+    if c.get("dispatch"):
+        di = c["dispatch"]
+        d["dispatch"] = {"run": di.get("run"), "mode": di.get("mode"), "goal": (di.get("goal") or "")[:80]}
+    preferred = call_preferred(c)
+    if preferred and preferred != c.get("backend"):
+        d["preferred_backend"] = preferred
+    d["rev"] = record_version(os.path.join(CALLS_DIR, c["id"] + ".json"))
+    return d
+
+
+def ui_run_summary(r):
+    d = {k: r[k] for k in ("id", "status", "start", "end", "cwd", "error", "write", "follows",
+                           "submission_id", "parent_call", "pressure", "fork", "images", "planner",
+                           "synthesizer") if r.get(k) is not None}
+    # display/goal 原来同时传送，两者择一仍能保持原来的标题和搜索结果。
+    d["display"] = r.get("display") or r.get("goal")
+    d["mode"] = r.get("mode") or "run"
+    d["rev"] = record_version(os.path.join(RUNS_DIR, r.get("id") or "", "run.json"))
+    d["tasks"] = [{k: t[k] for k in ("id", "agent", "title", "status", "skip_reason", "kind",
+                                    "plan_spec", "spec", "backend", "call_id") if t.get(k) is not None}
+                  for t in (r.get("tasks") or [])]
+    return d
+
+
+def ui_state(cfg, compact=False):
+    calls, runs = load_calls(shared=True), load_runs(shared=True)
     try:
         start_auto_titles(active_cfg(cfg), calls, runs)
     except Exception as e:  # 起名出问题不能影响面板
@@ -2668,6 +2740,9 @@ def ui_state(cfg):
     for i, c in enumerate(calls):
         if i >= 200 and (c.get("parent") or c.get("run") or c.get("kind") == "side"):
             continue
+        if compact:
+            lite_calls.append(ui_call_summary(c))
+            continue
         d = {k: c.get(k) for k in ("id", "parent", "run", "task", "kind", "title", "agent", "backend", "status",
                                    "start", "end", "secs", "write", "cwd", "error", "follows", "display", "submission_id",
                                    "chat", "dispatch", "side", "fork", "resumed", "images", "handoff")}
@@ -2679,6 +2754,9 @@ def ui_state(cfg):
         lite_calls.append(d)
     lite_runs = []
     for r in runs:
+        if compact:
+            lite_runs.append(ui_run_summary(r))
+            continue
         d = {k: r.get(k) for k in ("id", "goal", "status", "summary", "start", "end", "cwd", "planner",
                                    "synthesizer", "error", "write", "follows", "display", "submission_id",
                                    "participants", "skipped", "timeout_warning", "parent_call", "pressure", "fork", "images")}
@@ -2689,11 +2767,12 @@ def ui_state(cfg):
         for t in d["tasks"]:
             if not t.get("preferred_backend") and t.get("call_id"):
                 t["preferred_backend"] = call_preferred(_call_records.read(os.path.join(
-                    CALLS_DIR, t["call_id"] + ".json")) or {})
+                    CALLS_DIR, t["call_id"] + ".json"), shared=True) or {})
         lite_runs.append(d)
     health = read_json(HEALTH_PATH) or {}
     keeps = [{k: d.get(k) for k in ("id", "model", "write", "title", "start", "last", "turns", "busy")} for d in keep_list()]
-    return {"now": now, "agents": agents, "runs": lite_runs, "calls": lite_calls, "keeps": keeps, "awake": awake_on(),
+    st = {"now": int(now // 60) * 60 if compact else now,
+            "agents": agents, "runs": lite_runs, "calls": lite_calls, "keeps": keeps, "awake": awake_on(),
             "archived": load_archived(),
             "names": load_names(), "naming": _names_running.is_set(), "folders": load_folders(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
@@ -2707,6 +2786,9 @@ def ui_state(cfg):
                            tiers={tr: {n: dict(zip(("spec", "effort"), think_setting(cfg, n, tr))) for n in cfg["agents"]} for tr in TIERS}),
             "workspace": UI_WORKSPACE, "backends": backend_choices(cfg),
             "ui_version": int(os.path.getmtime(UI_HTML)) if os.path.exists(UI_HTML) else 0}
+    if compact:
+        st["live"] = {c["id"]: live_len(c["id"]) for c in lite_calls if c.get("status") == "running"}
+    return st
 
 
 MODELS_PATH = os.path.join(HUB_HOME, "models.json")
@@ -2714,7 +2796,7 @@ _models_running = threading.Event()
 
 
 def refresh_models():
-    """从 Antigravity 取可用的 Gemini 模型清单（只留 Gemini，按用户要求不用它里面的 Claude/GPT）。"""
+    """从 Antigravity 取可用的模型清单：Gemini 和 Claude（不收它里面的 GPT-OSS）。"""
     if _models_running.is_set():
         return
     _models_running.set()
@@ -2728,7 +2810,7 @@ def refresh_models():
             ids = []
             for line in out.splitlines():
                 p = line.split("\t")
-                if len(p) >= 2 and p[0].strip().startswith("gemini"):
+                if len(p) >= 2 and p[0].strip().startswith(("gemini", "claude-")):
                     ids.append({"id": p[0].strip(), "name": p[1].strip()})
             if ids:
                 write_json(MODELS_PATH, {"ts": time.time(), "agy": ids})
@@ -2762,15 +2844,24 @@ def enabled_specs(cfg):
     return set(o["spec"] for o in backend_choices(cfg) if not o.get("off"))
 
 
+def agy_label(m):
+    """Antigravity 模型的显示名；Claude 加「· Antigravity」，和本机 Claude 命令行区分开。档位括号留在最后，面板靠它分档。"""
+    name = m.get("name") or m["id"]
+    if not m["id"].startswith("claude-"):
+        return name
+    lv = re.match(r"^(.*?)\s*(\([^)]*\))\s*$", name)
+    return (lv.group(1) + " · Antigravity " + lv.group(2)) if lv else name + " · Antigravity"
+
+
 def backend_choices(cfg):
     """面板里可选的后端：[{spec, label}]。"""
     d = read_json(MODELS_PATH) or {}
     if time.time() - (d.get("ts") or 0) > 86400:
         refresh_models()
-    out = [{"spec": "agy:" + m["id"], "label": m.get("name") or m["id"]} for m in d.get("agy") or []]
+    out = [{"spec": "agy:" + m["id"], "label": agy_label(m)} for m in d.get("agy") or []]
     cdef, ceff = codex_defaults()
     out.append({"spec": "codex", "label": "GPT · 跟随 Codex 设置" + ("（现为 %s）" % cdef if cdef else "")})
-    cm = read_json(os.path.join(HOME, ".codex", "models_cache.json")) or {}
+    cm = _model_records.read(os.path.join(HOME, ".codex", "models_cache.json"), shared=True) or {}
     for m in cm.get("models") or []:
         if isinstance(m, dict) and m.get("slug") and m.get("visibility") == "list":
             out.append({"spec": "codex:" + m["slug"], "label": m.get("display_name") or m["slug"]})
@@ -2863,11 +2954,14 @@ def ui_run(rid):
     if r is None or r.get("id") != rid:
         return None
     for t in r.get("tasks") or []:
+        c = _call_records.read(os.path.join(CALLS_DIR, "%s.json" % t["call_id"]), shared=True) if t.get("call_id") else None
+        if not t.get("preferred_backend") and c:
+            t["preferred_backend"] = call_preferred(c)
         if t.get("status") == "running":
             t["live"] = read_live(t.get("call_id"))
         elif t.get("call_id"):
-            t["session"] = (_call_records.read(os.path.join(CALLS_DIR, "%s.json" % t["call_id"])) or {}).get("session")
-    for c in load_calls():
+            t["session"] = (c or {}).get("session")
+    for c in load_calls(shared=True):
         if c.get("run") == rid and c.get("kind") in ("plan", "synth"):
             r.setdefault(c["kind"] + "_calls", []).append(
                 {k: c.get(k) for k in ("id", "agent", "backend", "status", "secs", "start", "attempts")})
@@ -4008,6 +4102,32 @@ def _reexec_ui(port, me):
 
 
 
+def history_patch(before, after):
+    old = {r.get("id"): r for r in before}
+    new = {r.get("id"): r for r in after}
+    patch = {"upsert": [r for k, r in new.items() if old.get(k) != r],
+             "remove": [k for k in old if k not in new]}
+    if list(old) != list(new):
+        patch["order"] = list(new)
+    return patch
+
+
+def accepts_gzip(header):
+    qualities = {}
+    for part in header.lower().split(","):
+        coding, *params = part.split(";")
+        quality = 1
+        for param in params:
+            key, _, value = param.strip().partition("=")
+            if key.strip() == "q":
+                try:
+                    quality = float(value)
+                except ValueError:
+                    quality = 0
+        qualities[coding.strip()] = quality
+    return 0 < qualities.get("gzip", qualities.get("*", 0)) <= 1
+
+
 def serve_ui(port, me):
     import mimetypes
     import secrets
@@ -4021,6 +4141,48 @@ def serve_ui(port, me):
     restart = {"on": False}
     clients = {}  # 页面 id -> 最近一次来取数据的时间
     clients_lock = threading.Lock()
+    state_lock = threading.Lock()
+    snapshots = {False: OrderedDict(), True: OrderedDict()}
+    html_lock = threading.Lock()
+    html_cache = {}
+
+    def dashboard_html():
+        path = UI_HTML if os.path.exists(UI_HTML) else os.path.join(os.path.dirname(os.path.realpath(me)), "ui.html")
+        with html_lock:
+            sig = record_version(path)
+            if not sig or html_cache.get("version") != sig:
+                with open(path, encoding="utf-8") as f:
+                    body = f.read().replace("__HUB_TOKEN__", token).encode("utf-8")
+                html_cache.update(version=sig, body=body, gzipped=gzip.compress(body, compresslevel=1, mtime=0))
+            return html_cache["body"], html_cache["gzipped"]
+
+    def get_state(remote, compact, version):
+        cfg = load_config()
+        st = ui_state(cfg, compact)
+        st["client"] = {"remote": remote}
+        st["lan"] = {"enabled": bool(cfg.get("lan_access")), "listening": lan_on}
+        if not compact:
+            return st
+        recent = snapshots[remote]
+        latest = next(reversed(recent), None)
+        if latest is None or st != recent[latest]:
+            if latest is not None:
+                # 复用未变化的部分，多个窗口可以从各自上一版追上。
+                st = {k: recent[latest][k] if v == recent[latest][k] else v for k, v in st.items()}
+            latest = secrets.token_hex(8)
+            recent[latest] = st
+            if len(recent) > 8:
+                recent.popitem(last=False)
+        if version == latest:
+            return {"version": latest}
+        if version not in recent:
+            return {"version": latest, **st}
+        before = recent[version]
+        changed = {k: v for k, v in st.items() if v != before[k]}
+        for key in ("calls", "runs"):
+            if key in changed:
+                changed[key] = history_patch(before[key], st[key])
+        return {"version": latest, "changes": changed}
 
     def launch(cmd, cwd, text, meta):
         env = {k: v for k, v in os.environ.items() if not k.startswith("HUB_") or k == "HUB_HOME"}
@@ -4290,13 +4452,25 @@ def serve_ui(port, me):
         def log_message(self, *a):
             pass
 
-        def send(self, code, body, ctype="application/json; charset=utf-8"):
+        def send(self, code, body, ctype="application/json; charset=utf-8", gzipped=None):
             if not isinstance(body, bytes):
-                body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+                body = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            compressible = ctype.startswith(("text/html", "application/json"))
+            compressed = None
+            if compressible and len(body) >= 512 and accepts_gzip(",".join(self.headers.get_all("Accept-Encoding", []))):
+                compressed = gzipped if gzipped is not None else gzip.compress(body, compresslevel=1, mtime=0)
+                if len(compressed) < len(body):
+                    body = compressed
+                else:
+                    compressed = None
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if compressible:
+                self.send_header("Vary", "Accept-Encoding")
+            if compressed is not None:
+                self.send_header("Content-Encoding", "gzip")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
             if not ctype.startswith("text/html"):
@@ -4364,19 +4538,16 @@ def serve_ui(port, me):
                 return self.send(200, app_icon_png(), "image/png")
             if u.path == "/":
                 try:
-                    here = os.path.join(os.path.dirname(os.path.realpath(me)), "ui.html")
-                    with open(UI_HTML if os.path.exists(UI_HTML) else here, encoding="utf-8") as f:
-                        html = f.read().replace("__HUB_TOKEN__", token)
+                    html, gzipped = dashboard_html()
                 except OSError:
                     return self.send(500, "找不到界面文件 %s" % UI_HTML, "text/plain; charset=utf-8")
-                return self.send(200, html.encode("utf-8"), "text/html; charset=utf-8")
+                return self.send(200, html, "text/html; charset=utf-8", gzipped)
             if u.path == "/api/state":
                 # 没带编号的是旧版页面，也算一个窗口
                 with clients_lock:
                     clients[q["c"] if re.fullmatch(r"[a-z0-9]{4,20}", q.get("c") or "") else "old"] = time.time()
-                st = ui_state(load_config())
-                st["client"] = {"remote": self.remote()}
-                st["lan"] = {"enabled": bool(load_config().get("lan_access")), "listening": lan_on}
+                with state_lock:
+                    st = get_state(self.remote(), q.get("compact") == "1", q.get("v"))
                 return self.send(200, st)
             if u.path == "/api/clients":
                 now = time.time()

@@ -6,9 +6,9 @@ function boot(store){
   const nodes={};
   const node=id=>nodes[id]||(nodes[id]={innerHTML:'',value:'',textContent:'',style:{},dataset:{},scrollTop:0,classList:{add(){},remove(){},toggle(){}},addEventListener(){},querySelectorAll(){return []},focus(){},contains(){return false}});
   const ss={getItem:k=>k in store?store[k]:null,setItem:(k,v)=>{store[k]=String(v)},removeItem:k=>{delete store[k]}};
-  const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []}},window:{},localStorage:{getItem(){return null}},sessionStorage:ss,addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},getSelection:()=>null};
+  const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []}},window:{},localStorage:{getItem(){return null}},sessionStorage:ss,addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},setTimeout:()=>1,getSelection:()=>null};
   vm.createContext(ctx);
-  vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);',
+  vm.runInContext(source.replace('schedulePoll(0); setInterval(ticks, 1000);',
     `globalThis.ui={set:s=>S=s,errHtml,chainOf,groups,viewChat,findItem,viewRun,viewNew,items,renderComposer,openKey:k=>open.add(k),settingsHtml,saveDraft,getMode:()=>mode,setMode:m=>mode=m,cache:detail};`),ctx);
   return {ui:ctx.ui,nodes};
 }

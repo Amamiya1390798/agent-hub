@@ -264,6 +264,7 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .ctx.off button{width:auto;height:auto;padding:1px 7px;color:var(--ink)}
 .sidewin{position:fixed;right:18px;bottom:18px;width:410px;max-width:calc(100vw - 24px);height:min(640px,calc(100vh - 36px));background:var(--panel);border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.28);display:flex;flex-direction:column;z-index:40}
 .sidewin[hidden]{display:none}
+.chat .who .cmodel{font-weight:500;opacity:.85}
 .flink{color:var(--live);text-decoration:none;border-bottom:1px dashed currentColor;cursor:pointer;word-break:break-all}
 .flink:hover{border-bottom-style:solid}
 .fview{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:45;display:flex;align-items:center;justify-content:center;padding:24px}
@@ -556,6 +557,7 @@ const agentDetails = new Set();
 let S = null;                       // 最新状态
 let sel = null;                     // {type:'run'|'call', id}；null = 新任务
 let followLatest = false, pendingSubmission = null, pollSeq = 0, appliedPollSeq = 0, sending = false, stopTimer = 0;
+let pollTimer = 0;
 const beginSubmit = () => { pendingSubmission = null; followLatest = true; };
 let filter = "all", query = "";
 let mode = "chat", allowWrite = localStorage.getItem("hub-write") !== "0", showCwd = false, ctx = null;
@@ -632,7 +634,18 @@ function isFileRef(u){
   if (/^(\/|~\/)/.test(u)) return /\/[^/]+(\.[A-Za-z0-9]{1,8}|\/)$/.test(u) || /^(\/|~\/)[^/]+\/[^/]+/.test(u);
   return /^[^\/][^<>|*?]*\.[A-Za-z0-9]{1,8}$/.test(u) && !/^www\./i.test(u);
 }
+const MD_CACHE = new Map();               // 排版结果按原文记住：长对话每次刷新不用把几百条回答重排一遍
 function md(src){
+  const k = String(src || "");
+  let h = MD_CACHE.get(k);
+  if (h === undefined){
+    h = mdRender(k);
+    if (MD_CACHE.size > 2000) MD_CACHE.delete(MD_CACHE.keys().next().value);
+    MD_CACHE.set(k, h);
+  }
+  return h;
+}
+function mdRender(src){
   const L = String(src || "").replace(/\r/g, "").split("\n"), out = [];
   let i = 0;
   const isList = l => /^(\s*)([-*+]|\d+[.)])\s+/.exec(l);
@@ -708,20 +721,37 @@ const icon = k => '<span class="ic ' + k + '">' + (k === "ok" ? "✓" : k === "b
 const badge = (k, t) => '<span class="badge ' + (k === "wait" || k === "skip" ? "plain" : k) + '">' + (k === "run" ? '<span class="ic run" style="width:10px;height:10px;border-width:1.5px"></span>' : "") + esc(t) + "</span>";
 const tick = (start, end, secs) => secs != null ? '<span class="dur">' + dur(secs) + "</span>" : end ? '<span class="dur">' + dur(end - start) + "</span>" : '<span class="dur tick" data-start="' + start + '"></span>';
 
+let itemIndex = {};
 function items(){
   if (!S) return [];
+  if (itemIndex.calls === S.calls && itemIndex.runs === S.runs) return itemIndex.all;
+  itemIndex = {calls:S.calls, runs:S.runs, children:new Map(), byKey:new Map(), follows:new Map()};
+  for (const c of S.calls){
+    if (!c.parent || (c.kind !== "ask" && c.kind !== "image")) continue;
+    if (!itemIndex.children.has(c.parent)) itemIndex.children.set(c.parent, []);
+    itemIndex.children.get(c.parent).push(c);
+  }
+  for (const cs of itemIndex.children.values()) cs.sort((a,b) => a.start - b.start);
   const out = [];
   for (const r of S.runs) out.push({type:"run", id:r.id, start:r.start, end:r.end, status:r.status, error:r.error,
     title:r.display || r.goal, follows:r.follows, fork:!!r.fork, council:r.mode === "council", pressure:!!r.pressure,
     agents:[r.planner].concat(r.tasks.filter(t => !t.skip_reason).map(t => t.agent), r.tasks.length > 1 ? [r.synthesizer] : []), rec:r});
   for (const c of S.calls) if (!c.run && !c.parent && c.kind !== "side") out.push({type:"call", id:c.id, start:c.start, end:c.end, status:c.status, error:c.error,
     title:c.display || (c.kind === "image" && c.title) || c.prompt_preview, follows:c.follows, fork:!!c.fork, image:c.kind === "image",
-    agents:c.kind === "handoff" ? [] : [c.agent].concat(kids(c.id).map(x => x.agent)), rec:c});
+    agents:c.kind === "handoff" ? [] : [c.agent].concat((itemIndex.children.get(c.id) || []).map(x => x.agent)), rec:c});
   out.sort((a,b) => b.start - a.start);
+  for (const i of out){
+    itemIndex.byKey.set(akey(i), i);
+    if (!i.follows || i.fork) continue;
+    const k = akey(i.follows);
+    if (!itemIndex.follows.has(k)) itemIndex.follows.set(k, []);
+    itemIndex.follows.get(k).push(i);
+  }
+  itemIndex.all = out;
   return out;
 }
-const findItem = s => s && items().find(i => i.type === s.type && i.id === s.id);
-const kids = cid => S.calls.filter(c => c.parent === cid && (c.kind === "ask" || c.kind === "image")).sort((a,b) => a.start - b.start);
+const findItem = s => { if (!S || !s) return; items(); return itemIndex.byKey.get(akey(s)); };
+const kids = cid => { items(); return itemIndex.children.get(cid) || []; };
 const uniq = a => a.filter((x,i) => x && a.indexOf(x) === i);
 const ARCH_ICON = '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="2.5" width="12.4" height="3.2" rx=".8"/><path d="M2.8 5.7v7a1 1 0 0 0 1 1h8.4a1 1 0 0 0 1-1v-7M6.3 8.6h3.4"/></svg>';
 const akey = i => i.type + ":" + i.id;
@@ -736,8 +766,11 @@ function groupOf(it){            // 这条记录所在的项目组（或它自�
   return {items: [s], archived: isArch(s), running: !!RUNNING[s.status], key: akey(s), title: nameOf(s), named: !!(S.names || {})[akey(s)], latest: s};
 }
 
+let groupIndex = {};
 function groups(){
-  const all = items(), uf = {}, buckets = {};
+  const all = items(), names = S && S.names, archived = S && S.archived;
+  if (groupIndex.all === all && groupIndex.names === names && groupIndex.archived === archived) return groupIndex.data;
+  const uf = {}, buckets = {};
   const find = x => { while (uf[x] && uf[x] !== x) x = uf[x] = uf[uf[x]] || uf[x]; return uf[x] || (uf[x] = x); };
   const union = (a, b) => { a = find(a); b = find(b); if (a !== b) uf[a] = b; };
   for (const i of all){
@@ -808,7 +841,9 @@ function groups(){
   }
   projects.sort((a, b) => b.time - a.time);
   solos.sort((a, b) => b.start - a.start);
-  return {projects, solos};
+  const data = {projects, solos};
+  groupIndex = {all, names, archived, data};
+  return data;
 }
 
 /* ---------- 左栏 ---------- */
@@ -892,6 +927,8 @@ async function folderMove(keys, folder){
   folderArm = null; last.list = ""; poll();
 }
 function renderList(){
+  last.listPending = document.activeElement && document.activeElement.tagName === "SELECT" && $("list").contains(document.activeElement);
+  if (last.listPending) return;
   let {projects, solos} = groups();
   const nArch = projects.filter(g => g.archived).length + solos.filter(isArch).length;
   const fs = [["all","全部"],["running","进行中"],["failed","失败"],["archived","已归档" + (nArch ? " " + nArch : "")]];
@@ -1046,16 +1083,23 @@ function effortSelect(a){               // 卡片上的「思考等级」：沿�
 }
 const HOME_KIND = {gemini: "agy", claude: "claude", gpt: "codex", ds: "dsh"};
 const kindOf = sp => (sp || "").split(":")[0];
+const homeOf = sp => (sp || "").startsWith("agy:claude-") ? "claude" : kindOf(sp);   // 模型归哪家：Antigravity 里的 Claude 算 Claude
 function ownModels(a, cur){              // 这位成员自家的模型（Claude 只列 Claude，GPT 只列 GPT…）；备用模型不受限
-  const k = HOME_KIND[a.name] || kindOf(a.chain[0]);
-  return usable(S.backends || [], cur).filter(o => kindOf(o.spec) === k || o.spec === cur);
+  const k = HOME_KIND[a.name] || homeOf(a.chain[0]);
+  return usable(S.backends || [], cur).filter(o => homeOf(o.spec) === k || o.spec === cur);
 }
-const TIER_LIST = [["think", "动脑", "定方案、审查、拍板、会审"], ["design", "审美", "排版、配色、界面视觉、挑图"], ["copy", "文案", "标题、广告语、对外文字、润色"]];
-const TIER_NAME = {work: "干活", think: "动脑", design: "审美", copy: "文案"};
+const TIER_LIST = [["chat", "对接", "当对接人跟你聊天时（不设就用干活的模型）"], ["think", "动脑", "定方案、审查、拍板、会审"], ["design", "审美", "排版、配色、界面视觉、挑图"], ["copy", "文案", "标题、广告语、对外文字、润色"]];
+const TIER_NAME = {work: "干活", think: "动脑", design: "审美", copy: "文案", chat: "对接"};
 function plannedSpec(agent, kind){       // 任务还没开工时，按成员卡片推算会用哪个模型
   const a = ((S && S.agents) || []).find(x => x.name === agent) || {chain: []};
   const th = (((S && S.config && S.config.tiers) || {})[kind] || {})[agent] || {};
   return th.spec || a.chain[0] || "";
+}
+function callModel(r){                 // 这一轮实际用的子型号；换了备用会注明
+  const sp = r && r.backend;
+  if (!sp || sp === "-") return "";
+  const name = sp === "codex" ? "GPT（本机设置的型号）" : specLabel(sp).replace(/^(agy|claude|codex):/, "");
+  return name + (r.preferred_backend && r.preferred_backend !== sp ? "（首选用不了，换了备用）" : "");
 }
 function taskModel(t){                 // 「审美 · Gemini Flash」：开工后写实际在用的模型（中途换了备用也跟着变），没开工写预计
   const c = t.call_id && ((S && S.calls) || []).find(x => x.id === t.call_id);
@@ -1088,7 +1132,10 @@ function tierRow(a, tier, name, hint){  // 卡片上一行：某类活用的模�
         fams.map(x => { const m = gemLevel(x.o.spec); return opt(m ? pick(m[1]) : x.o.spec, m ? gemFamily(x.o.label) : lbl(x.o), sp && (m ? m[1] === g[1] : x.o.spec === sp)); }).join("")) +
       (sp && sib.length > 1 ? sel("档位", "data-tier-spec", sib.map(o => opt(o.spec, gemLabel(o), sp === o.spec)).join("")) : ""));
   }
-  let h = sel("模型", "data-tier-spec", opt("", "跟干活一样", !sp) + mine.filter(o => !gemLevel(o.spec)).map(o => opt(o.spec, lbl(o), o.spec === sp)).join(""));
+  const gfams = [];                      // 带档位的系列（如 Antigravity 里的 Claude）各列一次，选中后再出档位框
+  mine.forEach(o => { const m = gemLevel(o.spec); if (m && !gfams.some(x => x[1] === m[1])) gfams.push([(mine.find(y => y.spec === "agy:" + m[1] + "-medium") || o).spec, m[1], gemFamily(o.label)]); });
+  let h = sel("模型", "data-tier-spec", opt("", "跟干活一样", !sp) + mine.filter(o => !gemLevel(o.spec)).map(o => opt(o.spec, lbl(o), o.spec === sp)).join("") +
+    gfams.map(x => opt(x[0], x[2], false)).join(""));
   const levels = ((S.backends || []).find(b => b.spec === use) || {}).efforts || [];
   if ((kind === "codex" || kind === "claude") && levels.length)
     h += sel("档位", "data-tier-eff", [{id: "", desc: ""}].concat(levels).map(e => opt(e.id, e.id ? e.id + (EFF_NOTE[e.id] || "") : "档位同干活", e.id === (th.effort || ""))).join(""));
@@ -1101,7 +1148,7 @@ function sideState(){                   // 当前小窗里选中的成员、模�
   const ags = liveAgents().length ? liveAgents() : S.agents;
   if (!sideAgent || !ags.some(a => a.name === sideAgent)) sideAgent = (ags.find(a => a.name === "gemini") || ags[0]).name;
   const a = ags.find(x => x.name === sideAgent), kind = (a.chain[0] || "").split(":")[0];
-  const models = (S.backends || []).filter(b => b.spec.split(":")[0] === kind && (!b.off || b.spec === a.chain[0]));
+  const models = (S.backends || []).filter(b => homeOf(b.spec) === homeOf(a.chain[0]) && (!b.off || b.spec === a.chain[0]));
   const sp = models.some(b => b.spec === sideSpec) ? sideSpec : a.chain[0];
   const base = sideBase === "follow" && sideFollow ? findSide(sideFollow.id) : sideBase === "main" ? findItem(sel) : null;
   const baseOk = base && !RUNNING[base.status] ? base : null;
@@ -1143,9 +1190,9 @@ function sideCtlHtml(st){
 }
 function sideItemHtml(c){
   const si = stInfo(c.status, c.error), sd = c.side || {};
-  const full = need("call", c.id, c.status + "|" + (c.end || ""));
+  const full = need("call", c.id, c.rev || c.status + "|" + (c.end || ""));
   const based = c.follows ? (findSide(c.follows.id) ? "接着旁问" : "基于主线记录") : "单独问";
-  let h = '<div class="sw-item"><div class="sw-q">' + esc(c.display || c.prompt_preview || "") + '</div>' + thumbsHtml(c.images) + '<div class="sw-meta">' +
+  let h = '<div class="sw-item"><div class="sw-q">' + esc((full && full.display) || c.display || c.prompt_preview || "") + '</div>' + thumbsHtml(c.images) + '<div class="sw-meta">' +
     esc(c.agent) + " · " + esc(c.backend === "codex" ? "GPT（本机默认模型）" : specLabel(c.backend)) + (sd.effort ? " · " + esc(sd.effort) : "") + (sd.web ? " · 联网" : "") + " · " + based + (c.resumed ? " · 续接原会话" : "") + " · " + tick(c.start, c.end, c.secs) + '</div>';
   if (RUNNING[c.status]) h += '<div class="small">' + esc(si.t) + '…</div>';
   else if (full && full.answer){ copyStore["side:" + c.id] = full.answer; h += '<div class="md">' + md(full.answer) + '</div>'; }
@@ -1158,7 +1205,7 @@ function renderSide(){
   const w = $("sidewin");
   w.hidden = !sideOpen;
   $("tb-side").classList.toggle("primary", sideOpen);
-  if (!sideOpen || !S) return;
+  if (!sideOpen || !S){ last.sidePending = false; return; }
   const list = sideCalls();
   const hh = list.length ? list.map(sideItemHtml).join("") : '<div class="sw-empty">在这里单独问个繁琐的小问题，比如查个资料、确认个用法。<br>不会进入左边的记录，也不会打断团队正在做的事。<br>可以基于当前打开的记录问，也可以完全单独问。</div>';
   if (hh !== last.side){
@@ -1168,7 +1215,8 @@ function renderSide(){
   }
   const st = sideState();
   const ch = sideCtlHtml(st);
-  if (ch !== last.sideCtl && !(document.activeElement && $("sw-ctl").contains(document.activeElement))){ $("sw-ctl").innerHTML = ch; last.sideCtl = ch; }
+  last.sidePending = ch !== last.sideCtl && document.activeElement && $("sw-ctl").contains(document.activeElement);
+  if (ch !== last.sideCtl && !last.sidePending){ $("sw-ctl").innerHTML = ch; last.sideCtl = ch; }
   $("sw-hint").textContent = "只读，不会改文件" + (st.base ? "；会带上「" + (st.base.title || "").slice(0, 16) + "」" + (sideScope === "one" ? "这一条的问答" : "及之前的完整对话") : "");
   $("sw-send").disabled = sideSending || !$("sw-txt").value.trim();
 }
@@ -1261,7 +1309,7 @@ function settingsHtml(){
     field('谁来汇总', '<select data-cfg="synthesizer">' + optA(cfg.synthesizer) + '</select>', '把大家的回答整理成一份结果；会审时由它比较共同点和分歧。建议用 Gemini；只有一个子任务时直接交回结果。') +
     field('谁参加会审', '<span class="council-pick">' + S.agents.map(a => '<label style="display:inline-flex;gap:4px;margin-right:10px' + (a.disabled ? ';opacity:.5' : '') + '"><input type="checkbox" data-council="' + esc(a.name) + '"' + ((cfg.council_agents || []).indexOf(a.name) >= 0 ? " checked" : "") + (a.disabled ? " disabled" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</label>').join("") + '</span>', '会审时勾选的成员同时各自作答，互相看不到答案，再由汇总的人比较。默认 Gemini、GPT、DeepSeek；Claude 默认不参加，想让它参加就勾上。') +
     field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + (cfg.auto_title && !liveAgents().some(a => a.name === cfg.auto_title) ? '<option value="' + esc(cfg.auto_title) + '" selected>由 ' + esc(cfg.auto_title) + ' 起名（已停用，现由 ' + esc(cfg.auto_title_live || '无人') + ' 代起）</option>' : '') + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
-    field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
+    field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT，以及走 Antigravity 的 Claude）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
     field('最多同时做几件', '<input type="number" min="1" max="8" data-cfg="max_parallel" value="' + esc(cfg.max_parallel) + '">', '不是只能两位合作：最多可同时做 8 件，也可由同一位做多件。建议先用 3；依赖前一步结果的任务仍要等。') +
     field('一般多久交（分钟）', '<input type="number" min="1" max="120" data-cfg="timeout" data-scale="60" value="' + Math.round(cfg.timeout/60) + '">', '告诉成员大概多久该交。到点不会被掐断：只要还在干活就让它做完。建议 15 分钟。' + (cfg.timeout < (cfg.min_timeout || 900) ? '<br><b class="stuck" style="color:var(--bad)">现在少于 15 分钟：读资料、审查、写长文常常需要 5～15 分钟，成员可能会草草交差。</b>' : '')) +
     field('多久没动静算卡住（分钟）', '<input type="number" min="1" max="30" data-cfg="idle_timeout" data-scale="60" value="' + Math.round((cfg.idle_timeout || 300)/60) + '">', '连续这么久一点输出都没有，就当它卡住了，停下换人接着做（已写出的部分会交过去）。反复做同一件事也会被停。建议 5 分钟。') +
@@ -1289,6 +1337,14 @@ function settingsHtml(){
     '<p class="small">在运行 Hub 的 Mac 上打开该成员所用程序的登录窗口，不会发 AI 消息，也不花模型额度。仅未登录或登录失效时使用；手机上需回到 Mac 完成。</p></section>' + phoneHtml();
 }
 function renderRail(){
+  const active = document.activeElement;
+  last.railPending = Date.now() < railBusyUntil || !!(active && (active.id === "pp" ||
+    ((active.tagName === "SELECT" || active.type === "number") && $("rail").contains(active))));
+  if (last.railPending) return;
+  if (settingsOpen){
+    updateRail(settingsHtml());
+    return;
+  }
   const hl = S.health || {results:{}};
   let h = '<h3>团队<span class="x"><button class="btn railside' + (sideOpen ? ' primary' : '') + '" data-act="sidewin" title="开个小窗单独问个小问题，不影响主线">旁问</button><button class="btn" data-act="settings" aria-label="打开设置">⚙ 设置</button></span></h3><p class="small">按目标分工，不限两位。点模型名称可更换。</p>';
   for (const a of S.agents){
@@ -1323,24 +1379,32 @@ function renderRail(){
     }
     h += '</div>';
   }
-  if (settingsOpen) h = settingsHtml();
+  updateRail(h);
+}
+function updateRail(h){
   if (h !== last.rail){
-    if (Date.now() < railBusyUntil) return;
-    if (document.activeElement && document.activeElement.id === "pp") return;   // 正在写提示词时不重绘，免得打断输入
     const st = $("rail").scrollTop; $("rail").innerHTML = h; $("rail").scrollTop = st; last.rail = h; ticks();
   }
 }
 
 /* ---------- 中栏：详情 ---------- */
+let detailRenderTimer = 0, detailRetryAt = 0;
 function need(type, id, sig){
   const key = type + ":" + id, d = detail[key] || (detail[key] = {});
   if (d.sig !== sig && !d.loading && (!d.errAt || Date.now() - d.errAt > 3000)){
     d.loading = true;
     api("/api/" + type + "?id=" + encodeURIComponent(id)).then(j => { d.data = j; d.sig = sig; d.errAt = 0; })
-      .catch(() => { d.errAt = Date.now(); }).finally(() => { d.loading = false; renderView(); if (sideOpen) renderSide(); });
+      .catch(() => { d.errAt = Date.now(); detailRetryAt = detailRetryAt || d.errAt + 3001; })
+      .finally(() => {
+        d.loading = false;
+        if (!detailRenderTimer) detailRenderTimer = setTimeout(() => {
+          detailRenderTimer = 0; renderView(); if (sideOpen) renderSide();
+        }, 16);
+      });
   }
   return d.data;
 }
+const callSig = c => c.rev ? c.rev + "|" + ((S.live || {})[c.id] || 0) : c.status + "|" + (c.secs || "") + "|" + (c.live || 0);
 const fallbackTag = (agent, backend, preferred) => {
   return preferred && backend && backend !== "-" && backend !== preferred ? '<span class="badge warn" title="首选 ' + esc(preferred) + ' 不可用">由后备顶替 · ' + esc(backend) + "</span>" : "";
 };
@@ -1364,23 +1428,27 @@ function sessHtml(ss, key){
   return '<div class="sess"><span>这一步在「' + esc(ss.app || "") + '」里留有原始会话，编号 <code>' + esc(ss.id.slice(0, 13)) + '…</code></span><button class="copy" data-act="copy" data-key="' + esc(key) + ':s" title="' + esc(ss.resume || "") + '">复制续聊命令</button></div>';
 }
 const closed = new Set();            // 用户手动收起的进行中任务
-function liveHtml(lv, who){
+let liveFragments = null;
+function liveHtml(lv, who, key){
   if (!lv || (!lv.text && !(lv.steps || []).length)) return '<div class="small" style="margin-top:8px">' + esc(who) + " 正在处理…</div>";
-  return '<div class="livebox"><div class="lh"><span class="ic run" style="width:10px;height:10px;border-width:1.5px"></span>' + esc(who) + " 正在输出</div>" +
+  const body = '<div class="lh"><span class="ic run" style="width:10px;height:10px;border-width:1.5px"></span>' + esc(who) + " 正在输出</div>" +
     ((lv.steps || []).length ? '<div class="ls" data-stick>' + lv.steps.map(x => "▸ " + esc(x)).join("<br>") + "</div>" : "") +
-    (lv.text ? '<div class="lt" data-stick><div class="md">' + md(lv.text) + "</div></div>" : "") + "</div>";
+    (lv.text ? '<div class="lt" data-stick><div class="md">' + md(lv.text) + "</div></div>" : "");
+  if (!liveFragments) return '<div class="livebox">' + body + "</div>";
+  liveFragments.set(key, body);
+  return '<div class="livebox" data-live-key="' + esc(key) + '"></div>';
 }
 function callRow(c, label){           // 一次调用（可展开看指令/回答），含它途中委派的调用
   const key = "c:" + c.id, isOpen = open.has(key) || (c.status === "running" && !closed.has(key)), si = stInfo(c.status, c.error);
   let body = "";
   if (isOpen){
-    const full = need("call", c.id, c.status + "|" + (c.secs || "") + "|" + (c.live || 0));
+    const full = need("call", c.id, callSig(c));
     if (!full) body = '<div class="small">加载中…</div>';
     else {
       copyStore[key + ":p"] = full.prompt; copyStore[key + ":a"] = full.answer;
       body = block("交给它的指令", full.prompt, key + ":p", false) +
         (full.attempts && full.attempts.length ? '<div class="lab">没成功的尝试</div>' + attemptsHtml(full.attempts) : "") +
-        (full.answer ? block("它的回答", full.answer, key + ":a", true) : c.status === "running" ? liveHtml(full.live, c.agent) : "") +
+        (full.answer ? block("它的回答", full.answer, key + ":a", true) : c.status === "running" ? liveHtml(full.live, c.agent, key) : "") +
         (full.status === "fail" && full.error ? '<div class="lab">没完成的原因</div>' + errHtml(full.error, full.error_detail, full.partial, key) : "") + sessHtml(full.session, key);
     }
     body = '<div class="rb">' + body + subRows(c.id) + "</div>";
@@ -1513,7 +1581,7 @@ function fold(key, defOpen, title, body){   // 可折叠的一段；默认开/�
 function keepBox(){                     // 开着没关的 Gemini 会话：接着聊不用重新开机；不用了自己关
   const ks = S.keeps || [];
   if (!ks.length) return "";
-  const ago = t => { const m = Math.round((S.now - t) / 60); return m < 1 ? "刚刚" : m < 60 ? m + " 分钟前" : Math.round(m / 60) + " 小时前"; };
+  const ago = t => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 1 ? "刚刚" : m < 60 ? m + " 分钟前" : Math.round(m / 60) + " 小时前"; };
   return '<div class="keepbox"><div class="kh"><b>开着的会话 ' + ks.length + '</b><button class="mini" data-act="keep-close" data-id="all">全部关闭</button></div>' +
     ks.map(k => '<div class="krow"><span class="dot" style="background:' + (k.busy ? "var(--warn,#d9822b)" : "var(--ok,#2e9d5b)") + '"></span><span class="kt" title="' + esc(k.title || "") + '">' +
       esc((k.title || "（未命名）").slice(0, 22)) + '</span><button class="mini" data-act="keep-close" data-id="' + esc(k.id) + '">关闭</button></div><div class="ksub">' + esc((k.model || "").replace("gemini-", "")) + (k.write ? " · 可改文件" : "") + " · " + (k.busy ? "回答中" : ago(k.last)) + "</div>").join("") + "</div>";
@@ -1531,17 +1599,20 @@ function liveBar(){                     // 页面最上方：现在所有在进�
 }
 function viewRun(it){
   const lite = it.rec;
-  const sig = lite.status + "|" + lite.tasks.map(t => t.status + (t.call_id || "")).join(",") + "|" + S.calls.filter(c => c.run === lite.id).map(c => c.status + (c.live || "")).join("");
+  const calls = S.calls.filter(c => c.run === lite.id);
+  const sig = lite.rev ? lite.rev + "|" + calls.map(callSig).join(",")
+    : lite.status + "|" + lite.tasks.map(t => t.status + (t.call_id || "")).join(",") + "|" + calls.map(c => c.status + (c.live || "")).join("");
   const full = need("run", lite.id, sig) || lite;
+  const tasks = lite.tasks.map(t => Object.assign({}, (full.tasks || []).find(x => x.id === t.id), t));
   let h = (lite.parent_call ? '<button class="crumb" data-act="select" data-type="call" data-id="' + esc(lite.parent_call) + '">← 回到和对接人的对话</button>' : "") +
     headHtml(it, (lite.write ? '<span class="badge plain">可改文件</span>' : ""));
   if (lite.error && lite.error !== "已手动停止" && !(lite.mode === "council" && lite.status === "done")) h += '<div class="note bad" style="margin-bottom:14px">' + esc(lite.error) + "</div>";
   const council = lite.mode === "council";
-  if (lite.timeout_warning) h += '<div class="note" style="margin-bottom:14px">⏱ ' + esc(lite.timeout_warning) + "</div>";
+  if (full.timeout_warning) h += '<div class="note" style="margin-bottom:14px">⏱ ' + esc(full.timeout_warning) + "</div>";
   if (lite.pressure) h += full.pressure_prompt
     ? '<details class="note" style="margin-bottom:14px"><summary>高压模式：ds 拆任务前读了你写的提示词（' + full.pressure_prompt.length + ' 字），点开查看</summary><div style="white-space:pre-wrap;margin-top:8px">' + esc(full.pressure_prompt) + '</div></details>'
     : '<div class="note" style="margin-bottom:14px">高压模式：当时提示词是空的，ds 按普通方式排工</div>';
-  const synCalls = S.calls.filter(c => c.run === lite.id && c.kind === "synth");
+  const synCalls = calls.filter(c => c.kind === "synth");
   h += stepperHtml(lite, synCalls.length > 0);
   if (full.final){
     copyStore["final"] = full.final;
@@ -1550,36 +1621,35 @@ function viewRun(it){
   const procStart = h.length;
   h += '<div class="steps">';
   if (council){
-    const sk = lite.skipped || [];
-    h += step(lite.synthesizer || "gemini", false, '<div class="plan"><span class="small">会审</span><br>' + esc(lite.summary || "几位各自独立作答，再比较共同点和分歧") +
+    const sk = full.skipped || [];
+    h += step(lite.synthesizer || "gemini", false, '<div class="plan"><span class="small">会审</span><br>' + esc(full.summary || "几位各自独立作答，再比较共同点和分歧") +
       (sk.length ? '<br><span class="small">跳过：' + sk.map(x => esc(x.agent) + "（" + esc(x.reason) + "）").join("；") + "</span>" : "") + "</div>");
   }
   // 规划
-  const plans = S.calls.filter(c => c.run === lite.id && c.kind === "plan").sort((a,b) => a.start - b.start);
+  const plans = calls.filter(c => c.kind === "plan").sort((a,b) => a.start - b.start);
   const pBusy = lite.status === "planning";
   let pin = plans.map(c => callRow(c, '<span class="who" style="color:' + agc(c.agent) + '">' + esc(c.agent) + '</span><span class="what">拆解任务、分配人手</span>')).join("") ||
     '<div class="row"><div class="rh"><span class="who" style="color:' + agc(lite.planner) + '">' + esc(lite.planner) + '</span><span class="what">拆解任务、分配人手</span></div></div>';
-  if (lite.summary) pin += '<div class="plan" style="margin-top:8px"><span class="small">方案</span><br>' + esc(lite.summary) + "</div>";
+  if (full.summary) pin += '<div class="plan" style="margin-top:8px"><span class="small">方案</span><br>' + esc(full.summary) + "</div>";
   if (!council) h += step(lite.planner, pBusy, pin);
   // 同一分工阶段的任务并列，前置关系写在各卡片上；状态来自后台实际执行记录。
   const counts = {};
   const active = lite.tasks.filter(t => !t.skip_reason);   // 因额度跳过的成员不算参与
   for (const t of active) counts[t.agent] = (counts[t.agent] || 0) + 1;
-  const participants = uniq([council ? null : lite.planner].concat(active.map(t => t.agent), S.calls.filter(c => c.run === lite.id).map(c => c.agent)));
+  const participants = uniq([council ? null : lite.planner].concat(active.map(t => t.agent), calls.map(c => c.agent)));
   h += '</div><div class="team-summary small">' + participants.length + ' 位成员参与' +
     (lite.tasks.length ? '，分工 ' + lite.tasks.length + ' 件（' + Object.entries(counts).map(([n,c]) => esc(n) + ' ×' + c).join('、') + '）。点任务卡片看指令和回答；带「接」的要等前一步完成。' : '，正在安排分工') + '</div>' +
-    (lite.tasks.length ? fold("board:" + lite.id, false, "共享进度板 <span class=\"small\" style=\"display:inline;font-weight:400\">· 每件的进度、原因和遗留</span>", boardHtml(lite)) : "") + '<div class="task-grid">';
-  for (const t of lite.tasks){
-    const ft = (full.tasks || []).find(x => x.id === t.id) || t;
+    (tasks.length ? fold("board:" + lite.id, false, "共享进度板 <span class=\"small\" style=\"display:inline;font-weight:400\">· 每件的进度、原因和遗留</span>", boardHtml({...lite, tasks})) : "") + '<div class="task-grid">';
+  for (const t of tasks){
     const key = "t:" + lite.id + ":" + t.id, isOpen = open.has(key) || (t.status === "running" && !closed.has(key)), si = t.status ? stInfo(t.status) : {k:"wait", t:"仅方案"};
     const waiting = t.status === "pending" && t.depends_on && t.depends_on.length;
     let body = "";
     if (isOpen){
-      copyStore[key + ":p"] = ft.prompt; copyStore[key + ":a"] = ft.answer;
-      body = '<div class="rb">' + (t.skip_reason ? '<div class="note">' + esc(t.skip_reason) + "</div>" : block("交给它的指令", ft.prompt, key + ":p", false)) +
-        (ft.answer && !t.skip_reason ? block("它的回答", ft.answer, key + ":a", true) : t.status === "running" ? liveHtml(ft.live, t.agent) : '<div class="small" style="margin-top:8px">' + (t.status === "pending" ? "还没开始。" : "没有产出。") + "</div>") +
-        (t.status === "fail" ? errHtml("", ft.error_detail, ft.partial, key) : "") +
-        sessHtml(ft.session, key) + (t.call_id ? subRows(t.call_id) : "") + "</div>";
+      copyStore[key + ":p"] = t.prompt; copyStore[key + ":a"] = t.answer;
+      body = '<div class="rb">' + (t.skip_reason ? '<div class="note">' + esc(t.skip_reason) + "</div>" : block("交给它的指令", t.prompt, key + ":p", false)) +
+        (t.answer && !t.skip_reason ? block("它的回答", t.answer, key + ":a", true) : t.status === "running" ? liveHtml(t.live, t.agent, key) : '<div class="small" style="margin-top:8px">' + (t.status === "pending" ? "还没开始。" : "没有产出。") + "</div>") +
+        (t.status === "fail" ? errHtml("", t.error_detail, t.partial, key) : "") +
+        sessHtml(t.session, key) + (t.call_id ? subRows(t.call_id) : "") + "</div>";
     }
     const nk = t.call_id ? kids(t.call_id).length : 0;
     h += step(t.agent, t.status === "running",
@@ -1602,7 +1672,7 @@ function viewRun(it){
   return h;
 }
 function viewCall(it){
-  const c = it.rec, full = need("call", c.id, c.status + "|" + (c.secs || "") + "|" + (c.live || 0)) || {};
+  const c = it.rec, full = need("call", c.id, callSig(c)) || {};
   let h = headHtml(it, '<span style="color:' + agc(c.agent) + ';font-weight:650">' + esc(c.agent) + "</span>" + fallbackTag(c.agent, c.backend, c.preferred_backend) + (c.write ? '<span class="badge plain">可改文件</span>' : ""));
   const ks = kids(c.id);
   if (ks.length || (full.attempts && full.attempts.length) || (full.prompt && full.display && full.prompt !== full.display)){
@@ -1616,7 +1686,7 @@ function viewCall(it){
     }
   }
   h += '<div class="sec">结果</div>';
-  if (c.status === "running") h += liveHtml(full.live, c.agent);
+  if (c.status === "running") h += liveHtml(full.live, c.agent, "top:" + c.id);
   else {
     let inner = "";
     if (full.has_image) inner += '<img class="gen" src="/api/image?id=' + c.id + '" alt="生成的图片">' + (isRemote() ? '' : '<div class="acts" style="margin-bottom:8px"><button class="btn" data-act="reveal">在访达中显示</button></div>');
@@ -1647,20 +1717,23 @@ function compactBtn(it){                // 原地压缩：前面的来往压成�
     : '<button class="btn" data-act="compact" data-key="' + esc(g.key) + '" title="把这一组前面的来往压成一份说明，之后接着问只带这份说明和后面几轮：更快、更省额度，早期定下的也不会忘">🗜 压缩</button>';
 }
 function chainOf(it){                 // 一串连续追问：从最早一条到最新一条
-  const all = items(), byKey = {};
-  all.forEach(i => { byKey[i.type + ":" + i.id] = i; });
-  const up = i => i.follows && !i.fork ? byKey[i.follows.type + ":" + i.follows.id]
-    : i.type === "run" && i.rec.parent_call ? byKey["call:" + i.rec.parent_call] : null;   // 派出的项目组算在派它的那轮对话里
-  if (it.type === "run" && it.rec.parent_call && byKey["call:" + it.rec.parent_call]) it = byKey["call:" + it.rec.parent_call];
+  items();
+  const {byKey, follows} = itemIndex;
+  const parent = i => byKey.get("call:" + i.rec.parent_call);
+  const up = i => i.follows && !i.fork ? byKey.get(akey(i.follows)) : i.type === "run" ? parent(i) : null;
+  it = byKey.get(akey(it)) || it;
+  if (it.type === "run" && parent(it)) it = parent(it);   // 派出的项目组算在派它的那轮对话里
   let root = it;
   const onBranch = new Set([it]);
   while (up(root) && !onBranch.has(up(root))){ root = up(root); onBranch.add(root); }
   const out = [root];
+  const seen = new Set(out);
   for (;;){
     const cur = out[out.length - 1];
-    const kids = all.filter(i => i.follows && !i.fork && i.follows.type === cur.type && i.follows.id === cur.id && out.indexOf(i) < 0);
-    if (!kids.length) break;
-    out.push(kids.find(k => onBranch.has(k)) || kids.sort((a,b) => b.start - a.start)[0]);   // 先走选中那条所在的分支
+    const next = (follows.get(akey(cur)) || []).filter(i => !seen.has(i));
+    if (!next.length) break;
+    const child = next.find(k => onBranch.has(k)) || next[0];   // 先走选中那条所在的分支
+    out.push(child); seen.add(child);
   }
   return out;
 }
@@ -1670,7 +1743,7 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
   for (const t of turns){
     const r = t.rec;
     if (r.kind === "handoff"){
-      const full = need("call", r.id, "ok" + ((r.handoff || {}).digest || "")) || {}, hf = r.handoff || {}, key = "hand:" + r.id;
+      const full = need("call", r.id, r.rev || "ok" + ((r.handoff || {}).digest || "")) || {}, hf = r.handoff || {}, key = "hand:" + r.id;
       if (full.answer) copyStore[key] = full.answer;
       const dg = hf.digest === "running" && Date.now() / 1000 - (r.start || 0) < 1800 ? "正在把整组 " + (hf.rounds || "") + " 轮压缩成交接说明，好了会自动换上…"
         : hf.digest === "ok" ? "整组 " + (hf.rounds || "") + " 轮已压缩成交接说明" : hf.digest ? "整组压缩没成功（" + (hf.digest_error || "原因不明") + "），先用的是最近几轮的内容" : "";
@@ -1687,12 +1760,12 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
       h += '<div class="them"><div class="who">团队（' + (r.mode === "council" ? "会审" : r.pressure ? "高压" : "自动分工") + '）</div><button class="job" data-act="select" data-type="run" data-id="' + esc(r.id) + '">打开这个项目组看过程 · ' + esc(stInfo(r.status, r.error).t) + "</button></div>";
       continue;
     }
-    const full = r.kind === "chat" || r.kind === "ask" ? need("call", r.id, r.status + "|" + (r.secs || "") + "|" + (r.live || 0) + "|" + JSON.stringify(r.dispatch || {})) || {} : {};
-    const ci = r.chat || {};
-    h += '<div class="them" data-rt="call" data-rid="' + esc(r.id) + '"><div class="who" style="color:' + agc(r.agent) + '">' + esc(r.agent) + (r.kind === "chat" ? " · 对接人" + (ci.mode === "manual" ? "（你指定）" : "（自动选）") : "") + (r.resumed ? '<span class="small" title="直接接着上一轮的原会话，没有重发前文，缓存命中更高"> · 续接原会话</span>' : "") + "</div>";
+    const full = r.kind === "chat" || r.kind === "ask" ? need("call", r.id, r.rev ? callSig(r) : callSig(r) + "|" + JSON.stringify(r.dispatch || {})) || {} : {};
+    const ci = full.chat || r.chat || {};
+    h += '<div class="them" data-rt="call" data-rid="' + esc(r.id) + '"><div class="who" style="color:' + agc(r.agent) + '">' + esc(r.agent) + (callModel(r) ? '<span class="cmodel" title="这一轮实际用的模型"> · ' + esc(callModel(r)) + "</span>" : "") + (r.kind === "chat" ? " · 对接人" + (ci.mode === "manual" ? "（你指定）" : "（自动选）") : "") + (r.resumed ? '<span class="small" title="直接接着上一轮的原会话，没有重发前文，缓存命中更高"> · 续接原会话</span>' : "") + "</div>";
     if (ci.handoff) h += '<div class="handoff">' + esc(ci.handoff) + "</div>";
     if (full.answer){ const key = "chat:" + r.id; copyStore[key] = full.answer; h += '<div class="md">' + md(full.answer) + '</div><div class="lab"><span></span><span><button class="copy" data-act="fork" data-type="call" data-id="' + esc(r.id) + '" title="带上到这一轮为止的对话，另开一条线">⑂ 从这里分叉</button><button class="copy" data-act="copy" data-key="' + esc(key) + '">复制</button></span></div>'; }
-    else if (r.status === "running") h += liveHtml(full.live, r.agent);
+    else if (r.status === "running") h += liveHtml(full.live, r.agent, "chat:" + r.id);
     if (r.status === "fail" && !r.dispatch) h += errHtml(full.error || r.error || "没有回答", full.error_detail, full.partial, "chat:" + r.id);
     if (r.dispatch){
       const run = S.runs.find(x => x.id === r.dispatch.run);
@@ -1720,21 +1793,53 @@ viewNew.sug = [   // [填入的文字, 模式, 卡片标题]；点了只填入�
 ];
 function renderView(){
   if (!S) return;
+  const v = $("view"), s = getSelection(), active = document.activeElement;
+  const requestedKey = sel ? sel.type + sel.id : "new";
+  last.viewPending = last.viewKey === requestedKey && !!((s && !s.isCollapsed && v.contains(s.anchorNode)) ||
+    (active && active.tagName === "SELECT" && v.contains(active)));
+  if (last.viewPending) return;   // 保留文字选择和正在操作的下拉框
   const it = findItem(sel);
   if (sel && !it){ sel = null; }
-  const h = '<div class="wrap">' + liveBar() + (it ? (it.type === "run" ? viewRun(it) : it.rec.kind === "chat" || it.rec.kind === "handoff" ? viewChat(it) : viewCall(it)) : viewNew()) + "</div>";
-  $("tb-title").textContent = it ? (it.title || "").slice(0, 30) : "新任务";
-  if (h === last.view) return;
-  const s = getSelection();
-  if (s && !s.isCollapsed && $("view").contains(s.anchorNode)) return;   // 用户正在选文字，先不重绘
-  const v = $("view"), st = v.scrollTop, keep = last.viewKey === (sel ? sel.type + sel.id : "new"),
-    atEnd = v.scrollHeight - v.scrollTop - v.clientHeight < 60;   // 原来就停在最底下
-  v.innerHTML = h; last.view = h; last.viewKey = sel ? sel.type + sel.id : "new"; syncActbar();
-  const sticks = {};
-  v.querySelectorAll("[data-stick]").forEach((el, i) => { sticks[i] = el; });
+  const key = sel ? requestedKey : "new", keep = last.viewKey === key, bar = liveBar();
+  const fragments = new Map();
+  let h;
+  liveFragments = fragments;
+  try {
+    h = it ? (it.type === "run" ? viewRun(it) : it.rec.kind === "chat" || it.rec.kind === "handoff" ? viewChat(it) : viewCall(it)) : viewNew();
+  } finally {
+    liveFragments = null;
+  }
+  const title = it ? (it.title || "").slice(0, 30) : "新任务";
+  if ($("tb-title").textContent !== title) $("tb-title").textContent = title;
+  const rebuild = !keep || h !== last.view;
+  const barChanged = bar !== last.liveBar;
+  const liveChanged = fragments.size && [...fragments].some(([k, body]) => body !== last.viewLive?.get(k));
+  if (!rebuild && !barChanged && !liveChanged) return;
+  const st = v.scrollTop, atEnd = v.scrollHeight - st - v.clientHeight < 60;
+  if (!rebuild && barChanged){
+    const wrap = v.firstElementChild;
+    if (last.liveBar) wrap.firstElementChild.remove();
+    if (bar) wrap.insertAdjacentHTML("afterbegin", bar);
+  }
+  if (rebuild){
+    const expanded = keep ? Array.from(v.querySelectorAll("details"), el => el.open ? el.firstElementChild.textContent : null) : [];
+    v.innerHTML = '<div class="wrap">' + bar + h + "</div>";
+    if (expanded.length) v.querySelectorAll("details").forEach((el, i) => {
+      if (expanded[i] === el.firstElementChild.textContent) el.open = true;
+    });
+  }
+  if (fragments.size && (rebuild || liveChanged)){
+    v.querySelectorAll("[data-live-key]").forEach(el => {
+      const k = el.dataset.liveKey, body = fragments.get(k);
+      if (!rebuild && body === last.viewLive?.get(k)) return;
+      el.innerHTML = body;
+      el.querySelectorAll("[data-stick]").forEach(box => { box.scrollTop = box.scrollHeight; });
+    });
+  }
+  last.view = h; last.liveBar = bar; last.viewKey = key; last.viewLive = fragments;
   const isChat = it && it.type === "call" && (it.rec.kind === "chat" || it.rec.kind === "handoff");
-  v.scrollTop = isChat && (!keep || atEnd) ? v.scrollHeight : keep ? st : 0;   // 对话停在最新一轮；团队页、单条从顶上看起   // 打开对话停在最新一轮；在底部时新内容来了也跟着到底
-  Object.values(sticks).forEach(el => { el.scrollTop = el.scrollHeight; });   // 实时输出始终看最新一行
+  v.scrollTop = isChat && (!keep || atEnd) ? v.scrollHeight : keep ? st : 0;
+  syncActbar();
   ticks();
 }
 
@@ -1775,13 +1880,14 @@ function renderComposer(){
   const partial = it && RUNNING[it.status];   // 上一轮还在做：照样接着，只带上已经完成的部分
   const back = !it && sel && !ctx && findItem(sel) && mode !== "image";   // 叉掉了还能改回来
   if (!it) forking = false;
-  $("ctx").innerHTML = it && forking ? '<div class="ctx fork"><span>⑂ 从「' + esc((it.title || "").slice(0, 30)) + '」分叉：另开一条线，带上到这里为止的上下文</span><button data-act="noctx" title="取消分叉">✕</button></div>'
+  let contextHtml = it && forking ? '<div class="ctx fork"><span>⑂ 从「' + esc((it.title || "").slice(0, 30)) + '」分叉：另开一条线，带上到这里为止的上下文</span><button data-act="noctx" title="取消分叉">✕</button></div>'
     : it ? '<div class="ctx"><span>↩ 接着这条追问：' + esc((it.title || "").slice(0, 40)) + (partial ? "（上一轮还在做，只带上已完成的部分）" : "") + '</span><button data-act="noctx" title="不带上文，作为新任务">✕</button></div>'
     : back ? '<div class="ctx off"><span>作为新任务发送，不带上文</span><button data-act="yesctx" title="重新接着当前这条追问">↩ 改回接着追问</button></div>' : "";
   if (it && !forking){                    // 追问链太长：提醒另起一组
     const n = roundsTo(it), w = LONG_WARN(n);
-    if (w){ const g = groupOf(it); $("ctx").innerHTML += '<div class="ctxwarn' + (n >= LONG_BAD ? " bad" : "") + '">' + esc(w) + (g && !RUNNING[chainEnd(g.latest).status] ? ' <button class="job" data-act="compact" data-key="' + esc(g.key) + '">🗜 现在压缩</button>' : "") + '</div>'; }
+    if (w){ const g = groupOf(it); contextHtml += '<div class="ctxwarn' + (n >= LONG_BAD ? " bad" : "") + '">' + esc(w) + (g && !RUNNING[chainEnd(g.latest).status] ? ' <button class="job" data-act="compact" data-key="' + esc(g.key) + '">🗜 现在压缩</button>' : "") + '</div>'; }
   }
+  if (contextHtml !== last.context){ $("ctx").innerHTML = contextHtml; last.context = contextHtml; }
   $("txt").placeholder = it && forking ? "在新的分叉里说点什么…" : it ? "接着说，会带上前面的对话和结果…" : mode === "image" ? "描述想要的画面…" : mode === "chat" ? "跟对接人说说你想做什么…" : "想让团队做什么？";
   $("send").disabled = sending || !$("txt").value.trim();
 }
@@ -1833,6 +1939,7 @@ async function send(){
 
 /* ---------- 轮询、通知、计时 ---------- */
 function ticks(){
+  if (document.hidden) return;
   const now = Date.now()/1000;
   document.querySelectorAll(".tick").forEach(el => { const t = dur(now - parseFloat(el.dataset.start)); if (el.textContent !== t) el.textContent = t; });
 }
@@ -1856,21 +1963,61 @@ function checkDone(){
   document.title = (running ? "(" + running + ") " : "") + "Hub";
 }
 async function poll(){
-  const seq = ++pollSeq;
+  const seq = ++pollSeq, base = S;
+  let st, fresh;
   try {
-    const st = await api("/api/state?c=" + CID);
+    st = await api("/api/state?compact=1&c=" + CID + (base && base.version ? "&v=" + base.version : ""));
     if (seq < appliedPollSeq) return;     // 只丢弃比已显示状态更旧的响应
     appliedPollSeq = seq;
-    if (uiVersion && st.ui_version && st.ui_version !== uiVersion && !$("txt").value.trim()){ location.reload(); return; }   // 界面有新版，自动刷新
-    uiVersion = uiVersion || st.ui_version;
-    S = st;
-    $("conn").className = "conn"; $("conn").textContent = "已连接";
+    fresh = !st.changes && (!base || st.version !== base.version || "calls" in st);
+    if (fresh) S = st;
+    else if (st.changes){
+      S = {...base, ...st.changes, version:st.version};
+      for (const key of ["calls", "runs"]){
+        if (key in st.changes) S[key] = patchHistory(base[key], st.changes[key]);
+      }
+    }
+    if (uiVersion && S.ui_version && S.ui_version !== uiVersion && !$("txt").value.trim()){ location.reload(); return; }
+    uiVersion = uiVersion || S.ui_version;
+    if ($("conn").textContent !== "已连接"){ $("conn").className = "conn"; $("conn").textContent = "已连接"; }
   } catch(e){ if (seq >= appliedPollSeq){ appliedPollSeq = seq; $("conn").className = "conn off"; $("conn").textContent = "连接断开"; } return; }
+  const changed = (...keys) => fresh || keys.some(k => st.changes && k in st.changes);
+  const history = changed("calls", "runs"), clockChanged = changed("now");
+  const dayChanged = clockChanged && (!base || new Date(base.now * 1000).toDateString() !== new Date(S.now * 1000).toDateString());
+  const retry = detailRetryAt && Date.now() >= detailRetryAt;
+  if (retry) detailRetryAt = 0;
+  let selected = false;
   if (followLatest && pendingSubmission){
     const n = items().find(i => i.rec.submission_id === pendingSubmission);
-    if (n){ sel = {type:n.type, id:n.id}; ctx = sel; followLatest = false; }
+    if (n){ sel = {type:n.type, id:n.id}; ctx = sel; followLatest = false; selected = true; }
   }
-  checkDone(); renderList(); renderRail(); renderView(); renderComposer(); renderSide(); renderAwake();
+  if (history) checkDone();
+  if (history || selected || dayChanged || changed("names", "folders", "archived", "keeps") ||
+      (clockChanged && S.keeps && S.keeps.length) || last.listPending || !last.list) renderList();
+  if (clockChanged || changed("calls", "agents", "config", "backends", "health", "client", "lan") ||
+      last.railPending || !last.rail) renderRail();
+  if (history || selected || dayChanged || retry || (sel && changed("live")) ||
+      changed("names", "archived", "backends", "config", "agents", "client") || last.viewPending) renderView();
+  if (history || selected || changed("agents", "config", "workspace", "client", "names", "archived")) renderComposer();
+  if (history || selected || retry || changed("agents", "backends", "config") || last.sidePending) renderSide();
+  if (changed("awake")) renderAwake();
+}
+function patchHistory(previous, patch){
+  const rows = new Map(previous.map(r => [r.id, r]));
+  for (const id of patch.remove) rows.delete(id);
+  for (const r of patch.upsert) rows.set(r.id, r);
+  return patch.order ? patch.order.map(id => rows.get(id)) : Array.from(rows.values());
+}
+function schedulePoll(delay){
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    const timer = pollTimer;
+    try {
+      await poll();
+    } finally {
+      if (pollTimer === timer) schedulePoll(document.hidden ? 10000 : 1500);
+    }
+  }, delay);
 }
 /* ---------- 查看回答里提到的文件 ---------- */
 const fview = {path: "", rec: null};
@@ -1904,6 +2051,7 @@ function select(type, id){
   sel = type ? {type, id} : null; ctx = sel; forking = false; handoffArm = null; followLatest = false; stopArm = null; clearTimeout(stopTimer);
   document.body.classList.remove("side-open", "rail-open"); syncTabs();
   renderList(); renderView(); renderComposer();
+  if (sideOpen) renderSide();
   if (!sel) $("txt").focus();
 }
 
@@ -2073,9 +2221,11 @@ document.addEventListener("click", async e => {
       else { stopArm = el.dataset.id || sel.id; renderView(); stopTimer = setTimeout(() => { stopArm = null; renderView(); }, 4000); }
     }
     else if (act === "retry" && it){
-      const r = it.rec;
+      const r = it.type === "run" && it.rec.rev
+        ? {...it.rec, ...await api("/api/run?id=" + encodeURIComponent(it.id)), mode:it.rec.mode}
+        : it.rec;
       let text = it.type === "run" ? (r.display || r.goal) : r.display;
-      if (!text){ const full = await api("/api/call?id=" + encodeURIComponent(r.id)); text = full.display || full.prompt; }
+      if (!text && it.type === "call"){ const full = await api("/api/call?id=" + encodeURIComponent(r.id)); text = full.display || full.prompt; }
       if (!text) throw new Error("找不到原始指令，没法重新执行");
       const body = it.type === "run" ? (r.mode === "council" ? Object.assign({mode:"council", text, cwd:r.cwd}, (r.participants || []).length >= 2 ? {agents:r.participants} : {}, r.synthesizer ? {synthesizer:r.synthesizer} : {}) : {mode:r.pressure ? "pressure" : "run", text, cwd:r.cwd, write:!!r.write})
         : r.kind === "chat" ? {mode:"chat", agent:(r.chat && r.chat.mode === "manual") ? r.agent : "auto", text, cwd:r.cwd, write:!!(r.chat && r.chat.write)}
@@ -2114,14 +2264,14 @@ document.addEventListener("click", async e => {
 document.addEventListener("change", async e => {
   const el = e.target;
   if (el.id === "contact"){ contact = el.value; localStorage.setItem("hub.contact", contact); last.modes = ""; renderComposer(); return; }
-  if (el.id === "theme"){ theme = el.value; last.rail = ""; localStorage.setItem("hub.theme", theme); applyTheme(); return; }
+  if (el.id === "theme"){ theme = el.value; el.blur(); last.rail = ""; localStorage.setItem("hub.theme", theme); applyTheme(); return; }
   if (el.dataset && el.dataset.chain){
     const p = el.dataset.chain.split(":");
     try { await api("/api/config", {chain:{agent:p[0], index:+p[1], spec:el.value}}); toast(el.dataset.gem ? p[0] + " 的思考等级已改成「" + el.options[el.selectedIndex].text + "」，下次干活生效" : p[0] + " 的" + (+p[1] ? "后备" : "首选") + "已换成 " + el.options[el.selectedIndex].text); el.blur(); last.rail = ""; poll(); }
     catch(err){ toast(err.message); el.blur(); last.rail = ""; poll(); }
     return;
   }
-  if (el.dataset && el.dataset.folderMove !== undefined){ folderMove([el.dataset.folderMove], el.value); return; }
+  if (el.dataset && el.dataset.folderMove !== undefined){ el.blur(); folderMove([el.dataset.folderMove], el.value); return; }
   if (el.dataset && el.dataset.handoff && el.value){
     const {projects, solos} = groups(), key = el.dataset.handoff;
     const pg = projects.find(p => p.id === key), si = !pg && solos.find(x => akey(x) === key);
@@ -2130,7 +2280,7 @@ document.addEventListener("change", async e => {
     if (!src || !confirm("把「" + (me.title || "") + "」做出来的结果交接到「" + dstTitle + "」？\n会把整组 " + me.keys.length + " 轮压缩成一份交接说明（要一两分钟，先用最近几轮顶着）。之后在那一组接着问，就会带上它；这一组照旧留着，以后还能再交接给别的组。")){ el.value = ""; return; }
     try {
       const r = await api("/api/handoff", {from: {type: src.type, id: src.id}, to: {type, id}, title: me.title || "", keys: me.keys});
-      handoffArm = null; last.list = ""; toast("已交接到「" + dstTitle + "」，在那边接着问就能用上"); await poll(); select("call", r.id);
+      el.blur(); handoffArm = null; last.list = ""; toast("已交接到「" + dstTitle + "」，在那边接着问就能用上"); await poll(); select("call", r.id);
     } catch(err){ toast(err.message || "没交接成功"); el.value = ""; }
     return;
   }
@@ -2201,7 +2351,8 @@ try {
   }
 } catch(e){}
 applyTheme(); renderComposer();
-poll(); setInterval(poll, 1500); setInterval(ticks, 1000);
+document.addEventListener("visibilitychange", () => schedulePoll(document.hidden ? 10000 : 0));
+schedulePoll(0); setInterval(ticks, 1000);
 })();
 </script>
 </body>

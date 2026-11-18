@@ -22,6 +22,7 @@ python3 tests/test_watchdog.py
 python3 tests/test_lifecycle.py
 python3 tests/test_hub.py
 python3 tests/test_api.py
+python3 tests/test_panel_refresh.py
 python3 tests/test_council.py
 python3 tests/test_lan.py
 python3 tests/test_pressure.py
@@ -42,6 +43,7 @@ python3 tests/test_files.py
 python3 tests/test_bins.py
 node tests/test_ui_files.js
 node tests/test_ui.js
+node tests/test_ui_poll.js
 node tests/test_ui_layout.js
 node tests/test_ui_council.js
 node tests/test_ui_groups.js

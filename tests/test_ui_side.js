@@ -7,7 +7,7 @@ const node=id=>nodes[id]||(nodes[id]={innerHTML:'',value:'',hidden:true,disabled
 const posts=[];
 const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []},body:{classList:{add(){},remove(){},toggle(){},contains(){return false}}}},window:{},localStorage:{getItem(){return null},setItem(){}},sessionStorage:{getItem(){return null},setItem(){},removeItem(){}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},setTimeout:()=>1,clearTimeout(){},getSelection:()=>null,fetch:()=>new Promise(()=>{})};
 vm.createContext(ctx);
-vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);',
+vm.runInContext(source.replace('schedulePoll(0); setInterval(ticks, 1000);',
   'globalThis.ui={set:s=>S=s,items,renderSide,sideCtlHtml,sideState,renderComposer,open:v=>{sideOpen=v;},setSel:v=>{sel=v;ctx=v;},setCtx:v=>{ctx=v;},setSide:o=>{if("base" in o)sideBase=o.base;if("follow" in o)sideFollow=o.follow;if("agent" in o)sideAgent=o.agent;if("effort" in o)sideEffort=o.effort;},api:f=>{api=f;},sendSide,last,groups,chainOf,findItem,send,fork:(t,i)=>{ctx={type:t,id:i};forking=true;},isForking:()=>forking,setScope:v=>{sideScope=v;},pendImgs,thumbsHtml,viewChat,handPicker,setArm:v=>{handoffArm=v;}};'),ctx);
 const agents=[{name:'gemini',chain:['agy:gemini-4-carbon-medium'],profile:'x'},{name:'gpt',chain:['codex'],profile:'x'},{name:'ds',chain:['dsh'],profile:'x'}];
 const backends=['low','medium','high'].map(l=>({spec:'agy:gemini-4-carbon-'+l,label:'Gemini 4 Carbon ('+l[0].toUpperCase()+l.slice(1)+')'}))

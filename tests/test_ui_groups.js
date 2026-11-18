@@ -40,7 +40,7 @@ function boot(){
   };
   vm.createContext(ctx);
   vm.runInContext(source.replace(
-    'poll(); setInterval(poll, 1500); setInterval(ticks, 1000);',
+    'schedulePoll(0); setInterval(ticks, 1000);',
     'globalThis.ui={set:s=>{S=s;},groups,items,renderList,select,getSel:()=>sel,getFilter:()=>filter,setFilter:v=>{filter=v;},setQuery:v=>{query=v;},openGroups,last};'
   ), ctx);
   return { ui: ctx.ui, nodes, docListeners };
@@ -220,6 +220,7 @@ const config = { planner: 'gemini', synthesizer: 'gemini', max_parallel: 3, time
       { id: 'tp2', agent: 'gpt', title: '额度跳过项', status: 'skipped', depends_on: [] }
     ]
   });
+  ui.set({ agents, config, health: { results: {} }, calls: [...calls], runs: [...runs], workspace: '/w' });
   ui.renderList();
   assert.ok(ui.openGroups.has('call:c_ask1'), '新增追问后原展开组仍保持展开');
   assert.ok(nodes.list.innerHTML.includes('未执行方案项') && nodes.list.innerHTML.includes('仅方案'), '展开态正确显示仅方案任务');

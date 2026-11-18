@@ -56,36 +56,6 @@ vm.runInContext(script.slice(script.indexOf('document.addEventListener("click"')
   console.log('ui actions: retry context and failure recovery passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});
 
-// 请求慢于轮询间隔时仍显示已返回的数据；乱序响应不能覆盖新状态。
-const pending = [], conn = {};
-const polling = {pollSeq:0, appliedPollSeq:0, CID:'test', uiVersion:0, S:null,
-  api:()=>new Promise((resolve,reject)=>pending.push({resolve,reject})),
-  $:()=>conn, followLatest:false, checkDone:()=>{}, renderList:()=>{},
-  renderRail:()=>{}, renderView:()=>{}, renderComposer:()=>{}, renderSide:()=>{}};
-vm.createContext(polling);
-vm.runInContext(script.slice(script.indexOf('async function poll(){'),script.indexOf('function select(type,')),polling);
-(async()=>{
-  const first=polling.poll(), second=polling.poll();
-  pending[0].resolve({version:1}); await first;
-  assert.equal(polling.S.version,1);
-  pending[1].resolve({version:2}); await second;
-  const third=polling.poll(), fourth=polling.poll();
-  pending[3].resolve({version:4}); await fourth;
-  pending[2].resolve({version:3}); await third;
-  assert.equal(polling.S.version,4);
-  const fifth=polling.poll(), sixth=polling.poll();
-  pending[5].resolve({version:6}); await sixth;
-  pending[4].reject(Error('旧请求失败')); await fifth;
-  assert.equal(conn.textContent,'已连接');
-  polling.followLatest=true; polling.pendingSubmission='mine';
-  polling.items=()=>[{type:'call',id:'other',rec:{submission_id:'other'}},
-                    {type:'call',id:'own',rec:{submission_id:'mine'}}];
-  const seventh=polling.poll(); pending[6].resolve({version:7}); await seventh;
-  assert.equal(polling.sel.id,'own'); assert.equal(polling.ctx.id,'own');
-  assert.equal(polling.followLatest,false);
-  console.log('ui polling: slow, out-of-order and own submission selection passed');
-})().catch(e=>{console.error(e);process.exitCode=1;});
-
 const tags = {};
 vm.createContext(tags);
 vm.runInContext(esc + script.slice(script.indexOf('const fallbackTag ='),script.indexOf('function block(')) + '\nthis.tag=fallbackTag;',tags);

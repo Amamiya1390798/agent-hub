@@ -155,6 +155,25 @@ class HubTests(unittest.TestCase):
             self.assertEqual(len(q['windows']),1)
             self.assertEqual(q['windows'][0]['remaining'],42)
 
+    def test_agy_claude_models_and_quota(self):
+        g = self.g
+        usage = ('Gemini Models\tFive Hour Limit Remaining\t80%\t2026-01-01T00:00:00Z\n'
+                 'Claude and GPT models\tWeekly Limit Remaining\t30%\t2026-01-01T00:00:00Z\n'
+                 'Claude and GPT models\tFive Hour Limit Remaining\t60%\t2026-01-01T00:00:00Z')
+        with patch.dict(g,{'find_bin':lambda *a:'fake','_run':lambda *a:(0,usage,'')}):
+            self.assertEqual(g['quota_agy'](self.cfg)['windows'][0]['remaining'],80)
+            cq = g['quota_agy'](self.cfg,'claude')['windows']
+            self.assertEqual([w['label'] for w in cq],['5 小时','本周'])
+            cfg = dict(self.cfg, agents=dict(self.cfg['agents'], claude=['agy:claude-opus-5-5-high','claude:opus']))
+            with patch.dict(g,{'quota_codex':lambda:None,'quota_ds':lambda:{}}):
+                q = g['fetch_quota'](cfg)['agents']
+            self.assertEqual(q['claude']['windows'][0]['remaining'],60)
+            self.assertEqual(q['gemini']['windows'][0]['remaining'],80)
+        self.assertEqual(g['spec_label']('agy:claude-opus-5-5-high'),'Claude Opus 5.5·高（Antigravity）')
+        self.assertTrue(g['spec_label']('agy:gemini-4-carbon-high').startswith('Gemini Carbon'))
+        self.assertEqual(g['agy_label']({'id':'claude-sonnet-5-5-low','name':'Claude Sonnet 5.5 (Low)'}),'Claude Sonnet 5.5 · Antigravity (Low)')
+        self.assertEqual(g['agy_label']({'id':'gemini-4-carbon-low','name':'Gemini 4 Carbon (Low)'}),'Gemini 4 Carbon (Low)')
+
     def test_login_failure_is_not_success(self):
         with patch.object(subprocess,'call',return_value=1):
             with self.assertRaises(ValueError):

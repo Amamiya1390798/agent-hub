@@ -71,6 +71,36 @@ class Think(unittest.TestCase):
         self.assertEqual(L("agy:gemini-4-hydrogen-xhigh"), "Gemini Hydrogen·超高")
         self.assertEqual(L("agy:gemini-4-argon-low"), "Gemini Argon·低")
 
+    def chat_call(self):
+        got = {}
+
+        class Stop(Exception):
+            pass
+
+        def fake_ask(cfg, agent, prompt, **kw):
+            got.update(agent=agent, spec=kw.get("spec"), tier=kw.get("tier"))
+            raise Stop()
+        with patch.dict(self.g, {"ask": fake_ask}):
+            try:
+                self.g["run_chat"](self.cfg, "你好", cwd=self.home, contact="gemini")
+            except Stop:
+                pass
+        return got
+
+    def test_contact_model_tier(self):
+        self.cfg["agents"]["gemini"] = ["agy:gemini-pro-orchestrator", "agy:gemini-4-carbon-medium"]
+        self.assertEqual(self.chat_call(), {"agent": "gemini", "spec": "agy:gemini-4-carbon-medium", "tier": None}, "没设对接模型：照旧自动换轻模型")
+        self.cfg["chat"] = {"gemini": {"spec": "agy:m-high", "effort": ""}}
+        self.assertEqual(self.chat_call(), {"agent": "gemini", "spec": None, "tier": "chat"}, "设了对接模型：走对接档")
+        _, spec = self.run_ask("gemini", tier="chat")
+        self.assertEqual(spec, "agy:m-high")
+
+    def test_chat_not_a_task_kind(self):
+        self.assertIn("chat", self.g["TIERS"])
+        self.assertNotIn("chat", self.g["TASK_TIERS"])
+        self.cfg["chat"] = {"gemini": {"spec": "agy:m-high", "effort": ""}}
+        self.assertNotIn("对接", self.g["tier_roster"](self.cfg, "gemini"))
+
     def test_chat_prompt_states_permission(self):
         P = self.g["CHAT_PROMPT"]
         self.assertIn("{perm_note}", P)

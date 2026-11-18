@@ -4,9 +4,9 @@ const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const source=fs.readFileSync('ui.html','utf8').match(/<script>([\s\S]*)<\/script>/)[1];
 const nodes={};
 const node=id=>nodes[id]||(nodes[id]={innerHTML:'',value:'',style:{},dataset:{},scrollTop:0,classList:{add(){},remove(){},toggle(){}},addEventListener(){},querySelectorAll(){return []},focus(){},contains(){return false}});
-const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []}},window:{},localStorage:{getItem(){return null}},sessionStorage:{getItem(){return null}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},getSelection:()=>null};
+const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []}},window:{},localStorage:{getItem(){return null}},sessionStorage:{getItem(){return null}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},setTimeout:()=>1,getSelection:()=>null};
 vm.createContext(ctx);
-vm.runInContext(source.replace('poll(); setInterval(poll, 1500); setInterval(ticks, 1000);', 'globalThis.ui={set:s=>S=s,effortSelect,modelSelect,renderRail,modelListHtml,liveAgents};'),ctx);
+vm.runInContext(source.replace('schedulePoll(0); setInterval(ticks, 1000);', 'globalThis.ui={set:s=>S=s,effortSelect,modelSelect,renderRail,modelListHtml,liveAgents};'),ctx);
 const lv=['Low','Medium','High'];
 const backends=lv.map(l=>({spec:'agy:gemini-4-carbon-'+l.toLowerCase(),label:'Gemini 4 Carbon ('+l+')'}))
   .concat(['Low','Medium','High','XHigh'].map(l=>({spec:'agy:gemini-4-hydrogen-'+l.toLowerCase(),label:'Gemini 4 Hydrogen ('+l+')'})))
