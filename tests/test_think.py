@@ -101,6 +101,26 @@ class Think(unittest.TestCase):
         self.cfg["chat"] = {"gemini": {"spec": "agy:m-high", "effort": ""}}
         self.assertNotIn("对接", self.g["tier_roster"](self.cfg, "gemini"))
 
+    def test_plan_and_synth_tiers(self):
+        self.cfg["plan"] = {"gemini": {"spec": "agy:m-high", "effort": ""}}
+        _, spec = self.run_ask("gemini", tier="plan")
+        self.assertEqual(spec, "agy:m-high", "设了拆任务模型：拆任务时用它")
+        _, spec = self.run_ask("gemini", tier="synth")
+        self.assertNotEqual(spec, "agy:m-high", "汇总没设：跟干活一样")
+        self.assertNotIn("plan", self.g["TASK_TIERS"])
+        self.assertNotIn("synth", self.g["TASK_TIERS"])
+        seen = []
+
+        def fake_ask(cfg, agent, prompt, **kw):
+            seen.append(kw.get("tier"))
+            raise self.g["BackendError"]("stop")
+        with patch.dict(self.g, {"ask": fake_ask}):
+            with self.assertRaises(Exception):
+                self.g["make_plan"](self.cfg, "目标", self.home, False, "gemini", 3)
+        self.assertEqual(seen[0], "plan", "拆任务时走拆任务档")
+        src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hub"), encoding="utf-8").read()
+        self.assertIn('tier="synth", meta={"run": run_id, "kind": "synth"', src)
+
     def test_chat_prompt_states_permission(self):
         P = self.g["CHAT_PROMPT"]
         self.assertIn("{perm_note}", P)

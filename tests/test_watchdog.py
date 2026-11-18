@@ -43,7 +43,7 @@ def turn(prompt):
         time.sleep(30)
     if mode in ('repeat7', 'repeat8', 'mcp8'):
         text('已经完成的部分')
-        for i in range(7 if mode == 'repeat7' else 8):
+        for i in range(11 if mode == 'repeat7' else 12):  # 空转门槛：同一调用接连 12 次
             if kind == 'agy':
                 send({'step_update': {'step_type': 'tool', 'state': 'ACTIVE', 'tool_name': 'read_file',
                                      'tool_info': {'parameters': {'path': '/same.txt'}}}})
@@ -157,15 +157,57 @@ class WatchdogTests(unittest.TestCase):
 
     def test_tool_identity_uses_all_parameters_and_ignores_key_order(self):
         watch = self.g['Watchdog'](self.cfg, .1)
-        for i in range(8):
+        for i in range(20):
             watch.tool('read', {'path': 'same', 'offset': i})
-        watch.check()
-        for _ in range(6):
+        watch.check()  # 参数不同不算同一件事
+        for _ in range(11):
             watch.tool('read', {'offset': 0, 'path': 'same'})
-        watch.check()  # 加上前面那一次，一共七次
+        watch.check()  # 参数顺序不同也算同一件事，接连十一次还不算
         watch.tool('read', {'path': 'same', 'offset': 0})
         with self.assertRaisesRegex(self.g['BackendError'], '^空转'):
             watch.check()
+
+    def test_editing_same_file_many_times_is_not_spinning(self):
+        watch = self.g['Watchdog'](self.cfg, .1)
+        for _ in range(60):  # 分块改一个大文件：agy 只报路径，不报改了什么
+            watch.tool('edit_file', {'Path': '/big.rs'})
+            watch.tool('run_command', {'CommandLine': 'cargo test'})
+        watch.tool('write_to_file', {'Path': '/big.rs'})
+        watch.check()
+
+    def test_spinning_counts_consecutive_and_total(self):
+        watch = self.g['Watchdog'](self.cfg, .1)
+        for _ in range(11):  # 中间穿插别的事，接连次数清零
+            watch.tool('read', {'path': 'a'})
+            watch.tool('read', {'path': 'b'})
+        watch.check()
+        for _ in range(19):  # 但没改过文件、同一个调用累计到 30 次还是算绕圈
+            watch.tool('read', {'path': 'a'})
+            watch.tool('read', {'path': 'b'})
+        with self.assertRaisesRegex(self.g['BackendError'], '^空转'):
+            watch.check()
+
+    def test_log_file_updates_count_as_activity(self):
+        import tempfile
+        cfg = dict(self.cfg, idle_timeout=1)
+        watch = self.g['Watchdog'](cfg, 30)
+        fd, log = tempfile.mkstemp()
+        os.close(fd)
+        watch.paths.append(log)
+        try:
+            end = time.time() + 3
+            while time.time() < end:  # 没有任何输出，但日志一直在写：模型还在请求，不算卡住
+                with open(log, 'a') as f:
+                    f.write('streamGenerateContent\n')
+                watch._polled = 0
+                watch.check()
+                time.sleep(0.2)
+            time.sleep(1.2)
+            watch._polled = 0
+            with self.assertRaisesRegex(self.g['BackendError'], '^卡住了'):
+                watch.check()  # 日志也不动了才算卡住
+        finally:
+            os.unlink(log)
 
     def test_claude_uses_only_hard_limit_and_keeps_json_parsing(self):
         self.assertEqual(self.backend('claude', 'delayed', idle_timeout=.15), '完成')

@@ -56,7 +56,7 @@ class EffortTests(unittest.TestCase):
 
     def test_codex_and_claude_flags(self):
         self.assertIn('model_reasoning_effort="high"', self._cmd("backend_codex", "high"))
-        self.assertNotIn("-c", self._cmd("backend_codex", ""))
+        self.assertFalse(any("model_reasoning_effort" in x for x in self._cmd("backend_codex", "")), "没设档位：不传档位")
         c = self._cmd("backend_claude", "max")
         self.assertEqual(c[c.index("--effort") + 1], "max")
         self.assertNotIn("--effort", self._cmd("backend_claude", ""))

@@ -50,6 +50,62 @@ class ResumeTests(unittest.TestCase):
             self.target(**bad)
             self.assertIsNone(self.plan(), bad)
 
+    def test_long_gemini_session_compacts_itself(self):
+        cfg = {"compact_gemini": 200000}
+        self.target(backend="agy:m1", tokens={"in": 3000, "cache": 900000, "ctx": 150000})
+        with self.env():
+            p = self.g["resume_plan"]("gemini", self.g["top_meta"](), {}, False, cfg)
+            self.assertFalse(p["compact"], "会话还不长：照常续接")
+            self.assertEqual(p["prompt"], "第二问")
+        self.target(backend="agy:m1", tokens={"in": 3000, "cache": 900000, "ctx": 210000})
+        with self.env():
+            p = self.g["resume_plan"]("gemini", self.g["top_meta"](), {}, False, cfg)
+            self.assertTrue(p["compact"] and p["prompt"].startswith("/compact 第二问"), "超过门槛：同一个会话里先压缩再回答")
+            self.assertIsNotNone(self.g["resume_plan"]("gemini", self.g["top_meta"](), {}, False, {"compact_gemini": 0}), "填 0：不管")
+        self.target(backend="agy:m1", compact="asked", tokens={"ctx": 230000})
+        with self.env():
+            self.assertIsNone(self.g["resume_plan"]("gemini", self.g["top_meta"](), {}, False, cfg), "让它压缩过却没压成：换新会话兜底")
+        self.target(backend="agy:m1", compact="asked", tokens={"ctx": 230000, "compacted": 1})
+        with self.env():
+            self.assertTrue(self.g["resume_plan"]("gemini", self.g["top_meta"](), {}, False, cfg)["compact"], "压成了但又长了：继续压")
+
+    def test_compact_turn_marks_record_and_skips_keep(self):
+        g, seen = self.g, []
+        self.cfg["compact_gemini"] = 200000
+        self.target(backend="agy:m1", tokens={"ctx": 250000})
+
+        def fake(cfg, model, prompt, cwd, write, timeout):
+            seen.append((cfg.get("_resume"), cfg.get("_keep"), prompt))
+            g["_ctx"].session = {"id": cfg.get("_resume") or "conv-new"}
+            g["_ctx"].tokens = {"in": 1, "out": 1, "cache": 1, "ctx": 9000, "compacted": 1}
+            return "答"
+        with self.env(), patch.dict(g["BACKENDS"], {"agy": fake}):
+            g["ask"](self.cfg, "gemini", "【前文】第一问 第一答\n第二问", quiet=True)
+        self.assertEqual(seen[0][0], "conv-1")
+        self.assertFalse(seen[0][1], "压缩这一轮不走常驻会话")
+        self.assertTrue(seen[0][2].startswith("/compact "))
+        rec = [g["read_json"](os.path.join(g["CALLS_DIR"], f)) for f in os.listdir(g["CALLS_DIR"]) if f != "c_aaa.json"][0]
+        self.assertEqual(rec["compact"], "asked")
+        self.assertEqual(rec["tokens"]["compacted"], 1)
+
+    def test_gpt_and_claude_get_their_own_compact_limits(self):
+        g, got = self.g, {}
+
+        def fake_run(cmd, cwd, env, timeout, **kw):
+            got["cmd"], got["env"] = cmd, env
+            raise g["BackendError"]("stop")
+        cfg = dict(self.cfg, compact_gpt=220000, compact_claude=400000)
+        with patch.dict(g, {"_run": fake_run, "find_bin": lambda *a: "/fake"}):
+            for fn in ("backend_codex", "backend_claude"):
+                try:
+                    g[fn](cfg, "", "hi", self.tmp, False, 5)
+                except Exception:
+                    pass
+                if fn == "backend_codex":
+                    self.assertIn("model_auto_compact_token_limit=220000", got["cmd"])
+                else:
+                    self.assertEqual(got["env"].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"), "400000")
+
     def run_ask(self, fail_resume=False, spec_used=None):
         g, seen = self.g, []
 

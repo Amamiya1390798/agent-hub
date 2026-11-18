@@ -43,6 +43,11 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 
 **续接原生会话**：每次调用会把后端返回的会话编号存进记录的 `session`。追问时由 `resume_plan()` 判断能否直接续接：同一位成员、同一个模型、上一轮成功（派过团队也可以：团队交回的结果会补在这一句前面）、不是分叉、旁问只接旁问、上下文范围是完整、且那个会话还没被别的分支续过（`session_continued_by`）。能续接就只发这一轮的话（GPT `codex exec resume <id>`、Gemini `agy --conversation <id>`、Claude `claude --resume <id> --output-format json`、DeepSeek `dsh --session-id <id>`）；续接失败自动改为把前文写进提示词新开会话。
 
+**长对话自动压缩**：会话越续越长，每一步都要把整段历史重过一遍。配置 `compact_gemini` / `compact_gpt` / `compact_claude`（token 数，默认 20 万 / 22 万 / 40 万，0 = 用模型自己的默认）让三家在各自的会话里压缩，不换会话：
+- Gemini：agy 每步的用量里，最近一次请求的输入加缓存记为 `tokens.ctx`（会话现有长度）；出现 `checkpoint` 步骤记 `tokens.compacted`。下一轮续接时 `ctx` 超过门槛，`resume_plan()` 在这句话前加 `/compact `（agy 会先自己总结前文再回答），记录标 `compact: "asked"`，这一轮不走常驻会话。如果上一轮已经要求压缩却没看到 `checkpoint`，就不再续接，改为新开会话、带 Hub 整理的前文兜底。
+- GPT：给 codex 传 `-c model_auto_compact_token_limit=<n>`。GPT 单次输入超过 27.2 万会按两倍计价，所以默认留在下面。
+- Claude：设环境变量 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=<n>`（Claude Code 在接近这个大小时自动压缩）。
+
 ## 4. 核心流程（都在 `hub` 里）
 
 - **`ask(cfg, agent, prompt, ...)`**：单次调用。负责选后端、写调用记录、实时输出、失败换备用。所有其他流程最终都调用它。
@@ -59,17 +64,17 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 **会审补人与点名**：会审名单里能用的成员不到两位时，`run_council()` 会自动补上其他在岗成员（先补问题里点名的）。对接人可以写 `【派活】会审（gpt、claude）：…`，只叫点名的几位，例如让没做好的补做（`DISPATCH_RE`）。
 
 **看进展的时限**：`timeout` 是软时限，只用来告诉队员大概多久交，到点不会停。真正会停的是 `Watchdog`（`_run`、`keep_turn` 和各后端都接了它）：
-- 连续 `idle_timeout`（默认 300 秒）没有任何输出，报错以「卡住了（」开头；
-- 同一个「工具+参数」出现第 8 次，报错以「空转（」开头；
+- 连续 `idle_timeout`（默认 300 秒）没有任何动静，报错以「卡住了（」开头。「动静」包括输出，也包括 `watch.paths` 里的文件有更新：agy 每次调用都用 `--log-file` 写一份自己的日志（一次性调用在临时目录 `hub-agy-*.log`，常驻会话在 `keep/<id>.agy.log`），模型长时间思考或内部重试时不往外报进度，但日志还在写，就不算卡住。被强行停掉留下的临时日志，隔天自动清掉；
+- 同一个「工具+参数」接连出现 `SPIN_RUN`（12）次，或两次改文件之间累计 `SPIN_TOTAL`（30）次，报错以「空转（」开头。改文件的工具（名字匹配 `_EDIT_TOOL`：edit/write/replace/patch 等，Codex 的 `file_change`）不计数，而且会把累计清零：agy 报上来的改文件参数只有路径，分块改同一个大文件、「改→测→再改」都是正常干活；
 - 到 `hard_timeout`（默认 3600 秒），报错以「超时（到总上限 」开头。
 
 Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑一个已经失败过的同名模型；因为上面三种原因停下、并且已有部分输出时，会把前 6000 字附给下一个模型，让它接着做。进度板还要求队员先亲自打开问题里提到的文件，并在开头写明看了哪些。
 
 **按活的类型分档选模型**：
-- 除了「干活」用的首选模型，每位成员还可以分别设「对接」「动脑」「审美」「文案」四档（`TIERS = ("think","design","copy","chat")`；只有前三档是任务类型，见 `TASK_TIERS`）。「对接」只管这位成员当对接人聊天时用的模型（`run_chat` 里 `tier="chat"`），不设就沿用原来的规则（包括 `CHAT_FAST` 换轻模型）。配置 `chat` / `think` / `design` / `copy` 都是 `{成员: {spec, effort}}`，`spec` 为空表示和干活用同一个模型、只换档位。`think_setting(cfg, agent, tier)` 会忽略已停用的模型。
+- 除了「干活」用的首选模型，每位成员还可以分别设「对接」「动脑」「审美」「文案」「拆任务」「汇总」几档（`TIERS = ("think","design","copy","chat","plan","synth")`；只有前三档是任务类型，见 `TASK_TIERS`）。「拆任务」「汇总」在设置页「谁来拆任务」「谁来汇总」下面选（前端 `roleField()`），`make_plan` 用 `tier="plan"`，汇总用 `tier="synth"`；会审综合设了「汇总」档就用它，否则用「动脑」档。「对接」只管这位成员当对接人聊天时用的模型（`run_chat` 里 `tier="chat"`），不设就沿用原来的规则（包括 `CHAT_FAST` 换轻模型）。配置 `chat` / `think` / `design` / `copy` / `plan` / `synth` 都是 `{成员: {spec, effort}}`，`spec` 为空表示和干活用同一个模型、只换档位。`think_setting(cfg, agent, tier)` 会忽略已停用的模型。
 - `ask(..., tier=...)` 把该档模型排在最前，原来的后备链接在后面。
 - 排工 JSON 里每个任务有 `kind: think|design|copy|work`（中文「动脑/审美/文案」也认）。排工提示里的 `{models}` 由 `model_menu()` / `tier_roster()` 写明每人每档用什么模型；任务里的 `spec` 是用户点名的模型，必须是已启用的 `backend_choices`，用不了就按预设并在任务里说明。任务记录带 `plan_spec`（预计用的模型），面板任务标签显示预计/实际在用的模型，换备用也跟着变。会审的每位成员和会审综合固定走动脑档。
-- 面板成员卡片上「干活用」「思考等级」两栏之外，每档一行（模型 + 档位），修改时调用 `/api/config {chat|think|design|copy: {agent, spec?, effort?}}`。Gemini 的档位写在模型名里，所以改档位就是改 `spec`。卡片上只列这位成员自家的模型（`HOME_KIND`），备用模型不受这个限制。
+- 面板成员卡片上「干活用」「思考等级」两栏之外，每档一行（模型 + 档位），修改时调用 `/api/config {chat|think|design|copy|plan|synth: {agent, spec?, effort?}}`。Gemini 的档位写在模型名里，所以改档位就是改 `spec`。卡片上只列这位成员自家的模型（`HOME_KIND`），备用模型不受这个限制。
 
 **不休眠**：配置 `keep_awake` 为真时，面板服务用 `caffeinate -i -m -w <面板进程号>` 阻止电脑自动睡眠（屏幕仍会熄灭，合盖仍会睡），`/api/awake {on}` 切换。离线测试设 `HUB_NO_AWAKE=1`。
 

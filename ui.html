@@ -387,6 +387,9 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .setting{margin:14px 0}
 .setting label{display:flex;flex-direction:column;gap:6px;font-weight:600}
 .setting label select,.setting label input{width:100%;font-weight:400}
+.setting .role-model .model-line{flex-direction:row;font-weight:400;margin-top:6px}
+.setting .role-model .model-line>span{flex:none}
+.setting .role-model .model-line select{flex:1 1 0;width:0}
 .setting p,.box>p{font-size:12px;color:var(--muted);margin:6px 0;line-height:1.7}
 .login-line{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
 .intro{list-style:none;padding:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:24px 0;text-align:left}
@@ -1089,7 +1092,7 @@ function ownModels(a, cur){              // 这位成员自家的模型（Claude
   return usable(S.backends || [], cur).filter(o => homeOf(o.spec) === k || o.spec === cur);
 }
 const TIER_LIST = [["chat", "对接", "当对接人跟你聊天时（不设就用干活的模型）"], ["think", "动脑", "定方案、审查、拍板、会审"], ["design", "审美", "排版、配色、界面视觉、挑图"], ["copy", "文案", "标题、广告语、对外文字、润色"]];
-const TIER_NAME = {work: "干活", think: "动脑", design: "审美", copy: "文案", chat: "对接"};
+const TIER_NAME = {work: "干活", think: "动脑", design: "审美", copy: "文案", chat: "对接", plan: "拆任务", synth: "汇总"};
 function plannedSpec(agent, kind){       // 任务还没开工时，按成员卡片推算会用哪个模型
   const a = ((S && S.agents) || []).find(x => x.name === agent) || {chain: []};
   const th = (((S && S.config && S.config.tiers) || {})[kind] || {})[agent] || {};
@@ -1303,13 +1306,19 @@ function settingsHtml(){
     '<p class="small">想把 Hub 放到手机桌面：安卓 Chrome 点右上角 ⋮ →「添加到主屏幕」；iPhone Safari 点分享 →「添加到主屏幕」。</p></section>';
   const optA = v => S.agents.filter(a => !a.disabled || a.name === v).map(a => '<option' + (a.name === v ? " selected" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</option>').join("");
   const field = (name, control, help) => '<div class="setting"><label><span>' + name + '</span>' + control + '</label><p>' + help + '</p></div>';
+  const roleField = (name, key, tier, help) => {   // 选人 + 这个人做这件事时用的模型和档位（不设就跟他干活一样）
+    const who = S.agents.find(a => a.name === cfg[key]);
+    return '<div class="setting"><label><span>' + name + '</span><select data-cfg="' + key + '">' + optA(cfg[key]) + '</select></label>' +
+      (who ? '<div class="role-model">' + tierRow(who, tier, "用的模型", help) + '</div>' : '') + '<p>' + help + '</p></div>';
+  };
   return '<h3>设置<button class="btn x" data-act="settings">返回团队</button></h3><p class="small">改完即保存；分工和模型设置从新任务开始生效。</p>' +
     '<section class="box"><h4>分工方式</h4>' +
-    field('谁来拆任务', '<select data-cfg="planner">' + optA(cfg.planner) + '</select>', '收到目标后，由它决定分几步、交给谁。建议日常用 Gemini，复杂目标再选更擅长规划的成员；拆任务也会花它的额度。') +
-    field('谁来汇总', '<select data-cfg="synthesizer">' + optA(cfg.synthesizer) + '</select>', '把大家的回答整理成一份结果；会审时由它比较共同点和分歧。建议用 Gemini；只有一个子任务时直接交回结果。') +
+    roleField('谁来拆任务', 'planner', 'plan', '收到目标后，由它决定分几步、交给谁。建议日常用 Gemini，复杂目标再选更擅长规划的成员；拆任务也会花它的额度。下面可以单独选它拆任务时用的模型和档位，不设就跟它干活用的一样。') +
+    roleField('谁来汇总', 'synthesizer', 'synth', '把大家的回答整理成一份结果；会审时由它比较共同点和分歧。建议用 Gemini；只有一个子任务时直接交回结果。下面可以单独选它汇总时用的模型和档位，不设就跟它干活用的一样（会审综合不设时用它的「动脑」档）。') +
     field('谁参加会审', '<span class="council-pick">' + S.agents.map(a => '<label style="display:inline-flex;gap:4px;margin-right:10px' + (a.disabled ? ';opacity:.5' : '') + '"><input type="checkbox" data-council="' + esc(a.name) + '"' + ((cfg.council_agents || []).indexOf(a.name) >= 0 ? " checked" : "") + (a.disabled ? " disabled" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</label>').join("") + '</span>', '会审时勾选的成员同时各自作答，互相看不到答案，再由汇总的人比较。默认 Gemini、GPT、DeepSeek；Claude 默认不参加，想让它参加就勾上。') +
     field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + (cfg.auto_title && !liveAgents().some(a => a.name === cfg.auto_title) ? '<option value="' + esc(cfg.auto_title) + '" selected>由 ' + esc(cfg.auto_title) + ' 起名（已停用，现由 ' + esc(cfg.auto_title_live || '无人') + ' 代起）</option>' : '') + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
     field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT，以及走 Antigravity 的 Claude）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
+    field('长对话自动压缩（万 token）', [['compact_gemini', 'Gemini', 20], ['compact_gpt', 'GPT', 22], ['compact_claude', 'Claude', 40]].map(x => '<span style="display:inline-flex;align-items:center;gap:4px;margin-right:10px">' + x[1] + ' <input type="number" min="0" max="200" step="1" style="width:64px" data-scale="10000" data-cfg="' + x[0] + '" value="' + esc(cfg[x[0]] == null ? x[2] : Math.round(cfg[x[0]] / 10000)) + '"></span>').join(""), '同一个对话一直接着聊，会话会越来越长，每说一句都要把整段历史重新过一遍。到了这个长度，就让模型自己把前面的内容压缩成摘要，接着在同一个会话里聊，读过的文件和要点都会保留。GPT 超过 27.2 万会按两倍算钱，所以默认 22；Claude 没有长度加价，默认 40；Gemini 上限约 25.6 万，默认 20。填 0 表示不管，用模型自己的默认。') +
     field('最多同时做几件', '<input type="number" min="1" max="8" data-cfg="max_parallel" value="' + esc(cfg.max_parallel) + '">', '不是只能两位合作：最多可同时做 8 件，也可由同一位做多件。建议先用 3；依赖前一步结果的任务仍要等。') +
     field('一般多久交（分钟）', '<input type="number" min="1" max="120" data-cfg="timeout" data-scale="60" value="' + Math.round(cfg.timeout/60) + '">', '告诉成员大概多久该交。到点不会被掐断：只要还在干活就让它做完。建议 15 分钟。' + (cfg.timeout < (cfg.min_timeout || 900) ? '<br><b class="stuck" style="color:var(--bad)">现在少于 15 分钟：读资料、审查、写长文常常需要 5～15 分钟，成员可能会草草交差。</b>' : '')) +
     field('多久没动静算卡住（分钟）', '<input type="number" min="1" max="30" data-cfg="idle_timeout" data-scale="60" value="' + Math.round((cfg.idle_timeout || 300)/60) + '">', '连续这么久一点输出都没有，就当它卡住了，停下换人接着做（已写出的部分会交过去）。反复做同一件事也会被停。建议 5 分钟。') +

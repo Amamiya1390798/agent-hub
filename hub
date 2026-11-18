@@ -81,8 +81,13 @@ DEFAULT_CONFIG = {
     "gpt_full_access": False,  # True：GPT 在「允许改文件」的任务里不受沙箱限制，才能调用 hub 指挥队友、联网
     "codex_effort": "",        # 旧设置：GPT 的思考强度；成员卡片上单独设过（见 effort）就以那个为准
     "design": {},              # 审美的活（排版、配色、界面、视觉、挑图）用的模型和思考等级，格式同 think
-    "copy": {},
-    "chat": {},                # 当对接人跟用户聊天时用的模型和思考等级，格式同 think；不设就用干活的模型                # 文案的活（标题、广告语、文章润色、对外文字）用的模型和思考等级，格式同 think
+    "copy": {},                # 文案的活（标题、广告语、文章润色、对外文字）用的模型和思考等级，格式同 think
+    "chat": {},                # 当对接人跟用户聊天时用的模型和思考等级，格式同 think；不设就用干活的模型
+    "compact_gemini": 200000,  # 长对话自动压缩：Gemini 会话超过这么多 token，Hub 在下一句前加 /compact，让它先自己压缩再回答；0=不管
+    "compact_gpt": 220000,     # GPT（Codex）会话到这么多 token 自己压缩（model_auto_compact_token_limit）；低于 27.2 万可避开长上下文加价；0=用它自己的默认
+    "compact_claude": 400000,  # Claude Code 会话到这么多 token 左右自己压缩（CLAUDE_CODE_AUTO_COMPACT_WINDOW）；0=用它自己的默认
+    "plan": {},                # 拆任务（排工）时用的模型和思考等级，格式同 think；不设就用干活的模型
+    "synth": {},               # 汇总时用的模型和思考等级，格式同 think；不设就用干活的模型（会审综合不设时走动脑档）
     "think": {},               # 动脑的活（定方案、审查、拍板、会审）用的模型和思考等级；没设就跟干活一样
     "effort": {},              # 每位成员的思考等级 {成员: low/medium/high/xhigh/max}，""=沿用该程序自己的默认；对 GPT、Claude 有效，Gemini 的等级写在模型名里
     "profiles": {
@@ -198,9 +203,9 @@ def agent_effort(cfg, agent, spec):
     return e if e and e in effort_levels(spec) else ""
 
 
-TIERS = ("think", "design", "copy", "chat")  # 除「干活」以外单独配模型的几类活
+TIERS = ("think", "design", "copy", "chat", "plan", "synth")  # 除「干活」以外单独配模型的几类活
 TASK_TIERS = ("think", "design", "copy")     # 排工时任务能标的类型（「对接」只给对接人聊天用）
-TIER_NAMES = {"work": "干活", "think": "动脑", "design": "审美", "copy": "文案", "chat": "对接"}
+TIER_NAMES = {"work": "干活", "think": "动脑", "design": "审美", "copy": "文案", "chat": "对接", "plan": "拆任务", "synth": "汇总"}
 
 
 def think_setting(cfg, agent, tier="think"):
@@ -478,8 +483,15 @@ class Live(object):
 WATCHDOG_PREFIXES = ("卡住了（", "空转（", "超时（到总上限 ")
 
 
+SPIN_RUN = 12     # 同一个工具、同样的参数接连调用这么多次（中间没做别的）才算空转
+SPIN_TOTAL = 30   # 两次改文件之间，同一个调用累计这么多次也算（防止两三件事来回绕圈）
+_EDIT_TOOL = re.compile(r"edit|write|replace|patch|create_file|insert", re.I)
+
+
 class Watchdog(object):
-    """软时限后允许继续干活；只因没动静、反复调用同一工具或到总上限而停。"""
+    """软时限后允许继续干活；只因没动静、反复调用同一工具或到总上限而停。
+    改文件的工具不算空转：Antigravity 报上来的只有文件路径，看不出每次改的内容不同，分块改同一个大文件是正常干活。
+    「动静」除了输出，也看 paths 里的文件（如 agy 自己的日志）有没有更新：模型长时间思考或内部重试时不往外报进度，但还活着。"""
 
     def __init__(self, cfg, timeout, streaming=True):
         self.hard_timeout = max(timeout, cfg.get("hard_timeout", DEFAULT_CONFIG["hard_timeout"]))
@@ -487,6 +499,8 @@ class Watchdog(object):
         self.streaming = streaming
         self.start = self.last = time.monotonic()
         self.tools, self.error = {}, None
+        self.run_key, self.run_len = None, 0
+        self.paths, self._mtimes, self._polled = [], {}, 0.0
         self.lock = threading.Lock()
 
     def touch(self):
@@ -497,15 +511,37 @@ class Watchdog(object):
         arg = json.dumps(params, ensure_ascii=False, sort_keys=True)
         key = (name, arg)
         with self.lock:
+            if key == self.run_key:
+                self.run_len += 1
+            else:
+                self.run_key, self.run_len = key, 1
+            if _EDIT_TOOL.search(name or ""):  # 改了文件就是有进展：之后再跑同样的测试、读同样的文件都正常
+                self.tools.clear()
+                return
             self.tools[key] = self.tools.get(key, 0) + 1
-            if self.tools[key] >= 8 and not self.error:
+            if (self.run_len >= SPIN_RUN or self.tools[key] >= SPIN_TOTAL) and not self.error:
                 detail = " ".join((name + " " + arg).split())[:160]
                 self.error = "空转（反复做同一件事：%s）" % detail
+
+    def _poll_paths(self, now):
+        """每隔几秒看一眼日志之类的文件，有更新就算有动静。"""
+        if not self.paths or now - self._polled < 2:
+            return
+        self._polled = now
+        for p in self.paths:
+            try:
+                m = os.stat(p).st_mtime_ns
+            except OSError:
+                continue
+            if self._mtimes.get(p) not in (None, m):
+                self.last = now
+            self._mtimes[p] = m
 
     def check(self):
         """检查后返回下一段最多等多久；流式回调只记状态，由调用线程停进程。"""
         with self.lock:
             now = time.monotonic()
+            self._poll_paths(now)
             hard_left = self.start + self.hard_timeout - now
             idle_left = self.last + self.idle_timeout - now
             if self.error:
@@ -719,7 +755,7 @@ _active_keeps = set()
 
 
 def _keep_paths(kid):
-    return {k: os.path.join(KEEP_DIR, kid + ext) for k, ext in (("meta", ".json"), ("fifo", ".in"), ("log", ".log"), ("lock", ".lock"))}
+    return {k: os.path.join(KEEP_DIR, kid + ext) for k, ext in (("meta", ".json"), ("fifo", ".in"), ("log", ".log"), ("lock", ".lock"), ("agylog", ".agy.log"))}
 
 
 def _keep_alive(meta):
@@ -778,7 +814,7 @@ def keep_close(kid, kill=True):
         p.poll()
         if p.returncode is not None:
             _keep_processes.pop(kid, None)
-    for k in ("meta", "fifo", "log", "lock"):
+    for k in ("meta", "fifo", "log", "lock", "agylog"):
         try:
             os.unlink(ps[k])
         except OSError:
@@ -793,7 +829,7 @@ def _keep_spawn(exe, model, cwd, write, sid, title):
     kid = "k_" + uuid.uuid4().hex[:10]
     ps = _keep_paths(kid)
     os.mkfifo(ps["fifo"], 0o600)
-    cmd = [exe, "--input-format", "stream-json", "--output-format", "stream-json", "--add-dir", ATTACH_DIR]
+    cmd = [exe, "--input-format", "stream-json", "--output-format", "stream-json", "--add-dir", ATTACH_DIR, "--log-file", ps["agylog"]]
     if model:
         cmd += ["--model", model]
     if sid:
@@ -835,6 +871,7 @@ def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line, watc
         meta = _keep_spawn(exe, model, cwd, write, sid, title)
         meta["fresh"] = True
     ps = _keep_paths(meta["id"])
+    watch.paths.append(ps["agylog"])
     try:
         lockf = open(ps["lock"], "w")
     except OSError:
@@ -948,7 +985,17 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
             f.write(prompt)
         prompt = "完整任务说明在文件 %s 中，请先完整阅读该文件，再严格按其中要求完成任务（不要修改或删除该文件）。" % tmp
     watch = Watchdog(cfg, timeout)
-    cmd = [exe, "--print=" + prompt, "--output-format", "stream-json", "--print-timeout", "%ds" % watch.hard_timeout]
+    for old in glob.glob(os.path.join(tempfile.gettempdir(), "hub-agy-*.log")):  # 被强行停掉的调用来不及删日志：隔天清掉
+        try:
+            if time.time() - os.path.getmtime(old) > 86400:
+                os.unlink(old)
+        except OSError:
+            pass
+    fd, agy_log = tempfile.mkstemp(suffix=".log", prefix="hub-agy-")  # agy 自己的日志：模型还在请求就会更新，用来判断没卡住
+    os.close(fd)
+    watch.paths.append(agy_log)
+    cmd = [exe, "--print=" + prompt, "--output-format", "stream-json", "--print-timeout", "%ds" % watch.hard_timeout,
+           "--log-file", agy_log]
     if model:
         cmd += ["--model", model]
     if cfg.get("_resume"):  # 续接上一轮的会话，只发这一轮的话
@@ -978,6 +1025,10 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
             box["tok"]["in"] += int(u.get("input_tokens") or 0)
             box["tok"]["out"] += int(u.get("output_tokens") or 0)
             box["tok"]["cache"] += int(u.get("cache_read_tokens") or 0)
+            if su.get("step_type") != "checkpoint":  # 会话现在有多长 = 最近一次请求发过去的量
+                box["tok"]["ctx"] = int(u.get("input_tokens") or 0) + int(u.get("cache_read_tokens") or 0)
+        if su.get("step_type") == "checkpoint":  # 这一轮里会话被压缩过（/compact 或它自己到点压缩）
+            box["tok"]["compacted"] = 1
         if su.get("step_type") == "agent_response" and su.get("text_delta"):
             if box["step"] is not None and box["step"] != su.get("step_index") and live.text:
                 live.add("\n\n")
@@ -997,11 +1048,12 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
             rc, out, err = _run(cmd, cwd, clean_env(), watch.hard_timeout + 30, on_line=on_line, watch=watch)
     finally:
         live.close()
-        if tmp:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+        for f in (tmp, agy_log):
+            if f:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
     data = box["data"]
     if not isinstance(data, dict):
         raise BackendError("agy 没有给出结果 rc=%s：%s" % (rc, _tail(err or out)))
@@ -1035,6 +1087,8 @@ def backend_codex(cfg, model, prompt, cwd, write, timeout):
         cmd += ["-c", 'model_reasoning_effort="%s"' % cfg["_effort"]]
     if cfg.get("_web"):  # 打开 GPT 自带的实时网页搜索
         cmd += ["-c", 'web_search="live"']
+    if int(cfg.get("compact_gpt") or 0) > 0:  # 会话到这么长就让它自己压缩
+        cmd += ["-c", "model_auto_compact_token_limit=%d" % int(cfg["compact_gpt"])]
     cmd += ["--json"] + ([cfg["_resume"]] if cfg.get("_resume") else []) + ["-"]
     live = Live()
     watch = Watchdog(cfg, timeout)
@@ -1053,6 +1107,8 @@ def backend_codex(cfg, model, prompt, cwd, write, timeout):
         typ, kind = str(ev.get("type") or ""), str(item.get("type") or item.get("item_type") or "")
         if kind == "agent_message" and typ.endswith("completed") and item.get("text"):
             live.add(str(item["text"]) + "\n\n")
+        elif kind == "file_change" and typ.endswith(("started", "completed")):
+            watch.tool("edit_file", "")  # 改了文件：算有进展，之前的累计次数清零
         elif kind == "command_execution" and typ.endswith("started"):
             watch.tool(kind, item.get("command") or "")
             live.step(str(item.get("command") or "运行命令"))
@@ -1152,7 +1208,10 @@ def backend_claude(cfg, model, prompt, cwd, write, timeout):
         cmd += ["--add-dir", ATTACH_DIR]
     cmd += ["--output-format", "json"]  # 拿到会话编号，下次追问能续接
     watch = Watchdog(cfg, timeout, streaming=False)
-    rc, out, err = _run(cmd, cwd, clean_env(), watch.hard_timeout, stdin_text=prompt, watch=watch)
+    env = clean_env()
+    if int(cfg.get("compact_claude") or 0) > 0:  # 会话到这么长左右就让它自己压缩
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(cfg["compact_claude"]))
+    rc, out, err = _run(cmd, cwd, env, watch.hard_timeout, stdin_text=prompt, watch=watch)
     text = out.strip()
     try:
         d = json.loads(text)
@@ -1163,7 +1222,8 @@ def backend_claude(cfg, model, prompt, cwd, write, timeout):
             raise BackendError("claude 出错：%s" % _tail(str(d.get("result") or d.get("subtype") or text)))
         text = str(d.get("result") or "").strip()
         u = d.get("usage") if isinstance(d.get("usage"), dict) else {}
-        _ctx.tokens = {"in": int(u.get("input_tokens") or 0), "out": int(u.get("output_tokens") or 0),
+        _ctx.tokens = {"in": int(u.get("input_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0),  # 写进缓存的也是新算的
+                       "out": int(u.get("output_tokens") or 0),
                        "cache": int(u.get("cache_read_input_tokens") or 0)}
         if d.get("session_id"):
             _ctx.session = {"id": str(d["session_id"]), "app": "Claude Code",
@@ -1452,7 +1512,7 @@ _SID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CHAT_FAST = {"agy:gemini-pro-orchestrator": ("agy:gemini-4-carbon-medium",)}  # 首选模型 → 聊天时改用的轻模型
 
 
-def resume_plan(agent, ext, meta, web):
+def resume_plan(agent, ext, meta, web, cfg=None):
     """追问时能不能直接续接上一轮的原生会话（各家都会缓存会话前文，命中率更高，也不用重发上文）。
     只在「接着上一轮、同一位、同一个模型、上一轮成功（或派过团队，结果补进这一句）、那个会话还没被别的分支接过」时续接；旁问只接旁问；
     分叉、只带一条上文、换人换模型时都不续接，照旧把上文写进提示词新开会话。"""
@@ -1468,6 +1528,11 @@ def resume_plan(agent, ext, meta, web):
         return None
     if (meta.get("kind") == "side") != (t.get("kind") == "side"):  # 旁问另开自己的线，不去抢主对话的会话
         return None
+    tk = t.get("tokens") if isinstance(t.get("tokens"), dict) else {}
+    limit = int((cfg or {}).get("compact_gemini") or 0)
+    compact = bool(limit and str(t.get("backend") or "").startswith("agy:") and int(tk.get("ctx") or 0) > limit)
+    if compact and t.get("compact") == "asked" and not tk.get("compacted"):
+        return None  # 上一轮已经让它压缩过却没压成：不再硬接，换新会话、带上 Hub 整理好的前文
     text = meta.get("resume_prompt") or ext.get("display")
     if not text:
         return None
@@ -1477,8 +1542,8 @@ def resume_plan(agent, ext, meta, web):
             res = "（没有全部完成：%s）\n%s" % (t.get("error") or "", res)
         text = "（上一轮团队任务已结束，以下结果用户已看到：）\n%s\n\n%s" % (res[:12000], text)
     imgs = [p for p in (attachment_path(n) for n in ext.get("images") or []) if p]
-    return {"from": f["id"], "path": tpath, "sid": str(ses["id"]), "backend": t.get("backend"),
-            "prompt": text + image_note(imgs) + (WEB_NOTE if web else "")}
+    return {"from": f["id"], "path": tpath, "sid": str(ses["id"]), "backend": t.get("backend"), "compact": compact,
+            "prompt": ("/compact " if compact else "") + text + image_note(imgs) + (WEB_NOTE if web else "")}
 
 
 def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, quiet=False, note=True, meta=None,
@@ -1540,7 +1605,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
     cpath = os.path.join(CALLS_DIR, cid + ".json")
     keepable = (bool(cfg.get("keep_sessions", True)) and not rec["parent"] and rec["kind"] in ("ask", "chat", "side")
                 and bool(os.environ.get("HUB_META")) and hub_depth() == 0)  # 只给面板里的对话留着；命令行、队员互相求助的一次性提问不留
-    resume = resume_plan(agent, top_meta(), meta, web) if not rec["parent"] and rec["kind"] in ("ask", "chat", "side") else None
+    resume = resume_plan(agent, top_meta(), meta, web, cfg) if not rec["parent"] and rec["kind"] in ("ask", "chat", "side") else None
     write_json(cpath, rec)
     previous = (getattr(_ctx, "call_id", None), getattr(_ctx, "run_id", None), getattr(_ctx, "write", True))
     _ctx.call_id = cid
@@ -1592,7 +1657,11 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
                         t["session_continued_by"] = cid  # 先占住：这个会话之后只沿这条线续，别的分支另开新会话
                         write_json(resume["path"], t)
                         try:
-                            text = fn(dict(run_cfg, _resume=resume["sid"]), mdl, resume["prompt"], cwd, write, timeout)
+                            if resume.get("compact"):  # 会话太长：这一句前加 /compact，让它先自己压缩再回答（走一次性调用，确定能识别命令）
+                                rec["compact"] = "asked"
+                                write_json(cpath, rec)
+                            text = fn(dict(run_cfg, _resume=resume["sid"], _keep=run_cfg["_keep"] and not resume.get("compact")),
+                                      mdl, resume["prompt"], cwd, write, timeout)
                             rec["resumed"] = resume["from"]
                         except (BackendError, OSError) as e:
                             if _stopping.is_set() or str(e).startswith(WATCHDOG_PREFIXES):
@@ -1783,7 +1852,7 @@ def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None
         prompt = "【用户给排工者的特别要求，请先读并照办】\n" + inject.strip() + "\n\n――――――――\n\n" + prompt
     last = None
     for attempt in range(2):
-        text, spec = ask(cfg, planner, prompt, cwd=cwd, note=False,
+        text, spec = ask(cfg, planner, prompt, cwd=cwd, note=False, tier="plan",
                          meta={"run": run_id, "kind": "plan", "title": "排工：" + (title or goal)[:40]})
         try:
             plan = extract_json(text)
@@ -2142,7 +2211,7 @@ def run_goal(cfg, goal, cwd, write, planner, synthesizer, max_parallel, max_task
                 eprint("[hub] 汇总中（%s）…" % synthesizer)
                 save(status="synthesizing")
                 final, _ = ask(cfg, synthesizer, SYNTH_PROMPT.format(goal=goal + "".join("\n（用户中途补充：%s）" % n for n in run_notes(run_id)), results=blob), cwd=cwd, note=False,
-                               quiet=True, meta={"run": run_id, "kind": "synth", "title": "汇总：" + (state.get("display") or goal)[:40]})
+                               quiet=True, tier="synth", meta={"run": run_id, "kind": "synth", "title": "汇总：" + (state.get("display") or goal)[:40]})
             except BackendError as e:
                 synth_ok = False
                 final = "（汇总失败：%s）\n\n%s" % (e, blob)
@@ -2239,7 +2308,7 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
                 eprint("[hub] 比较意见中（%s）…" % synth)
                 save(status="synthesizing")
                 final, _ = ask(cfg, synth, COUNCIL_SYNTH_PROMPT.format(question=question, results=blob, note=note),
-                               cwd=state["cwd"], note=False, quiet=True, tier="think",
+                               cwd=state["cwd"], note=False, quiet=True, tier="synth" if any(think_setting(cfg, synth, "synth")) else "think",
                                meta={"run": run_id, "kind": "synth", "title": "会审综合：" + (state.get("display") or question)[:40]})
                 if same:
                     final = "> 注意：" + "；".join(same) + "\n\n" + final
@@ -2777,7 +2846,7 @@ def ui_state(cfg, compact=False):
             "names": load_names(), "naming": _names_running.is_set(), "folders": load_folders(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
                        "running": bool(_health_running.is_set())},
-            "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout", "idle_timeout", "hard_timeout")},
+            "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout", "idle_timeout", "hard_timeout", "compact_gemini", "compact_gpt", "compact_claude")},
                            council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
                            council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
                            quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "", auto_title_live=active_cfg(cfg).get("auto_title") or "",
@@ -4433,7 +4502,8 @@ def serve_ui(port, me):
             chain[idx] = spec
             raw.setdefault("agents", {})[name] = chain
         for k, lo, hi in (("max_parallel", 1, 8), ("timeout", 60, 7200),
-                          ("idle_timeout", 60, 1800), ("hard_timeout", 300, 14400)):
+                          ("idle_timeout", 60, 1800), ("hard_timeout", 300, 14400),
+                          ("compact_gemini", 0, 2000000), ("compact_gpt", 0, 2000000), ("compact_claude", 0, 2000000)):
             if k in body:
                 v = body[k]
                 if type(v) is not int:
