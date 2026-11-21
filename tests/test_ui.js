@@ -34,10 +34,11 @@ const ui = {
   findItem:()=>({type:'call',id:'c_abc',rec:{id:'c_abc',kind:'ask',agent:'gpt',cwd:'/work',write:false,display:'再解释',follows:{type:'call',id:'c_def'}}}),
   api:async(path,body)=>{submitted.push({path,body}); return {submission_id:"own"};},
   toast:t=>{toastText=t;}, poll:()=>{polls++;},
-  beginSubmit:()=>{}, clearTimeout:()=>{}, isRemote:()=>false,
+  beginSubmit:()=>{}, clearTimeout:()=>{}, isRemote:()=>false, confirm:()=>false,
   renderView:()=>{}, stopArm:'c_abc', last:{view:'old',rail:'old'}, followLatest:true,
 };
 vm.createContext(ui);
+vm.runInContext(script.slice(script.indexOf('function confirmRemoteSubmit('),script.indexOf('async function send(){')),ui);
 vm.runInContext(script.slice(script.indexOf('document.addEventListener("click"'),script.indexOf('["mousedown", "keydown", "input"]')),ui);
 (async()=>{
   const click = act=>({target:{closest:()=>({dataset:{act,sure:'1'},tagName:'BUTTON'})}});
@@ -45,6 +46,18 @@ vm.runInContext(script.slice(script.indexOf('document.addEventListener("click"')
   assert.equal(submitted[0].body.text,'再解释');
   assert.equal(submitted[0].body.context.id,'c_def');
   assert.equal(submitted[0].body.agent,'gpt');
+  ui.isRemote = () => true;
+  await listeners.click(click('retry'));
+  assert.equal(submitted[1].body.cwd,'');
+  assert.equal(submitted[1].body.confirm_write,undefined);
+  ui.findItem = () => ({type:'call',id:'c_img',rec:{id:'c_img',kind:'image',agent:'gpt',cwd:'/work',display:'画图'}});
+  await listeners.click(click('retry'));
+  assert.equal(submitted.length,2,'手机取消确认后不提交');
+  ui.confirm = message => message.includes('画图');
+  await listeners.click(click('retry'));
+  assert.equal(submitted[2].body.cwd,'');
+  assert.equal(submitted[2].body.confirm_write,true);
+  ui.isRemote = () => false;
   ui.api = async()=>{throw Error('失败');};
   await listeners.click(click('stop'));
   assert.equal(ui.stopArm,null); assert.equal(ui.last.view,'');
@@ -59,7 +72,7 @@ vm.runInContext(script.slice(script.indexOf('document.addEventListener("click"')
 const tags = {};
 vm.createContext(tags);
 vm.runInContext(esc + script.slice(script.indexOf('const fallbackTag ='),script.indexOf('function block(')) + '\nthis.tag=fallbackTag;',tags);
-assert.equal(tags.tag('gpt','codex','codex'),'');
-assert.ok(tags.tag('gpt','dsh','codex').includes('由后备顶替'));
-assert.equal(tags.tag('gpt','codex',null),'');
+assert.equal(tags.tag('codex','codex'),'');
+assert.ok(tags.tag('dsh','codex').includes('由后备顶替'));
+assert.equal(tags.tag('codex',null),'');
 console.log('ui fallback: historical preferred model passed');

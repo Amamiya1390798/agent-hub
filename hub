@@ -51,6 +51,7 @@ UI_HTML = os.path.join(HUB_HOME, "ui.html")
 UI_WORKSPACE = os.path.join(HUB_HOME, "workspace")  # 面板下任务时的默认工作目录
 ATTACH_DIR = os.path.join(UI_WORKSPACE, "attachments")  # 用户粘贴/拖进来的图片
 _ctx = threading.local()                          # 当前线程正在进行的调用 id
+RUN_ACTIVE = ("planning", "running", "synthesizing")
 MAX_DEPTH = 2  # agent 调 agent 的最大嵌套层数，防止互相无限踢皮球
 
 DEFAULT_CONFIG = {
@@ -87,6 +88,8 @@ DEFAULT_CONFIG = {
     "compact_gpt": 220000,     # GPT（Codex）会话到这么多 token 自己压缩（model_auto_compact_token_limit）；低于 27.2 万可避开长上下文加价；0=用它自己的默认
     "compact_claude": 400000,  # Claude Code 会话到这么多 token 左右自己压缩（CLAUDE_CODE_AUTO_COMPACT_WINDOW）；0=用它自己的默认
     "plan": {},                # 拆任务（排工）时用的模型和思考等级，格式同 think；不设就用干活的模型
+    "handoff_by": "gemini",    # 压缩、交接时由谁把整组来往写成说明
+    "digest": {},              # 写压缩/交接说明时用的模型和思考等级，格式同 think；不设就用干活的模型
     "synth": {},               # 汇总时用的模型和思考等级，格式同 think；不设就用干活的模型（会审综合不设时走动脑档）
     "think": {},               # 动脑的活（定方案、审查、拍板、会审）用的模型和思考等级；没设就跟干活一样
     "effort": {},              # 每位成员的思考等级 {成员: low/medium/high/xhigh/max}，""=沿用该程序自己的默认；对 GPT、Claude 有效，Gemini 的等级写在模型名里
@@ -161,8 +164,7 @@ def load_config():
         return DEFAULT_CONFIG
 
 
-WEB_NOTE = ("\n\n（可联网。需要最新信息或对信息没把握时，先用网页搜索工具核实，"
-            "回答附主要来源链接；搜不到或没有搜索工具就直说，不编造。）")
+WEB_NOTE = "\n\n（可联网查证。适合搜索时可使用网页工具，并附主要来源链接。）"
 CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"]   # 来自 claude --help 的 --effort 档位
 CODEX_EFFORTS_FALLBACK = ["low", "medium", "high", "xhigh", "max"]
 _EFFORT_ID = re.compile(r"^[a-z][a-z0-9_-]{0,15}$")
@@ -203,9 +205,9 @@ def agent_effort(cfg, agent, spec):
     return e if e and e in effort_levels(spec) else ""
 
 
-TIERS = ("think", "design", "copy", "chat", "plan", "synth")  # 除「干活」以外单独配模型的几类活
+TIERS = ("think", "design", "copy", "chat", "plan", "synth", "digest")  # 除「干活」以外单独配模型的几类活
 TASK_TIERS = ("think", "design", "copy")     # 排工时任务能标的类型（「对接」只给对接人聊天用）
-TIER_NAMES = {"work": "干活", "think": "动脑", "design": "审美", "copy": "文案", "chat": "对接", "plan": "拆任务", "synth": "汇总"}
+TIER_NAMES = {"work": "干活", "think": "动脑", "design": "审美", "copy": "文案", "chat": "对接", "plan": "拆任务", "synth": "汇总", "digest": "压缩"}
 
 
 def think_setting(cfg, agent, tier="think"):
@@ -264,7 +266,7 @@ def active_cfg(cfg):
     c["agents"] = agents
     c["_disabled_agents"] = [n for n in cfg["agents"] if n not in agents]
     pref = [x for x in ("gemini", "gpt", "ds", "claude") if x in agents] + [x for x in agents if x not in ("gemini", "gpt", "ds", "claude")]
-    for k in ("planner", "synthesizer", "default_worker"):
+    for k in ("planner", "synthesizer", "default_worker", "handoff_by"):
         if c.get(k) not in agents and pref:
             c[k] = pref[0]
     if c.get("auto_title") and c["auto_title"] not in agents:  # 选的起名人停用了：换一位启用的接手（""=用户关了起名，不补）
@@ -371,8 +373,7 @@ def clean_env(extra=None):
     parts = [os.path.join(HOME, ".local/bin")] + env.get("PATH", "").split(os.pathsep)
     # 从 Hub.app 启动时 PATH 很短：补上常见目录，不然 npm 装的命令行（#!/usr/bin/env node）找不到 node
     parts += [os.path.join(HOME, d) for d in BIN_DIRS] + list(SYS_BIN_DIRS) + (_SHELL_PATH.get("v") or "").split(os.pathsep)
-    seen = set()
-    env["PATH"] = os.pathsep.join(x for x in parts if x and not (x in seen or seen.add(x)))
+    env["PATH"] = os.pathsep.join(dict.fromkeys(filter(None, parts)))
     if os.environ.get("HUB_READONLY") == "1" or not getattr(_ctx, "write", True):
         env["HUB_READONLY"] = "1"  # 只读任务里队友再调 hub 也只能只读（会审等不能被绕成可写）
     if extra:
@@ -388,22 +389,12 @@ _children = set()  # 正在运行的子进程，收到停止信号时一并结�
 _stopping = threading.Event()  # 收到停止信号后不再启动任何新进程（包括后备模型）
 
 
-def _kill_tree(p):
+def _kill_tree(p, sig=signal.SIGTERM):
     try:
-        os.killpg(p.pid, signal.SIGTERM)
+        os.killpg(p.pid, sig)
     except OSError:
         try:
-            p.terminate()
-        except OSError:
-            pass
-
-
-def _kill_tree_hard(p):
-    try:
-        os.killpg(p.pid, signal.SIGKILL)
-    except OSError:
-        try:
-            p.kill()
+            p.send_signal(sig)
         except OSError:
             pass
 
@@ -424,7 +415,7 @@ def _on_stop(signum, frame):
             break
         time.sleep(0.1)
     for p in list(_children) + list(seen):
-        _kill_tree_hard(p)
+        _kill_tree(p, signal.SIGKILL)
         try:
             p.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -625,7 +616,7 @@ def _run(cmd, cwd, env, timeout, stdin_text=None, on_line=None, watch=None):
         except subprocess.TimeoutExpired:
             pass
         # 组长退出不等于子孙退出；继承输出管道的子进程也必须回收。
-        _kill_tree_hard(p)
+        _kill_tree(p, signal.SIGKILL)
         p.wait()
         for t in ths:
             if t.ident is not None:
@@ -834,7 +825,7 @@ def _keep_spawn(exe, model, cwd, write, sid, title):
         cmd += ["--model", model]
     if sid:
         cmd += ["--conversation", sid]
-    cmd += agy_perm_args(write) + ["-p="]
+    cmd += agy_perm_args(write, load_config()) + ["-p="]
     try:
         fin = os.open(ps["fifo"], os.O_RDWR)  # 自己也握着写端：中间没人说话时它不会读到结尾而退出
         try:
@@ -964,11 +955,12 @@ def keep_turn(exe, model, prompt, cwd, write, timeout, sid, title, on_line, watc
         lockf.close()
 
 
-def agy_perm_args(write):
+def agy_perm_args(write, cfg=None):
     if write:
         return ["--mode", "accept-edits", "--dangerously-skip-permissions"]
     # 只读：允许读任何位置的文件（和其他成员的只读一样），但不能写、不能运行命令。否则读工作目录外的文件会被拒、交白卷
-    return ["--settings", json.dumps({"permissions": {"allow": ["read_file(/)"]}})]
+    allow = ["read_file(/)"]
+    return ["--settings", json.dumps({"permissions": {"allow": allow}})]
 
 
 def backend_agy(cfg, model, prompt, cwd, write, timeout):
@@ -983,7 +975,7 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
             fd, tmp = tempfile.mkstemp(suffix=".md", prefix="hub-prompt-")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(prompt)
-        prompt = "完整任务说明在文件 %s 中，请先完整阅读该文件，再严格按其中要求完成任务（不要修改或删除该文件）。" % tmp
+        prompt = "任务说明在文件 %s 中，请读取后完成任务。" % tmp
     watch = Watchdog(cfg, timeout)
     for old in glob.glob(os.path.join(tempfile.gettempdir(), "hub-agy-*.log")):  # 被强行停掉的调用来不及删日志：隔天清掉
         try:
@@ -1002,7 +994,7 @@ def backend_agy(cfg, model, prompt, cwd, write, timeout):
         cmd += ["--conversation", cfg["_resume"]]
     if cfg.get("_images"):  # 让它能打开放图片的目录
         cmd += ["--add-dir", ATTACH_DIR]
-    cmd += agy_perm_args(write)
+    cmd += agy_perm_args(write, cfg)
     live = Live()
     box = {"data": None, "step": None, "tok": {"in": 0, "out": 0, "cache": 0}}
 
@@ -1281,7 +1273,7 @@ def _record_guard(get_record, save, failure):
         yield
     except BaseException as e:
         rec = get_record()
-        if (rec.get("status") in ("planning", "running", "synthesizing")
+        if (rec.get("status") in RUN_ACTIVE
                 or (failure == "failed" and rec.get("status") == "failed")):
             if failure == "failed":
                 _fail_tasks(rec)
@@ -1300,11 +1292,6 @@ def _iso_to_epoch(sv):
         return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
     except (ValueError, TypeError, AttributeError):
         return None
-
-
-def quota_agy(cfg, group="gemini"):
-    """Antigravity 自带的额度查询（不消耗模型额度）。group：gemini 或 claude（Claude 和 GPT 合用一份额度）。"""
-    return (quota_agy_all(cfg) or {}).get(group)
 
 
 def quota_agy_all(cfg):
@@ -1458,7 +1445,7 @@ def team_note(cfg, me):
     others = [a for a in cfg["agents"] if a != me]
     return ("\n\n---\n[协作说明] 你是团队成员「%s」。子任务明显更适合队友时，"
             "可在终端执行 `hub ask <agent> \"问题\"` 求助（可选：%s；加 --write 允许对方改文件；长内容用 `hub ask <agent> -` 从标准输入传入）。"
-            "只交最终结果和必要说明，不复述过程，不反问。" % (me, " / ".join(others)))
+            "按任务需要协作，并交付成果和必要说明。" % (me, " / ".join(others)))
 
 
 _ATT_NAME = re.compile(r"^att-[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\.(png|jpg|webp|gif)$")
@@ -1502,8 +1489,8 @@ def image_note(paths):
     """告诉模型图片在哪、怎么看。GPT 另外直接附图；DeepSeek 用 read_image；Gemini、Claude 用各自的看图/读文件工具。"""
     if not paths:
         return ""
-    return ("\n\n【用户附了 %d 张图片，回答前请先逐张打开看清楚（用你的看图工具，例如 read_image / 读取文件；"
-            "GPT 已直接收到图片）】\n" % len(paths)) + "\n".join("图 %d：%s" % (i + 1, p) for i, p in enumerate(paths))
+    return ("\n\n【用户附了 %d 张图片，可用看图工具查看，例如 read_image / 读取文件；"
+            "GPT 已直接收到图片】\n" % len(paths)) + "\n".join("图 %d：%s" % (i + 1, p) for i, p in enumerate(paths))
 
 
 _SID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -1593,6 +1580,10 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
            "image": meta.get("image"), "follows": None, "display": None, "chat": meta.get("chat")}
     if web or spec or effort is not None:
         rec["side"] = {"web": bool(web), "effort": effort or "", "spec": spec or ""}
+    if meta.get("pressure"):
+        rec["pressure"] = True
+    if meta.get("pressure_prompt"):
+        rec["pressure_prompt"] = meta["pressure_prompt"]
     images = [n for n in (top_meta().get("images") or []) if attachment_path(n)][:MAX_IMAGES]
     if images and not rec["parent"]:
         rec["images"] = images
@@ -1697,7 +1688,7 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
                         att["partial"] = _ctx.partial
                         rec["partial"] = _ctx.partial  # 超时等情况下已经写出来的部分，标「未完成」给人看
                         if str(e).startswith(WATCHDOG_PREFIXES):
-                            continuation = "\n\n（前一位做到一半被停下了，以下是它已经写出的部分，请在此基础上接着做完，不要从头再来：）\n" + _ctx.partial[:6000]
+                            continuation = "\n\n（以下是前一位成员留下的部分结果，供接手参考：）\n" + _ctx.partial[:6000]
                     rec["attempts"].append(att)
                     log_call({"ts": time.strftime("%F %T"), "agent": agent, "backend": spec_i, "ok": False,
                               "secs": round(time.time() - t0, 1), "error": str(e)[:500], "prompt": prompt[:200]})
@@ -1716,49 +1707,30 @@ def ask(cfg, agent, prompt, cwd=None, write=False, timeout=None, model=None, qui
 
 # ---------------------------------------------------------------- 规划 + 并行执行
 
-PLAN_PROMPT = """为平等协作的小团队排工，按成员长处和剩余额度分配，写清依赖与预计耗时。
+PLAN_PROMPT = """为平等协作的小团队排工，写清分工、依赖和预计耗时。按目标、成员长处和额度判断怎么协调，简单的事可以交给一位成员，有独立工作时可以并行，值得复核的成果可以安排复核。
 
 团队成员：
 {roster}
-
-可用模型（写法：说明）：{models}
-
-排工规则：
-1. 简单目标只排 1 个任务，交给最合适的成员。
-2. 有多块独立工作时，拆成 2～4 个可并行任务，尽量分给不同成员；不要重复分派同一份工作。
-3. 关键成果（方案、代码、交付用户的结论）值得复核时，再交给另一位成员审查，用 depends_on 接在产出任务后。
-4. 执行工作（查资料、写初稿、写代码、整理）默认给 gemini；claude / gpt 主要定方案、拍板和审查；画图给 gpt，零碎小活给 ds。{quota_rule}gemini 额度不足时再由其他成员接手，并在 why 中说明。
-5. 每个任务的 prompt 必须自包含：队员看不到用户原话，须写全所需背景、约束和输出格式，并要求简洁交付成果与必要说明。依赖其他任务结果时用 depends_on 标出，执行时会自动附上前置结果。
-6. why 用一句话说明成员长处或额度原因；eta_min 填预计分钟数，须为整数。一般在 {timeout_min} 分钟内做完；确实要更久也可以，只要一直在推进就不会被打断。
-7. kind 标这件活偏哪种，成员会按这一档换用对应的模型（成员名单里写了每档用什么模型）：
-   - think＝动脑：定方案、做判断、审查把关、疑难分析；
-   - design＝审美：排版、配色、界面和视觉设计、挑图、判断好不好看；
-   - copy＝文案：标题、广告语、宣传和对外文字、润色改写；
-   - work＝干活：查资料、读文件、写初稿、写代码、批量修改、整理。拿不准就写 work。
-   design、copy 的活优先派给在这一档专门配了模型的成员。think 用的模型通常更慢、更费额度，别滥用。
-   用户在目标里明确点名要用某个模型时（例如「用 Flash 做」「让 Opus 审」），给那件任务加 "spec": "<可用模型里的写法>"，agent 填这个模型所属的成员；用户点名的模型优先于上面的预设。用户没点名就不要写 spec。
-8. 共排 1～{max_tasks} 个任务。创建或修改文件、运行命令、操作本机软件的任务设 write=true（只读任务只能读文件、上网，不能运行任何命令）{write_hint}；两个写任务不得修改同一文件。
-9. 1～2 分钟内排完，只根据已给目标和背景拆分。不要自行读文件、运行命令、上网或执行任务；需要先摸清情况，就把它排为第一个任务。
-
+{quota_rule}
+可用模型：{models}
 工作目录：{cwd}
+参考耗时：{timeout_min} 分钟。
 
 用户目标：
 {goal}
 
-只输出一个 JSON 对象，不加其他文字或代码块标记：
-{{"summary": "一句话方案", "tasks": [{{"id": "t1", "agent": "gemini", "title": "简短标题", "why": "为什么派给它", "eta_min": 5, "kind": "work", "prompt": "给队员的完整指令", "depends_on": [], "write": false}}]}}"""
+队员看不到用户原话，prompt 写明各自的目标、相关背景和交付要求。depends_on 填前置任务的 id，执行时会附上结果。eta_min 填预计分钟数（整数）。
+kind 可填 work（执行）、think（规划、判断与复核）、design（视觉设计）或 copy（文案）。动脑模型通常更慢、耗费额度更多。用户点名模型时，可加 spec（填可用模型中的名称）并选对应的 agent。
+write 表示任务需要动手改文件、运行命令或操作软件时填 true。{write_hint}
 
-USER_STYLE = """【回答写法，必须遵守】用户不是程序员，看不懂技术细节。有固定输出格式（如【派活】）时先守格式，其余一律这样写：
-1. 第一句就给结论或结果，像跟朋友发消息那样说。
-2. 默认 200 字以内；只说用户要知道的和要做的，不讲内部原理、代码、文件路径、函数名、参数名。
-3. 不用表格、不用小标题、不堆粗体；最多列 3～5 个短点。
-4. 用日常词，不用英文缩写和行话；实在绕不开就顺手用大白话解释一句。
-5. 用户追问了再展开细节。
-6. 没把握就直说哪里不确定，不编。"""
+输出一个 JSON 对象，包含 1～{max_tasks} 个任务：
+{{"summary": "一句话方案", "tasks": [{{"id": "t1", "agent": "gemini", "title": "简短标题", "why": "分工理由", "eta_min": 5, "kind": "work", "prompt": "任务说明", "depends_on": [], "write": false}}]}}"""
+
+USER_STYLE = """用户不是程序员。用简体中文和日常用语，先说结论，再给必要的说明。不确定的地方说清楚。"""
 
 SYNTH_PROMPT = USER_STYLE + """
 
-把各任务结果合并成一份给用户的最终答复，直接交付结论和成果。去掉重复，指出结果中的矛盾（如有），标明失败的任务；不要逐份复述队员的回答。
+把各任务结果合并成一份给用户的最终答复。交付成果，说明影响结论的分歧、失败和未完成事项。
 
 用户目标：
 {goal}
@@ -1766,21 +1738,14 @@ SYNTH_PROMPT = USER_STYLE + """
 各任务结果：
 {results}"""
 
-COUNCIL_PROMPT = """请独立回答下面的问题。其他队员也在同时独立作答，彼此看不到答案；之后会统一比较共同点和分歧。
-用简体中文，简短给出自己的判断和关键理由；不确定就直说，不编造。
+COUNCIL_PROMPT = """独立回答下面的问题。其他成员也在各自作答，之后会统一比较意见。用简体中文说明你的判断、关键依据和不确定之处。
 
 问题：
 {question}"""
 
 COUNCIL_SYNTH_PROMPT = USER_STYLE + """
 
-比较各成员的独立回答，按以下四节输出，标题保持原样：
-## 建议
-## 共同点
-## 分歧与各自理由
-## 还需要确认的信息
-
-不要把多数意见当成事实；每项分歧写清成员、观点和理由。有成员缺席或失败时，在四节之前简要注明。{note}
+比较各成员的独立回答，给出建议，说明共同点、分歧及各自理由，以及还需要确认的事。结合依据判断，说明会影响结论的缺席或失败。{note}
 
 问题：
 {question}
@@ -1842,14 +1807,59 @@ def extract_json(text):
     raise ValueError("规划输出里没有合法的 JSON 方案")
 
 
+# 排工者常把「写文件」的任务误标成 write=false，导致队员在只读模式下被拦。
+# 这里按「写动词 + 产物」同句共现做确定性兜底：只在本次运行本身允许写（write=True）时才提升。
+_WRITE_SENT = re.compile(r"[。！？；\n]+")
+# 写动词与产物必须相邻（≤12 字），否则「说明如何写…代码」这类表述会被误判
+_WRITE_OBJ = (r"(文件|文档|脚本|表格|目录|"
+              r"\.(?:md|markdown|py|js|ts|json|txt|sh|csv|yml|yaml|toml|html|css|go|rs|swift|c|cpp)\b)")
+_WRITE_PAIR = re.compile(r"(写|生成|创建|新建|保存|写入|落盘|导出|存成|存为|覆盖|输出到)"
+                         r"[^。！？；\n]{0,12}?" + _WRITE_OBJ)
+# 句中出现这些否定词就不算「要求产出文件」
+_WRITE_NEG = re.compile(r"(不需要|无需|不要|不必|别|禁止|避免|不准|勿)[^。！？；\n]{0,10}"
+                        r"(写|生成|创建|保存|导出|产出)")
+# 句中已出现具体文件名（带扩展名）时，任何改动类动词都算数（含「X 里的 Y 改成 Z」这种倒装）
+_WRITE_FILE = re.compile(r"[A-Za-z0-9_\-./]+\.(?:md|markdown|py|js|ts|json|txt|sh|csv|yml|yaml|toml|html|css|go|rs|swift|c|cpp)\b")
+_WRITE_ANY_VERB = re.compile(r"(写|生成|创建|新建|保存|写入|落盘|导出|存成|存为|覆盖|输出到|改成|改为|修改|替换)")
+_WRITE_EN = re.compile(r"\b(?:write|create|generate|save|export)\b[^\n]{0,60}?"
+                       r"\b(?:file|document|script|markdown)\b", re.I)
+_EN_NEG = re.compile(r"\b(?:no need to|don't|do not|without)\b[^\n]{0,30}?"
+                     r"\b(?:write|create|generate|save|export)\b", re.I)
+
+
+def write_intent(*parts):
+    """任务文本里是否明确要求产出文件：写动词与产物相邻，且不是否定表述。"""
+    text = " ".join(str(x or "") for x in parts)
+    if not text.strip():
+        return False
+    if _WRITE_EN.search(text) and not _EN_NEG.search(text):
+        return True
+    for sent in _WRITE_SENT.split(text):
+        if _WRITE_NEG.search(sent):
+            continue
+        if _WRITE_PAIR.search(sent):
+            return True
+        if _WRITE_FILE.search(sent) and _WRITE_ANY_VERB.search(sent):
+            return True
+    return False
+
+
 def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None, inject=""):
-    roster = "\n".join("- %s：%s%s%s" % (k, v, quota_text(k), tier_roster(cfg, k)) for k, v in cfg["profiles"].items() if k in cfg["agents"])
+    profiles = {
+        "gemini": "额度最充裕，每周和每 5 小时有上限。擅长查阅、整理、写初稿和批量执行。",
+        "claude": "额度有限。擅长规划、疑难判断和重要成果的复核。",
+        "gpt": "额度有限。擅长规划、实现和审查，团队中只有它能画图。",
+    }
+    roster = "\n".join(
+        "- %s：%s%s%s" % (k, profiles.get(k, v) if v == DEFAULT_CONFIG["profiles"].get(k) else v,
+                         quota_text(k), tier_roster(cfg, k))
+        for k, v in cfg["profiles"].items() if k in cfg["agents"])
     prompt = PLAN_PROMPT.format(
-        quota_rule=("标注剩余额度低于 15% 的成员不要派活；" if quota_guard_on() else "用户设置了额度低也照样派活，不必因为额度低避开谁；"),
+        quota_rule="本次设置：%s。" % ("额度剩余低于 15% 时跳过该成员" if quota_guard_on() else "额度低时仍可分工"),
         roster=roster, models=model_menu(cfg), max_tasks=max_tasks, cwd=cwd, goal=goal, timeout_min=max(1, round(cfg["timeout"] / 60)),
-        write_hint="" if write else "（本次运行为只读模式，所有任务 write 都填 false，成果以文字形式交回）")
+        write_hint="" if write else "本次运行为只读，write 填 false。")
     if inject.strip():  # 高压模式：用户自己写的话放在排工说明前面
-        prompt = "【用户给排工者的特别要求，请先读并照办】\n" + inject.strip() + "\n\n――――――――\n\n" + prompt
+        prompt = "【用户给排工者的补充要求】\n" + inject.strip() + "\n\n――――――――\n\n" + prompt
     last = None
     for attempt in range(2):
         text, spec = ask(cfg, planner, prompt, cwd=cwd, note=False, tier="plan",
@@ -1880,6 +1890,8 @@ def make_plan(cfg, goal, cwd, write, planner, max_tasks, run_id=None, title=None
                     deps = [deps]
                 t["depends_on"] = [re.sub(r"[^A-Za-z0-9_-]", "_", str(d)) for d in deps]
                 t["write"] = bool(t.get("write")) and write
+                if write and not t["write"] and write_intent(t.get("title"), t.get("prompt")):
+                    t["write"], t["write_auto"] = True, True  # 兜底：排工者漏标，按文本证据补上
                 k = str(t.get("kind") or "").strip().lower()
                 k = {"动脑": "think", "审美": "design", "文案": "copy"}.get(k, k)
                 t["kind"] = k if k in TASK_TIERS else "work"
@@ -1977,7 +1989,7 @@ def busy_runs_in_line(depth=8):
         rid = (t.get("dispatch") or {}).get("run")
         if rid:
             r = read_json(os.path.join(RUNS_DIR, str(rid), "run.json")) or {}
-            if r.get("status") in ("planning", "running", "synthesizing") and pid_alive(r.get("pid")):
+            if r.get("status") in RUN_ACTIVE and pid_alive(r.get("pid")):
                 ts = r.get("tasks") or []
                 out.append({"id": rid, "goal": (r.get("display") or r.get("goal") or "")[:300],
                             "done": sum(1 for x in ts if x.get("status") == "ok"), "total": len(ts)})
@@ -2011,13 +2023,8 @@ def board_text(state, me, share_results=True, footer=True):
         return "\n".join(lines)
     cap = max(1, round(state.get("timeout", 900) / 60))
     eta = next((t.get("eta_min") for t in state["tasks"] if t["id"] == me), None)
-    if not share_results:
-        lines.append("你负责：%s。（这是会审：其他人同时独立作答，你看不到他们的答案。）问题里提到的文件夹、文件，"
-                     "必须先亲自打开看过再下结论，开头一句写明看了哪些；没法看就直说，不要凭印象答。"
-                     "看完关键材料、意见成形就交，不用逐个穷尽检查。一般 %d 分钟内能交；没有一刀切的时限，但连续几分钟没有任何进展、或反复做同一件事，会被当作卡住停下。" % (me, cap))
-    else:
-        lines.append("你负责：%s。任务里提到的文件、文件夹要先亲自打开看过再动手或下结论。%s确实要更久可以接着做，只要一直在推进；连续几分钟没有任何进展、或反复做同一件事，会被当作卡住停下。做到够用就交，别为了穷尽而反复检查。"
-                     % (me, ("预计 %s 分钟能做完；" % eta) if eta else ("一般 %d 分钟内能做完；" % cap)))
+    lines.append("你负责：%s。预计 %d 分钟。%s" % (
+        me, eta or cap, "会审成员独立作答。" if not share_results else ""))
     lines.append("简洁交付结果和必要说明，末尾单独写两行：\n【进度】一句话说明完成情况\n【遗留】未完成事项或提醒；没有则写 无")
     return "\n".join(lines)
 
@@ -2337,21 +2344,18 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
 # ---------------------------------------------------------------- 主联络窗口：用户只跟一位「联络人」说话
 
 
-DISPATCH_RE = re.compile(r"\s*【派活】\s*(?P<how>自动分工|会审)\s*(?:[（(](?P<who>[^）)]{1,60})[）)])?\s*[:：]\s*(?P<goal>\S[\s\S]*)")
+_DISPATCH_FIELDS = r"\s*(?P<how>自动分工|会审)\s*(?:[（(](?P<who>[^）)]{1,60})[）)])?\s*[:：]\s*(?P<goal>\S[\s\S]*)"
+DISPATCH_RE = re.compile(r"\s*【派活】" + _DISPATCH_FIELDS)
+RESET_DISPATCH_RE = re.compile(r"\s*【重置派活】" + _DISPATCH_FIELDS)
 
 CHAT_PROMPT = USER_STYLE + """
 
-你负责在 Hub 对接用户，团队成员有：{team}。用户只与你交谈。
+你负责在 Hub 对接用户，团队成员有：{team}。按问题决定直接处理还是交给团队。自动分工适合拆成几块做的工作，会审适合比较独立意见。{perm_note}
 
-简单的事自己做，不必派活：闲聊、翻译、小问答、解释，以及几分钟内能做完的小动手活，比如看一两个文件、跑几条命令核查、打开一个网页看看、改一处小地方。{perm_note}
-只有要大量查阅、改很多文件、几块工作并行，或预计要十几分钟以上的活，才交给团队。
-
-明显需要团队协作的工作（拆成几块并行、较大的执行任务、大量查资料）用自动分工；需要几位独立回答后比较，用会审。
-
-派活时只输出以下对应的一段，不加其他文字。Hub 会执行，并将结果送回本对话：
-【派活】自动分工：<完整目标，包含用户的要求和背景>
-【派活】会审：<要独立回答并比较的完整问题，包含用户的要求和背景>
-只让其中几位会审（比如上次没做完的补做，已经交了的别再做一遍）时，在「会审」后面写上名字：【派活】会审（gpt、claude）：<问题，并附上已交成员的结论供参考>
+派活时，回复以对应的标记开头，冒号后写完整目标和背景。Hub 会执行并将结果送回本对话：
+【派活】自动分工：<目标>
+【派活】会审：<问题>
+【派活】会审（gpt、claude）：<问题，由括号里的成员参加>
 
 {phase_note}
 用户说：
@@ -2447,7 +2451,7 @@ def pick_ok(cfg, preferred, others=("gemini", "gpt")):
     return preferred, None
 
 
-def _chat_fail_record(cfg, message, error, info):
+def _chat_fail_record(message, error, info):
     """对接人还没开口就失败（例如自动模式选不出人）：也留一条记录，免得用户的话凭空消失。"""
     ext = top_meta()
     now = time.time()
@@ -2460,12 +2464,22 @@ def _chat_fail_record(cfg, message, error, info):
         "submission_id": ext.get("submission_id"), "chat": info, "fork": bool(ext.get("fork")) or None})
 
 
-def run_chat(cfg, message, cwd=None, write=False, contact=None):
-    info = {"mode": "auto" if not contact or contact == "auto" else "manual", "write": bool(write)}
+def run_chat(cfg, message, cwd=None, write=False, contact=None, pressure=False):
+    if pressure:
+        contact = "ds"
+    info = {"mode": "pressure" if pressure else ("auto" if not contact or contact == "auto" else "manual"),
+            "write": bool(write)}
+    if pressure:
+        info["pressure"] = True
     try:
-        name, phase, reason = choose_contact(cfg, message, contact)
+        if pressure:
+            if "ds" not in cfg["agents"]:
+                raise BackendError("高压模式需要 ds（DeepSeek），它现在停用了")
+            name, phase, reason = "ds", chat_phase(top_meta().get("display") or message), "高压模式（ds 主导对接）"
+        else:
+            name, phase, reason = choose_contact(cfg, message, contact)
     except BackendError as e:
-        _chat_fail_record(cfg, message, str(e), info)
+        _chat_fail_record(message, str(e), info)
         raise
     prev = previous_contact()
     handoff = None
@@ -2484,20 +2498,29 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
     if busy:  # 团队还在做之前派的活：告诉对接人，别再叠一份
         b = busy[0]
         bnote = ("\n\n（后台：先前任务「%s」仍在进行，已完成 %d/%d 件。"
-                 "若本轮是对该任务的补充、修改或催问，直接回答；需转告团队时，在回答末尾单独一行写：【转告团队】<要转告的话>。"
-                 "不要重复派活；只有与该任务无关的新事才能另派。）" % (b["goal"], b["done"], b["total"]))
+                 "要给进行中的任务补充信息，在回答末尾另起一行写：【转告团队】<要转告的话>。" % (b["goal"], b["done"], b["total"]))
+        if pressure:
+            bnote += "若要停止旧任务并改派，回复以对应标记开头：【重置派活】自动分工：<新的完整目标>（或【重置派活】会审：<新问题>）。"
+        bnote += "）"
         message, shown = message + bnote, shown + bnote
     # 对接人日常聊天用轻快的模型（最重的那档留给拆任务），失败了自动换回原来的顺序
     fast = next((x for x in cfg["agents"].get(name) or [] if x in CHAT_FAST.get((cfg["agents"][name] or [""])[0], ())), None)
     full = bool(write) or os.environ.get("HUB_FULL") == "1"
-    perm = ("你现在可以读写文件、运行命令、上网查，别说自己没有权限。" if full else
-            "这次是只读：你能读文件、上网查，但不能改文件、不能运行命令；需要动手时交给团队，并跟用户说一句是因为只读。")
+    perm = " 当前工作模式：%s。" % ("可动手" if full else "只读")
     own = any(think_setting(cfg, name, "chat"))  # 成员卡片上单独设了「对接」模型/档位：就用它，不再自动换轻模型
-    text, spec = ask(cfg, name, CHAT_PROMPT.format(team=team, phase_note=note, message=message, perm_note=perm), cwd=cwd,
-                     write=False, note=False, spec=None if own else fast, tier="chat" if own else None,
-                     meta={"kind": "chat", "title": "联络：" + shown[:40], "chat": info, "on_start": cid_box.append,
-                           "defer": True,
-                           "resume_prompt": CHAT_PROMPT.format(team=team, phase_note=note, message=shown, perm_note=perm) if top_meta().get("display") else None})
+    inject = str(cfg.get("pressure_prompt") or "").strip() if pressure else ""
+    base_prompt = CHAT_PROMPT.format(team=team, phase_note=note, message=message, perm_note=perm)
+    full_prompt = (inject + "\n\n---\n\n" + base_prompt) if inject else base_prompt
+    resume_p = CHAT_PROMPT.format(team=team, phase_note=note, message=shown, perm_note=perm) if top_meta().get("display") else None
+    meta = {"kind": "chat", "title": ("高压：" if pressure else "联络：") + shown[:40], "chat": info, "on_start": cid_box.append,
+            "defer": True, "resume_prompt": resume_p}
+    if pressure:
+        meta["pressure"] = True
+        if inject:
+            meta["pressure_prompt"] = inject
+    text, spec = ask(cfg, name, full_prompt, cwd=cwd,
+                     write=bool(write) if pressure else False, note=bool(pressure and full), spec=None if own else fast, tier="chat" if own else None,
+                     meta=meta)
     cpath = os.path.join(CALLS_DIR, cid_box[0] + ".json")
 
     def update(**kw):
@@ -2508,8 +2531,15 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
         write_json(cpath, rec)
 
     with _record_guard(lambda: read_json(cpath) or {}, update, "fail"):
-        m = DISPATCH_RE.match(text)  # 只认开头就是【派活】的回答
-        if busy:
+        m_reset = RESET_DISPATCH_RE.match(text) if pressure else None
+        m = m_reset or DISPATCH_RE.match(text)  # 只认开头就是【派活】或高压【重置派活】的回答
+        reset_stopped = []
+        if m_reset and busy:
+            for b in busy:
+                err_s = stop_record("run", b["id"])
+                eprint("[hub] 高压模式：弃用进行中的团队任务 %s%s" % (b["id"], "（%s）" % err_s if err_s else ""))
+                reset_stopped.append(b["id"])
+        elif busy:
             rid = busy[0]["id"]
             if m:  # 团队还在忙又想派活：不叠新的一份，当作补充转告给正在做的团队
                 add_run_note(rid, m.group("goal").strip())
@@ -2529,7 +2559,10 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
             return 0
         how, goal = m.group("how"), m.group("goal").strip()
         who = [n for n in re.split(r"[、,，/\s]+", m.group("who") or "") if n in cfg["agents"]] or None  # 会审只叫点名的几位（例如只让没做完的补）
-        lead = "%s 觉得这件事需要团队：交给团队%s。做完会把结果写在这里。" % (name, "一起做（自动分工）" if how == "自动分工" else "会审")
+        if reset_stopped:
+            lead = "%s 已弃用并停止进行中的团队任务，按修改后的要求重新交给团队%s。做完会把结果写在这里。" % (name, "一起做（自动分工）" if how == "自动分工" else "会审")
+        else:
+            lead = "%s 觉得这件事需要团队：交给团队%s。做完会把结果写在这里。" % (name, "一起做（自动分工）" if how == "自动分工" else "会审")
 
         def opened(rid):
             update(status="running", answer=lead, dispatch={"mode": "council" if how == "会审" else "run", "goal": goal, "run": rid})
@@ -2537,15 +2570,19 @@ def run_chat(cfg, message, cwd=None, write=False, contact=None):
         err = None
         try:
             if how == "会审":
-                run_council(cfg, goal, cwd, members=who, synthesizer=pick_ok(cfg, cfg["synthesizer"])[0], on_open=opened, parent_call=cid_box[0])
+                synth_c = "ds" if pressure else pick_ok(cfg, cfg["synthesizer"])[0]
+                run_council(cfg, goal, cwd, members=who, synthesizer=synth_c, on_open=opened, parent_call=cid_box[0])
             else:
-                planner, n1 = pick_ok(cfg, cfg["planner"])
-                synth, n2 = pick_ok(cfg, cfg["synthesizer"])
-                for n in (n1, n2):
-                    if n:
-                        eprint("[hub] " + n)
+                if pressure:
+                    planner = synth = "ds"
+                else:
+                    planner, n1 = pick_ok(cfg, cfg["planner"])
+                    synth, n2 = pick_ok(cfg, cfg["synthesizer"])
+                    for n in (n1, n2):
+                        if n:
+                            eprint("[hub] " + n)
                 run_goal(cfg, goal, cwd, write, planner, synth, cfg["max_parallel"], 6, False,
-                         on_open=opened, parent_call=cid_box[0])
+                         on_open=opened, parent_call=cid_box[0], pressure=pressure)
         except BackendError as e:
             err = str(e)
             eprint("[hub] 失败：%s" % err)
@@ -2634,12 +2671,12 @@ def _load_run(path, *, shared=False):
     r = _run_records.read(path, shared=shared)
     if not isinstance(r, dict):
         return None
-    if r.get("status") in ("planning", "running", "synthesizing") and not pid_alive(r.get("pid")):
+    if r.get("status") in RUN_ACTIVE and not pid_alive(r.get("pid")):
         pid = r.get("pid")
         r = _run_records.read(path)
         if not isinstance(r, dict):
             return None
-        if r.get("status") not in ("planning", "running", "synthesizing") or r.get("pid") != pid:
+        if r.get("status") not in RUN_ACTIVE or r.get("pid") != pid:
             return r
         r.update(status="failed", error=r.get("error") or DEAD_MSG, end=r.get("end") or r.get("start"))
         _fail_tasks(r)
@@ -2730,45 +2767,67 @@ def record_version(path):
         return ""
 
 
-def ui_call_summary(c):
-    d = {k: c[k] for k in ("id", "parent", "run", "kind", "agent", "backend", "status", "start",
-                           "end", "secs", "write", "cwd", "error", "follows", "submission_id",
-                           "side", "fork", "resumed", "images", "handoff") if c.get(k) is not None}
-    # 保留列表中可搜索的标题。完整指令、回答和对接人的交接文字走详情接口。
-    if c.get("display") and not (c.get("parent") or c.get("run") or c.get("kind") == "side"):
-        d["display"] = c["display"]
-    elif c.get("kind") == "image" and c.get("title") and not (c.get("run") or c.get("parent")):
-        d["title"] = c["title"]
-    else:
-        d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
-    if c.get("chat"):
-        d["chat"] = {k: c["chat"][k] for k in ("mode", "write") if k in c["chat"]}
-    if c.get("dispatch"):
-        di = c["dispatch"]
-        d["dispatch"] = {"run": di.get("run"), "mode": di.get("mode"), "goal": (di.get("goal") or "")[:80]}
+def ui_call_summary(c, compact=True):
+    keys = ("id", "parent", "run", "kind", "agent", "backend", "status", "start", "end", "secs", "write",
+            "cwd", "error", "follows", "submission_id", "side", "fork", "resumed", "images", "handoff")
     preferred = call_preferred(c)
-    if preferred and preferred != c.get("backend"):
-        d["preferred_backend"] = preferred
-    d["rev"] = record_version(os.path.join(CALLS_DIR, c["id"] + ".json"))
+    if compact:
+        d = {k: c[k] for k in keys + ("pressure",) if c.get(k) is not None}
+        if c.get("display") and not (c.get("parent") or c.get("run") or c.get("kind") == "side"):
+            d["display"] = c["display"]
+        elif c.get("kind") == "image" and c.get("title") and not (c.get("run") or c.get("parent")):
+            d["title"] = c["title"]
+        else:
+            d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
+        if c.get("chat"):
+            d["chat"] = {k: c["chat"][k] for k in ("mode", "write", "pressure") if k in c["chat"]}
+        if c.get("dispatch"):
+            di = c["dispatch"]
+            d["dispatch"] = {"run": di.get("run"), "mode": di.get("mode"), "goal": (di.get("goal") or "")[:80]}
+        if preferred and preferred != c.get("backend"):
+            d["preferred_backend"] = preferred
+        d["rev"] = record_version(os.path.join(CALLS_DIR, c["id"] + ".json"))
+    else:
+        d = {k: c.get(k) for k in keys + ("task", "title", "display", "chat", "dispatch")}
+        d.update(preferred_backend=preferred, prompt_preview=_preview(c.get("display") or c.get("prompt")),
+                 answer_preview=_preview(c.get("answer")), has_image=bool(c.get("image") and os.path.isfile(c["image"])),
+                 live=live_len(c["id"]) if c.get("status") == "running" else 0)
+    if _top_level("call", c):
+        d["root"] = group_root("call:" + c["id"])
     return d
 
 
-def ui_run_summary(r):
-    d = {k: r[k] for k in ("id", "status", "start", "end", "cwd", "error", "write", "follows",
-                           "submission_id", "parent_call", "pressure", "fork", "images", "planner",
-                           "synthesizer") if r.get(k) is not None}
-    # display/goal 原来同时传送，两者择一仍能保持原来的标题和搜索结果。
-    d["display"] = r.get("display") or r.get("goal")
+def ui_run_summary(r, compact=True):
+    keys = ("id", "status", "start", "end", "cwd", "error", "write", "follows", "submission_id",
+            "parent_call", "pressure", "fork", "images", "planner", "synthesizer")
+    task_keys = ("id", "agent", "title", "status", "skip_reason", "kind", "plan_spec", "spec", "backend", "call_id")
+    tasks = r.get("tasks") or []
+    if compact:
+        d = {k: r[k] for k in keys if r.get(k) is not None}
+        d["display"] = r.get("display") or r.get("goal")
+        d["rev"] = record_version(os.path.join(RUNS_DIR, r.get("id") or "", "run.json"))
+        d["tasks"] = [{k: t[k] for k in task_keys if t.get(k) is not None} for t in tasks]
+    else:
+        d = {k: r.get(k) for k in keys + ("goal", "summary", "display", "participants", "skipped", "timeout_warning")}
+        task_keys += ("depends_on", "write", "why", "eta_min", "progress", "leftover", "started", "preferred_backend", "secs")
+        d["tasks"] = [{k: t.get(k) for k in task_keys} for t in tasks]
+        for t in d["tasks"]:
+            if not t.get("preferred_backend") and t.get("call_id"):
+                t["preferred_backend"] = call_preferred(_call_records.read(os.path.join(
+                    CALLS_DIR, t["call_id"] + ".json"), shared=True) or {})
     d["mode"] = r.get("mode") or "run"
-    d["rev"] = record_version(os.path.join(RUNS_DIR, r.get("id") or "", "run.json"))
-    d["tasks"] = [{k: t[k] for k in ("id", "agent", "title", "status", "skip_reason", "kind",
-                                    "plan_spec", "spec", "backend", "call_id") if t.get(k) is not None}
-                  for t in (r.get("tasks") or [])]
+    d["root"] = group_root("run:%s" % r.get("id"))
     return d
 
 
 def ui_state(cfg, compact=False):
     calls, runs = load_calls(shared=True), load_runs(shared=True)
+    if not _rekeyed:
+        _rekeyed.append(1)
+        try:
+            rekey_to_roots()
+        except Exception as e:
+            eprint("[hub] 整理项目组名字出错：%s" % e)
     try:
         start_auto_titles(active_cfg(cfg), calls, runs)
     except Exception as e:  # 起名出问题不能影响面板
@@ -2803,41 +2862,10 @@ def ui_state(cfg, compact=False):
             "quota": quota.get(name),
             "last_error": (last.get("error") or "")[:300] if last and last.get("status") == "fail" and last.get("error") != STOP_MSG else None,
         })
-    lite_calls = []
-    # 最近 200 条全给；更早的只给对话主线上的（没有上级、不属于项目组、不是旁问），
-    # 否则长项目的早期几轮掉出窗口，追问链断开，左边一个项目组会被拆成两个
-    for i, c in enumerate(calls):
-        if i >= 200 and (c.get("parent") or c.get("run") or c.get("kind") == "side"):
-            continue
-        if compact:
-            lite_calls.append(ui_call_summary(c))
-            continue
-        d = {k: c.get(k) for k in ("id", "parent", "run", "task", "kind", "title", "agent", "backend", "status",
-                                   "start", "end", "secs", "write", "cwd", "error", "follows", "display", "submission_id",
-                                   "chat", "dispatch", "side", "fork", "resumed", "images", "handoff")}
-        d["preferred_backend"] = call_preferred(c)
-        d["prompt_preview"] = _preview(c.get("display") or c.get("prompt"))
-        d["answer_preview"] = _preview(c.get("answer"))
-        d["has_image"] = bool(c.get("image") and os.path.isfile(c["image"]))
-        d["live"] = live_len(c["id"]) if c.get("status") == "running" else 0
-        lite_calls.append(d)
-    lite_runs = []
-    for r in runs:
-        if compact:
-            lite_runs.append(ui_run_summary(r))
-            continue
-        d = {k: r.get(k) for k in ("id", "goal", "status", "summary", "start", "end", "cwd", "planner",
-                                   "synthesizer", "error", "write", "follows", "display", "submission_id",
-                                   "participants", "skipped", "timeout_warning", "parent_call", "pressure", "fork", "images")}
-        d["mode"] = r.get("mode") or "run"  # 旧记录没有 mode，都是自动分工
-        d["tasks"] = [{k: t.get(k) for k in ("id", "agent", "title", "status", "depends_on", "write", "why", "eta_min", "kind", "plan_spec", "spec",
-                                             "progress", "leftover", "skip_reason", "started",
-                                             "backend", "preferred_backend", "secs", "call_id")} for t in (r.get("tasks") or [])]
-        for t in d["tasks"]:
-            if not t.get("preferred_backend") and t.get("call_id"):
-                t["preferred_backend"] = call_preferred(_call_records.read(os.path.join(
-                    CALLS_DIR, t["call_id"] + ".json"), shared=True) or {})
-        lite_runs.append(d)
+    # 较早的记录只留主线，保持长项目的追问链完整。
+    lite_calls = [ui_call_summary(c, compact) for i, c in enumerate(calls)
+                  if i < 200 or not (c.get("parent") or c.get("run") or c.get("kind") == "side")]
+    lite_runs = [ui_run_summary(r, compact) for r in runs]
     health = read_json(HEALTH_PATH) or {}
     keeps = [{k: d.get(k) for k in ("id", "model", "write", "title", "start", "last", "turns", "busy")} for d in keep_list()]
     st = {"now": int(now // 60) * 60 if compact else now,
@@ -2846,7 +2874,7 @@ def ui_state(cfg, compact=False):
             "names": load_names(), "naming": _names_running.is_set(), "folders": load_folders(),
             "health": {"ts": health.get("ts"), "results": health.get("results") or {},
                        "running": bool(_health_running.is_set())},
-            "config": dict({k: cfg[k] for k in ("planner", "synthesizer", "default_worker", "max_parallel", "timeout", "idle_timeout", "hard_timeout", "compact_gemini", "compact_gpt", "compact_claude")},
+            "config": dict({k: cfg.get(k) for k in ("planner", "synthesizer", "default_worker", "handoff_by", "max_parallel", "timeout", "idle_timeout", "hard_timeout", "compact_gemini", "compact_gpt", "compact_claude")},
                            council_agents=council_members(cfg), min_timeout=MIN_TIMEOUT,
                            council_quota={n: quota_skip(n)[0] for n in cfg["agents"]},
                            quota_guard=quota_guard_on(), auto_title=cfg.get("auto_title") or "", auto_title_live=active_cfg(cfg).get("auto_title") or "",
@@ -2862,14 +2890,26 @@ def ui_state(cfg, compact=False):
 
 MODELS_PATH = os.path.join(HUB_HOME, "models.json")
 _models_running = threading.Event()
+_refresh_lock = threading.Lock()
+
+
+def _start_refresh(running, work):
+    with _refresh_lock:
+        if running.is_set():
+            return
+        running.set()
+
+    def run():
+        try:
+            work()
+        finally:
+            running.clear()
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def refresh_models():
     """从 Antigravity 取可用的模型清单：Gemini 和 Claude（不收它里面的 GPT-OSS）。"""
-    if _models_running.is_set():
-        return
-    _models_running.set()
-
     def work():
         try:
             exe = find_bin(load_config(), "agy")
@@ -2885,10 +2925,7 @@ def refresh_models():
                 write_json(MODELS_PATH, {"ts": time.time(), "agy": ids})
         except BackendError:
             pass
-        finally:
-            _models_running.clear()
-
-    threading.Thread(target=work, daemon=True).start()
+    _start_refresh(_models_running, work)
 
 
 def codex_defaults():
@@ -2928,7 +2965,7 @@ def backend_choices(cfg):
     if time.time() - (d.get("ts") or 0) > 86400:
         refresh_models()
     out = [{"spec": "agy:" + m["id"], "label": agy_label(m)} for m in d.get("agy") or []]
-    cdef, ceff = codex_defaults()
+    cdef, _ = codex_defaults()
     out.append({"spec": "codex", "label": "GPT · 跟随 Codex 设置" + ("（现为 %s）" % cdef if cdef else "")})
     cm = _model_records.read(os.path.join(HOME, ".codex", "models_cache.json"), shared=True) or {}
     for m in cm.get("models") or []:
@@ -2963,32 +3000,14 @@ _quota_running = threading.Event()
 
 
 def refresh_quota():
-    if _quota_running.is_set():
-        return
-    _quota_running.set()
-
-    def work():
-        try:
-            fetch_quota(load_config())
-        finally:
-            _quota_running.clear()
-
-    threading.Thread(target=work, daemon=True).start()
-
+    _start_refresh(_quota_running, lambda: fetch_quota(load_config()))
 
 
 def run_health():
-    if _health_running.is_set():
-        return
-    _health_running.set()
+    def check():
+        write_json(HEALTH_PATH, {"ts": time.time(), "results": check_specs(active_cfg(load_config()))})
 
-    def work():
-        try:
-            write_json(HEALTH_PATH, {"ts": time.time(), "results": check_specs(active_cfg(load_config()))})
-        finally:
-            _health_running.clear()
-
-    threading.Thread(target=work, daemon=True).start()
+    _start_refresh(_health_running, check)
 
 
 def read_live(cid):
@@ -3096,14 +3115,19 @@ def ui_record(kind, rid):
     return ui_run(rid) if kind == "run" else ui_call(rid) if kind == "call" else None
 
 
-def follow_context(kind, rid, depth=8):
+def conversation_ref(kind, rid):
+    if kind == "run" and isinstance(rid, str) and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", rid):
+        parent = (read_json(os.path.join(RUNS_DIR, rid, "run.json")) or {}).get("parent_call")
+        if parent:
+            return "call", parent
+    return kind, rid
+
+
+def follow_context(kind, rid, depth=8, *, labelled=True):
     """保留最近多轮问答，按时间顺序提供；旧记录无需迁移。depth=1 时只带这一条。"""
     turns, seen = [], set()
     for _ in range(max(1, min(8, depth))):
-        if kind == "run" and isinstance(rid, str) and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", rid):
-            pc = (read_json(os.path.join(RUNS_DIR, rid, "run.json")) or {}).get("parent_call")
-            if pc:  # 对接人派出的项目组：上文是派它的那一轮对话（对话里已含项目组结果）
-                kind, rid = "call", pc
+        kind, rid = conversation_ref(kind, rid)
         if (kind, rid) in seen:
             break
         seen.add((kind, rid))
@@ -3126,20 +3150,11 @@ def follow_context(kind, rid, depth=8):
             break
     if not turns:
         return ""
-    return ("===== 之前的对话（背景）=====\n" + "\n\n".join(reversed(turns)) +
-            "\n\n===== 用户现在的追问 =====\n")
+    body = "\n\n".join(reversed(turns))
+    return "===== 之前的对话（背景）=====\n" + body + "\n\n===== 用户现在的追问 =====\n" if labelled else body.strip()
 
 
-DIGEST_PROMPT = """下面是一个项目组从头到尾的全部来往（用户的要求和每一轮的结果）。把它压缩成一份交接说明，给另一个项目组接手用。
-
-按这几块写，每块用短句逐条列，没有就写「无」：
-1. 目标：这个项目要做成什么，现在做到哪一步。
-2. 已定下的：决定、约定、参数、命名、用户的偏好和要求。数字、路径、文件名、模型名、链接一律原样照抄。
-3. 做出来的东西：文件、目录、脚本、图片、链接在哪，各是什么。
-4. 走过的弯路：试过不行的做法和原因，免得再踩。
-5. 没做完的和要注意的。
-
-只写事实和结论，不写过程，不写客套。后面的说法推翻前面的，以后面的为准。控制在 3000 字以内。
+DIGEST_PROMPT = """把以下项目组往来整理成一份交接说明，让接手的人知道目标、当前进度、已定事项、成果在哪里、试过哪些办法、接下来要做什么。保留会影响后续工作的用户偏好、数字、路径和链接。有冲突时以较新的决定为准。篇幅以便于接手为准，约 3000 字以内。
 
 =====
 {body}"""
@@ -3171,7 +3186,8 @@ def _digest_handoff(cfg, cid, keys):
     """后台把整组压缩成交接说明，写回那条交接记录；失败就保留原来的最近几轮内容。"""
     path = os.path.join(CALLS_DIR, cid + ".json")
     who = cfg.get("handoff_by") if cfg.get("handoff_by") in cfg["agents"] else ("gemini" if "gemini" in cfg["agents"] else cfg.get("synthesizer"))
-    chain = (cfg["agents"].get(who) or [])[:2]
+    chain, eff = tier_chain(cfg, who, "digest")
+    chain = chain[:3]
     prompt = DIGEST_PROMPT.format(body=handoff_digest_text(keys))
     out, used, err = None, None, ""
     for spec in chain:
@@ -3180,7 +3196,7 @@ def _digest_handoff(cfg, cid, keys):
         if not fn:
             continue
         try:
-            out = (fn(dict(cfg, _effort=""), mdl, prompt, tempfile.gettempdir(), False, 900) or "").strip()
+            out = (fn(dict(cfg, _effort=eff if eff in effort_levels(spec) else ""), mdl, prompt, tempfile.gettempdir(), False, 900) or "").strip()
             used = spec
             if out:
                 break
@@ -3212,60 +3228,50 @@ def make_handoff(src, dst, title="", keys=None, cfg=None):
     s, d = ui_record(src["type"], src["id"]), ui_record(dst["type"], dst["id"])
     if not s or not d:
         raise ValueError("找不到要交接的记录")
-    if s.get("status") in ("running", "planning", "synthesizing"):
+    if s.get("status") in RUN_ACTIVE:
         raise ValueError("来源那组还没做完，做完再交接")
-    body = follow_context(src["type"], src["id"], 8)
-    body = body.replace("===== 之前的对话（背景）=====\n", "", 1).rsplit("\n\n===== 用户现在的追问 =====", 1)[0].strip()
+    body = follow_context(src["type"], src["id"], labelled=False)
     if not body:
         raise ValueError("来源那组还没有可交接的内容")
     name = re.sub(r"[\x00-\x1f\x7f]", "", str(title or ""))[:60] or (s.get("display") or s.get("goal") or "")[:40]
-    cid = "c_" + uuid.uuid4().hex[:10]
-    now = time.time()
-    write_json(os.path.join(CALLS_DIR, cid + ".json"), {
-        "id": cid, "parent": None, "run": None, "task": None, "kind": "handoff", "title": "交接：" + name,
-        "agent": "-", "backend": "-", "preferred_backend": "-", "status": "ok", "start": now, "end": now, "secs": 0,
-        "write": False, "cwd": d.get("cwd") or UI_WORKSPACE, "prompt": "", "error": None, "attempts": [], "pid": None,
-        "display": "交接：把「%s」的结果交到这里" % name,
-        "answer": "以下是从另一个项目组「%s」交接过来的要求和结果，供后面参考：\n\n%s" % (name, body),
-        "follows": {"type": dst["type"], "id": dst["id"]},
-        "handoff": {"from": {"type": src["type"], "id": src["id"]}, "name": name}})
-    if isinstance(keys, list) and keys and cfg:  # 交整组：先放最近几轮顶着，后台压缩整组，好了再换上
-        keys = [k for k in keys if isinstance(k, str) and _ARCHIVE_KEY.match(k)][:600]
-        if keys:
-            rec = read_json(os.path.join(CALLS_DIR, cid + ".json"))
-            rec["handoff"].update(digest="running", rounds=len(keys))
-            write_json(os.path.join(CALLS_DIR, cid + ".json"), rec)
-            threading.Thread(target=_digest_handoff, args=(cfg, cid, keys), daemon=True).start()
-    return cid
+    keys = [k for k in keys if isinstance(k, str) and _ARCHIVE_KEY.match(k)][:600] if isinstance(keys, list) and cfg else []
+    return _save_transfer(dst, d, "交接：" + name, "交接：把「%s」的结果交到这里" % name,
+                          "以下是从另一个项目组「%s」交接过来的要求和结果，供后面参考：\n\n%s" % (name, body),
+                          {"from": {"type": src["type"], "id": src["id"]}, "name": name}, cfg, keys)
 
 
 def make_compact(at, keys, cfg, title=""):
-    """原地压缩：在这条线最后一轮后面加一条「压缩」记录，后台把前面全部来往压成说明。
-    之后接着问，只带这份说明和它之后的几轮，不再往前翻，也不续接原来那个越来越长的会话。"""
+    """在最后一轮后加一条压缩记录，之后追问从这份说明开始。"""
     if not isinstance(at, dict) or at.get("type") not in ("call", "run") or not _ARCHIVE_KEY.match("%s:%s" % (at.get("type"), at.get("id"))):
         raise ValueError("记录不对")
     r = ui_record(at["type"], at["id"])
     if not r:
         raise ValueError("找不到这条记录")
-    if r.get("status") in ("running", "planning", "synthesizing"):
+    if r.get("status") in RUN_ACTIVE:
         raise ValueError("最后一轮还在做，做完再压缩")
     keys = [k for k in (keys or []) if isinstance(k, str) and _ARCHIVE_KEY.match(k)][:600]
     if len(keys) < 2:
         raise ValueError("这一组才一两轮，不用压缩")
-    body = follow_context(at["type"], at["id"], 8)
-    body = body.replace("===== 之前的对话（背景）=====\n", "", 1).rsplit("\n\n===== 用户现在的追问 =====", 1)[0].strip()
+    body = follow_context(at["type"], at["id"], labelled=False)
     name = re.sub(r"[\x00-\x1f\x7f]", "", str(title or ""))[:60]
+    return _save_transfer(at, r, "压缩：" + (name or "前面的来往"), "压缩：把前面 %d 轮压成一份说明" % len(keys),
+                          "以下是本组最近几轮的要求和结果（整组压缩还没完成时先用它）：\n\n%s" % body,
+                          {"from": None, "name": name, "compact": True}, cfg, keys)
+
+
+def _save_transfer(target, record, title, display, answer, handoff, cfg, keys):
     cid = "c_" + uuid.uuid4().hex[:10]
     now = time.time()
+    if keys:
+        handoff.update(digest="running", rounds=len(keys))
     write_json(os.path.join(CALLS_DIR, cid + ".json"), {
-        "id": cid, "parent": None, "run": None, "task": None, "kind": "handoff", "title": "压缩：" + (name or "前面的来往"),
+        "id": cid, "parent": None, "run": None, "task": None, "kind": "handoff", "title": title,
         "agent": "-", "backend": "-", "preferred_backend": "-", "status": "ok", "start": now, "end": now, "secs": 0,
-        "write": False, "cwd": r.get("cwd") or UI_WORKSPACE, "prompt": "", "error": None, "attempts": [], "pid": None,
-        "display": "压缩：把前面 %d 轮压成一份说明" % len(keys),
-        "answer": "以下是本组最近几轮的要求和结果（整组压缩还没完成时先用它）：\n\n%s" % body,
-        "follows": {"type": at["type"], "id": at["id"]},
-        "handoff": {"from": None, "name": name, "compact": True, "digest": "running", "rounds": len(keys)}})
-    threading.Thread(target=_digest_handoff, args=(cfg, cid, keys), daemon=True).start()
+        "write": False, "cwd": record.get("cwd") or UI_WORKSPACE, "prompt": "", "error": None, "attempts": [], "pid": None,
+        "display": display, "answer": answer, "follows": {"type": target["type"], "id": target["id"]},
+        "handoff": handoff})
+    if keys:
+        threading.Thread(target=_digest_handoff, args=(cfg, cid, keys), daemon=True).start()
     return cid
 
 
@@ -3289,14 +3295,100 @@ def undo_handoff(cid):
             c["follows"] = up
             write_json(cp, c)
     os.replace(path, path + ".undone")
+    with _root_lock:
+        _ROOT_CACHE.clear()
     return up
+
+
+_ROOT_CACHE = {}
+_root_lock = threading.RLock()
+
+
+def _rec_prev(key):
+    """(这条记录在追问链上的上一条, 这条记录在不在)。分叉、新对话的上一条是 None。"""
+    kind, _, rid = key.partition(":")
+    if kind == "run" and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", rid):
+        r = _run_records.read(os.path.join(RUNS_DIR, rid, "run.json"), shared=True)
+        if isinstance(r, dict) and r.get("parent_call"):
+            return "call:%s" % r["parent_call"], True
+    elif kind == "call" and re.fullmatch(r"c_[0-9a-f]+", rid):
+        r = _call_records.read(os.path.join(CALLS_DIR, rid + ".json"), shared=True)
+    else:
+        return None, False
+    if not isinstance(r, dict):
+        return None, False
+    f = r.get("follows")
+    if r.get("fork") or not isinstance(f, dict) or f.get("type") not in ("call", "run") or not f.get("id"):
+        return None, True
+    return "%s:%s" % (f["type"], f["id"]), True
+
+
+def group_root(key):
+    """项目组的开头一轮（顺着追问链往前找到头）。名字、文件夹都记在它上面：
+    面板只加载最近几百条记录，长对话的开头会掉出去，不能按「面板里看得到的最早一条」来记。"""
+    if not isinstance(key, str):
+        return key
+    with _root_lock:
+        if key in _ROOT_CACHE:
+            return _ROOT_CACHE[key]
+        path, cur, root = [], key, key
+        while True:
+            if cur in _ROOT_CACHE:
+                root = _ROOT_CACHE[cur]
+                break
+            prev, ok = _rec_prev(cur)
+            if not ok:  # 这一条找不到了：开头就是它后面那一条
+                root = path[-1] if path else key
+                break
+            path.append(cur)
+            if not prev or prev in path or len(path) > 5000:
+                root = cur
+                break
+            cur = prev
+        for k in path:
+            _ROOT_CACHE[k] = root
+        return root
+
+
+_rekeyed = []
+
+
+def rekey_to_roots():
+    """早先的名字和文件夹可能记在长对话中间的某一轮上（那时它是面板里看得到的最早一条），挪到开头那一轮。
+    同一组有好几个名字时：手动改的优先，都是手动的取最新的。"""
+    with _names_lock:
+        d = load_names_raw()
+        moved = False
+        for k in list(d["names"]):
+            v, r = d["names"][k], group_root(k)
+            if r == k or not isinstance(v, dict):
+                continue
+            cur = d["names"].get(r)
+            if (not isinstance(cur, dict) or (cur.get("auto") and not v.get("auto"))
+                    or (bool(cur.get("auto")) == bool(v.get("auto")) and (v.get("ts") or 0) > (cur.get("ts") or 0))):
+                d["names"][r] = v
+            del d["names"][k]
+            moved = True
+        if moved:
+            write_json(NAMES_PATH, d)
+    with _folders_lock:
+        f = load_folders()
+        moved = False
+        for k in list(f["of"]):
+            r = group_root(k)
+            if r != k:
+                f["of"][r] = f["of"].pop(k)
+                moved = True
+        if moved:
+            write_json(FOLDERS_PATH, f)
 
 
 NAMES_PATH = os.path.join(HUB_HOME, "names.json")
 _names_lock = threading.Lock()
 _names_running = threading.Event()
-TITLE_PROMPT = ("根据下面这段对话，给它起一个简短的中文标题，像文件夹名一样：4～12 个字，"
-                "不要标点和引号，不要以「关于」开头。只输出标题本身。\n\n【用户】\n%s\n\n【回答】\n%s")
+TITLE_PROMPT = ("根据下面的对话为项目组起一个简短中文标题，像文件夹名一样概括主题，"
+                "建议 4～12 个字。输出标题本身。\n\n%s")
+RETITLE_GROWTH = 5   # 自动起的名字：组里又多了这么多轮、并且轮数翻倍，就按新内容重起一次（手动改的不动）
 
 
 def load_names_raw():
@@ -3367,6 +3459,7 @@ def folder_op(body):
         for k in keys:
             if not isinstance(k, str) or not _ARCHIVE_KEY.match(k):
                 raise ValueError("记录不对")
+            k = group_root(k)
             if fid:
                 d["of"][k] = fid
             else:
@@ -3381,9 +3474,10 @@ def clean_title(t):
     return t[:24]
 
 
-def set_name(key, name, auto=False):
+def set_name(key, name, auto=False, rounds=None):
     if not isinstance(key, str) or not _ARCHIVE_KEY.match(key):
         raise ValueError("记录不对")
+    key = group_root(key)
     if not isinstance(name, str) or len(name) > 60:
         raise ValueError("名字最多 60 个字")
     name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
@@ -3394,14 +3488,38 @@ def set_name(key, name, auto=False):
             return  # 自动起名不覆盖你手动改的
         if name:
             d["names"][key] = {"name": name, "auto": bool(auto), "ts": time.time()}
+            if rounds:
+                d["names"][key]["rounds"] = rounds
         else:
             d["names"].pop(key, None)
         d.setdefault("since", time.time())
         write_json(NAMES_PATH, d)
 
 
+def _top_level(kind, r):
+    """左栏里算一轮的记录（团队内部调用、旁问、子调用不算）。"""
+    if kind == "run":
+        return True
+    return not (r.get("parent") or r.get("run") or r.get("kind") == "side")
+
+
+def group_members(calls, runs):
+    """{开头一轮的键: [(开始时间, 键, 记录), ...]}，只算加载到的记录。"""
+    groups = {}
+    for kind, recs in (("call", calls), ("run", runs)):
+        for r in recs:
+            if not isinstance(r, dict) or not r.get("id") or not _top_level(kind, r):
+                continue
+            key = "%s:%s" % (kind, r["id"])
+            groups.setdefault(group_root(key), []).append((r.get("start") or 0, key, r))
+    for v in groups.values():
+        v.sort(key=lambda x: x[0])
+    return groups
+
+
 def title_candidates(calls, runs):
-    """还没名字、已经做完、是一个项目组开头的记录（新对话或分叉；旁问、画图、团队内部调用不算），最新的在前。"""
+    """要起名的项目组：还没名字的；或者自动起的名字之后组里又长了不少（重起一次）。
+    手动改过的、归档的、还在做的不起。返回 [(开头的键, 组里的键按时间排)]，最新的在前。"""
     d = load_names_raw()
     since = d.get("since")
     if since is None:  # 第一次：只给以后的新项目组起名，旧的要在设置里点「给已有的起名」
@@ -3409,19 +3527,43 @@ def title_candidates(calls, runs):
         return []
     archived = set(load_archived())
     out = []
-    for kind, recs in (("call", calls), ("run", runs)):
-        for r in recs:
-            key = "%s:%s" % (kind, r.get("id"))
-            if key in d["names"] or d["failed"].get(key, 0) >= 2 or key in archived:
+    for root, mem in group_members(calls, runs).items():
+        cur = d["names"].get(root) if isinstance(d["names"].get(root), dict) else None
+        if (cur and not cur.get("auto")) or d["failed"].get(root, 0) >= 2 or root in archived:
+            continue
+        if any(m[2].get("status") in ("running", "planning", "synthesizing", None) for m in mem[-2:]):
+            continue
+        kind, _, rid = root.partition(":")
+        head = ui_record(kind, rid) or {}
+        if (head.get("start") or 0) < since:
+            continue
+        if kind == "call" and head.get("kind") not in ("ask", "chat"):
+            continue
+        n = len(mem)
+        if cur:
+            was = cur.get("rounds") or 1
+            if n < was + RETITLE_GROWTH or n < was * 2:
                 continue
-            if r.get("status") in ("running", "planning", "synthesizing", None) or (r.get("start") or 0) < since:
-                continue
-            if (r.get("follows") and not r.get("fork")) or r.get("parent_call"):
-                continue
-            if kind == "call" and (r.get("parent") or r.get("run") or r.get("kind") not in ("ask", "chat")):
-                continue
-            out.append((r.get("start") or 0, key))
-    return [k for _, k in sorted(out, reverse=True)]
+        out.append((mem[-1][0], root, [m[1] for m in mem]))
+    return [(k, keys) for _, k, keys in sorted(out, key=lambda x: x[0], reverse=True)]
+
+
+def title_context(keys):
+    """给起名看的内容：开头两轮和最近三轮，每轮的要求和结果各截一段。"""
+    pick = keys if len(keys) <= 5 else keys[:2] + keys[-3:]
+    parts = []
+    for k in pick:
+        kind, _, rid = k.partition(":")
+        r = ui_record(kind, rid) or {}
+        if kind == "run":
+            q, a = r.get("display") or r.get("goal") or "", r.get("final") or ""
+        elif r.get("kind") == "handoff":
+            q, a = "（压缩或交接进来的说明）", r.get("answer") or ""
+        else:
+            q, a = r.get("display") or r.get("prompt") or "", r.get("answer") or ""
+        if q or a:
+            parts.append("【第 %d 轮】\n用户：%s\n回答：%s" % (keys.index(k) + 1, q[:500], a[:500]))
+    return "\n\n".join(parts)
 
 
 def set_name_since(ts):
@@ -3431,17 +3573,15 @@ def set_name_since(ts):
         write_json(NAMES_PATH, d)
 
 
-def auto_title_one(cfg, key):
+def auto_title_one(cfg, key, keys=None):
     """叫一位成员给一个项目组起名。直接调后端，不写调用记录，免得名字本身又变成一条记录。"""
     who = cfg.get("auto_title") or ""
     chain = cfg["agents"].get(who) or []
-    kind, _, rid = key.partition(":")
-    r = ui_record(kind, rid) or {}
-    q = r.get("display") or r.get("goal") or r.get("prompt") or ""
-    a = r.get("final") or r.get("answer") or ""
-    if not q or not chain:
+    keys = keys or [key]
+    body = title_context(keys)
+    if not body or not chain:
         return
-    prompt = TITLE_PROMPT % (q[:1500], a[:1500])
+    prompt = TITLE_PROMPT % body
     for spec in chain[:2]:
         bk, _, mdl = spec.partition(":")
         fn = BACKENDS.get(bk)
@@ -3452,7 +3592,7 @@ def auto_title_one(cfg, key):
         except (BackendError, OSError):
             continue
         if t:
-            set_name(key, t, auto=True)
+            set_name(key, t, auto=True, rounds=len(keys))
             return
     with _names_lock:
         d = load_names_raw()
@@ -3463,15 +3603,15 @@ def auto_title_one(cfg, key):
 def start_auto_titles(cfg, calls, runs):
     if not cfg.get("auto_title") or _names_running.is_set() or os.environ.get("HUB_NO_AUTOTITLE") == "1":  # 离线测试里不真的叫模型
         return
-    keys = title_candidates(calls, runs)[:20]
-    if not keys:
+    todo = title_candidates(calls, runs)[:20]
+    if not todo:
         return
     _names_running.set()
 
     def work():
         try:
-            for k in keys:
-                auto_title_one(cfg, k)
+            for k, keys in todo:
+                auto_title_one(cfg, k, keys)
         finally:
             _names_running.clear()
     threading.Thread(target=work, daemon=True).start()
@@ -3510,7 +3650,7 @@ def stop_record(kind, rid):
     if not r:
         return "没有这条记录"
     pid = r.get("pid")
-    if r.get("status") not in ("running", "planning", "synthesizing") or not pid_alive(pid):
+    if r.get("status") not in RUN_ACTIVE or not pid_alive(pid):
         return "它已经不在运行了"
     if int(pid) == os.getpid():
         return "不能停止面板自己"
@@ -3552,7 +3692,7 @@ def stop_record(kind, rid):
             p = os.path.join(RUNS_DIR, name, "run.json")
             d = read_json(p)
             if (isinstance(d, dict) and d.get("pid") == pid
-                    and (d.get("status") in ("planning", "running", "synthesizing") or d.get("error") == DEAD_MSG)):
+                    and (d.get("status") in RUN_ACTIVE or d.get("error") == DEAD_MSG)):
                 _fail_tasks(d)
                 d.update(status="failed", error=STOP_MSG, end=now)
                 write_json(p, d)
@@ -3594,12 +3734,9 @@ def open_login(cfg, kind):
 
 def port_open(port):
     import socket
-    sk = socket.socket()
-    sk.settimeout(0.5)
-    try:
+    with socket.socket() as sk:
+        sk.settimeout(0.5)
         return sk.connect_ex(("127.0.0.1", port)) == 0
-    finally:
-        sk.close()
 
 
 NATIVE_APP = os.path.join(HOME, "Applications", "Hub.app")
@@ -3628,6 +3765,300 @@ def open_panel(url, browser=False):
         subprocess.call(["open", "-na", app, "--args", "--app=" + url])
     else:
         subprocess.call(["open", url])
+
+
+_dsh_plugins_lock = threading.Lock()
+_DSH_PKG_RE = re.compile(r"^(?:@[a-z0-9._-]+/)?[a-z0-9._-]+$")
+DSH_UI_ONLY_PLUGINS = ("dsh-whale-widget", "dsh-pet")
+DSH_KNOWN_PLUGINS = [
+    {
+        "name": "dsh-purge-community",
+        "title": "Purge 社区版",
+        "desc": "减少确认摩擦、提示词与规则管理",
+        "kind": "patch",
+        "cordis_id": "dsh-purge",
+        "options": [
+            {"key": "enabled", "label": "启用注入", "type": "bool", "default": True},
+            {"key": "autoRetry", "label": "回答中断自动重试", "type": "bool", "default": True},
+            {"key": "autoContinue", "label": "自动发送「继续」", "type": "bool", "default": False},
+            {"key": "capabilityProtocol", "label": "能力协议", "type": "bool", "default": True},
+            {"key": "hooksDenyBypass", "label": "Hooks 拦截绕过", "type": "bool", "default": True},
+            {"key": "stripMnemon", "label": "过滤 Mnemon 段落", "type": "bool", "default": True},
+            {"key": "injectOnce", "label": "仅首轮注入", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "dsh-full-throttle",
+        "title": "全油门模式",
+        "desc": "注入高预算高标准提示词（二级开关与桌面版共用）",
+        "kind": "full_throttle",
+        "cordis_id": "full-throttle",
+        "options": [
+            {"key": "enabled", "label": "开启全油门注入", "type": "bool", "default": False},
+            {"key": "subagents", "label": "鼓励组建智能体团队", "type": "bool", "default": False},
+        ],
+    },
+    {
+        "name": "dsh-todo-progress-guard",
+        "title": "Todo 进度守卫",
+        "desc": "长任务中提醒更新待办，结束时自动收尾",
+        "kind": "patch",
+        "cordis_id": "todo-progress-guard",
+        "options": [
+            {"key": "autoCompleteOnTurnEnd", "label": "回合结束自动完成剩余项", "type": "bool", "default": True},
+            {"key": "stepThreshold", "label": "步数提醒阈值", "type": "int", "default": 2, "min": 1, "max": 20},
+            {"key": "callThreshold", "label": "工具调用提醒阈值", "type": "int", "default": 5, "min": 1, "max": 30},
+        ],
+    },
+]
+_DSH_KNOWN_MAP = {p["name"]: p for p in DSH_KNOWN_PLUGINS}
+
+
+def _dsh_paths():
+    root = os.environ.get("DSH_HOME") or os.path.join(HOME, ".dsh")
+    return {
+        "desktop_pkg": os.path.join(root, "profiles", "desktop", "package.json"),
+        "desktop_nm": os.path.join(root, "profiles", "desktop", "node_modules"),
+        "headless_pkg": os.path.join(root, "profiles", "headless", "package.json"),
+        "headless_nm": os.path.join(root, "profiles", "headless", "node_modules"),
+        "headless_patch": os.path.join(root, "profiles", "headless", "cordis.patch.yml"),
+        "full_throttle": os.path.join(root, "full-throttle.json"),
+    }
+
+
+def _dsh_parse_yaml_scalar(raw):
+    s = raw.strip()
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    if (len(s) >= 2) and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
+        return s[1:-1]
+    return s
+
+
+def _dsh_read_patch_configs(path):
+    """读取 cordis.patch.yml 中每个 `- id: <id>` 条目的顶层 config 标量值。"""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return out
+    cur_id, in_cfg, cfg_indent = None, False, 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m_id = re.match(r"^-\s+id:\s*([^\s#]+)", line)
+        if m_id:
+            cur_id = _dsh_parse_yaml_scalar(m_id.group(1))
+            in_cfg = False
+            out.setdefault(cur_id, {})
+            continue
+        if line.startswith("-"):
+            cur_id, in_cfg = None, False
+            continue
+        if cur_id is None:
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if re.match(r"^\s+config:\s*$", line):
+            in_cfg = True
+            cfg_indent = indent
+            continue
+        if in_cfg:
+            if indent <= cfg_indent:
+                in_cfg = False
+                continue
+            m_kv = re.match(r"^\s+([A-Za-z0-9_-]+):\s*(.+?)\s*$", line)
+            if m_kv:
+                val = m_kv.group(2).split(" #", 1)[0].strip()
+                out[cur_id][m_kv.group(1)] = _dsh_parse_yaml_scalar(val)
+    return out
+
+
+def _dsh_write_patch_block(path, target_id, pkg_name, cfg_dict):
+    """只更新 cordis.patch.yml 中指定 id 的块，保留文件里其他注释和用户手写条目。"""
+    header = []
+    blocks = []  # [(id_or_None, [lines])]
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw_lines = f.readlines()
+    except OSError:
+        raw_lines = []
+    for line in raw_lines:
+        if line.startswith("-"):
+            match = re.match(r"^-\s+id:\s*([^\s#]+)", line)
+            block_id = _dsh_parse_yaml_scalar(match.group(1)) if match else None
+            blocks.append((block_id, [line]))
+        elif blocks:
+            blocks[-1][1].append(line)
+        elif line.strip() != "[]":
+            header.append(line)
+    new_blk = None
+    if cfg_dict:
+        lines = ["- id: %s\n" % target_id, "  name: %s\n" % pkg_name, "  config:\n"]
+        for k, v in cfg_dict.items():
+            if isinstance(v, bool):
+                sv = "true" if v else "false"
+            elif isinstance(v, int):
+                sv = str(v)
+            else:
+                sv = json.dumps(str(v), ensure_ascii=False)
+            lines.append("    %s: %s\n" % (k, sv))
+        new_blk = (target_id, lines)
+    out_blocks = []
+    for block_id, lines in blocks:
+        if block_id != target_id:
+            out_blocks.append((block_id, lines))
+        elif new_blk is not None:
+            out_blocks.append(new_blk)
+    if new_blk is not None and not any(block_id == target_id for block_id, _ in blocks):
+        out_blocks.append(new_blk)
+    if not header:
+        header = ["# Your patch layer for this dsh profile, applied after every bundle layer:\n"]
+    text = "".join(header)
+    if not text.endswith("\n"):
+        text += "\n"
+    text += "".join(line for _, block in out_blocks for line in block) if out_blocks else "[]\n"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _dsh_atomic_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def dsh_plugins_state():
+    """读取 DeepSeek (dsh headless) 插件同步状态与各插件二级开关。"""
+    ps = _dsh_paths()
+    h_pkg = read_json(ps["headless_pkg"]) or {}
+    d_pkg = read_json(ps["desktop_pkg"]) or {}
+    bundles = list(((h_pkg.get("dsh") or {}).get("profile") or {}).get("bundles") or [])
+    patch_cfgs = _dsh_read_patch_configs(ps["headless_patch"])
+    ft = read_json(ps["full_throttle"]) or {}
+
+    def installed_in_desktop(name):
+        return os.path.exists(os.path.join(ps["desktop_nm"], name))
+
+    plugins = []
+    for meta in DSH_KNOWN_PLUGINS:
+        name = meta["name"]
+        in_desk = installed_in_desktop(name)
+        enabled = name in bundles
+        opts = []
+        for o in meta["options"]:
+            if meta["kind"] == "full_throttle":
+                val = ft.get(o["key"], o["default"])
+            else:
+                val = patch_cfgs.get(meta["cordis_id"], {}).get(o["key"], o["default"])
+            opts.append(dict(o, value=val))
+        plugins.append({
+            "name": name,
+            "title": meta["title"],
+            "desc": meta["desc"],
+            "installed": in_desk,
+            "enabled": enabled,
+            "options": opts,
+        })
+
+    deps = list((d_pkg.get("dependencies") or {}).keys())
+    others = []
+    for name in sorted(deps):
+        if name in _DSH_KNOWN_MAP:
+            continue
+        others.append({
+            "name": name,
+            "installed": installed_in_desktop(name),
+            "enabled": name in bundles,
+            "ui_only": name in DSH_UI_ONLY_PLUGINS,
+        })
+    return {"ok": True, "plugins": plugins, "others": others}
+
+
+def dsh_plugins_update(body):
+    """同步/开关 headless 插件，或修改某个插件的二级开关/参数。"""
+    with _dsh_plugins_lock:
+        ps = _dsh_paths()
+        action = body.get("action")
+        if action == "toggle_bundle":
+            name = str(body.get("name") or "").strip()
+            on = body.get("on")
+            if not _DSH_PKG_RE.match(name) or not isinstance(on, bool):
+                raise ValueError("插件名或开关格式不对")
+            if name in ("@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"):
+                raise ValueError("基础组件不能关闭")
+            h_pkg = read_json(ps["headless_pkg"])
+            if not isinstance(h_pkg, dict):
+                raise ValueError("找不到 headless 的 package.json")
+            bak = ps["headless_pkg"] + ".bak-hub"
+            if not os.path.exists(bak):
+                shutil.copy2(ps["headless_pkg"], bak)
+            prof = h_pkg.setdefault("dsh", {}).setdefault("profile", {})
+            bundles = list(prof.get("bundles") or [])
+            if on:
+                desk_target = os.path.join(ps["desktop_nm"], name)
+                if not os.path.exists(desk_target):
+                    raise ValueError("桌面版尚未安装 %s" % name)
+                os.makedirs(ps["headless_nm"], exist_ok=True)
+                link_path = os.path.join(ps["headless_nm"], name)
+                rel_target = os.path.join("..", "..", "desktop", "node_modules", name)
+                if os.path.lexists(link_path):
+                    if os.path.islink(link_path):
+                        os.unlink(link_path)
+                if not os.path.exists(link_path):
+                    os.symlink(rel_target, link_path)
+                if name not in bundles:
+                    bundles.append(name)
+            else:
+                bundles = [b for b in bundles if b != name]
+            prof["bundles"] = bundles
+            _dsh_atomic_json(ps["headless_pkg"], h_pkg)
+            return dsh_plugins_state()
+
+        if action == "set_option":
+            plugin = str(body.get("plugin") or "").strip()
+            key = str(body.get("key") or "").strip()
+            val = body.get("value")
+            meta = _DSH_KNOWN_MAP.get(plugin)
+            if not meta:
+                raise ValueError("不支持的插件")
+            opt = next((o for o in meta["options"] if o["key"] == key), None)
+            if not opt:
+                raise ValueError("不支持的开关项")
+            if opt["type"] == "bool":
+                if not isinstance(val, bool):
+                    raise ValueError("开关值必须是布尔值")
+            elif opt["type"] == "int":
+                if isinstance(val, bool) or not isinstance(val, int):
+                    raise ValueError("参数值必须是整数")
+                val = max(opt.get("min", 1), min(opt.get("max", 100), val))
+            if meta["kind"] == "full_throttle":
+                cur = read_json(ps["full_throttle"]) or {}
+                if not isinstance(cur, dict):
+                    cur = {}
+                cur.setdefault("enabled", False)
+                cur.setdefault("subagents", False)
+                cur[key] = val
+                _dsh_atomic_json(ps["full_throttle"], cur)
+            else:
+                patch_cfgs = _dsh_read_patch_configs(ps["headless_patch"])
+                cfg = dict(patch_cfgs.get(meta["cordis_id"]) or {})
+                cfg[key] = val
+                _dsh_write_patch_block(ps["headless_patch"], meta["cordis_id"], plugin, cfg)
+            return dsh_plugins_state()
+
+        raise ValueError("未知操作")
 
 
 def cmd_ui(cfg, args):
@@ -4197,6 +4628,129 @@ def accepts_gzip(header):
     return 0 < qualities.get("gzip", qualities.get("*", 0)) <= 1
 
 
+def save_panel_config(raw):
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def update_panel_config(body):
+    c = load_config()
+    raw = read_json(CONFIG_PATH)
+    if not isinstance(raw, dict):
+        raise ValueError("配置文件 %s 读不出来（可能被改坏了），为免覆盖没有保存" % CONFIG_PATH)
+    for k in ("planner", "synthesizer", "default_worker", "handoff_by"):
+        if k in body:
+            if body[k] not in c["agents"]:
+                raise ValueError("没有这个 agent：%s" % body[k])
+            raw[k] = body[k]
+    if "council_agents" in body:
+        ca = body["council_agents"]
+        if not isinstance(ca, list) or not all(isinstance(x, str) and x in c["agents"] for x in ca):
+            raise ValueError("会审成员设置不对")
+        members = list(dict.fromkeys(ca))
+        if len(members) < 2:
+            raise ValueError("会审至少要选两位成员")
+        raw["council_agents"] = members
+    if "pressure_prompt" in body:
+        pp = body["pressure_prompt"]
+        if not isinstance(pp, str) or len(pp) > 20000:
+            raise ValueError("高压模式提示词必须是文字，最多 2 万字")
+        raw["pressure_prompt"] = pp
+    ae = body.get("agent_enabled")
+    if "agent_enabled" in body:
+        if not isinstance(ae, dict) or ae.get("agent") not in c["agents"] or not isinstance(ae.get("on"), bool):
+            raise ValueError("成员开关格式不对")
+        dis = [x for x in (raw.get("disabled_agents") or []) if x in c["agents"] and x != ae["agent"]]
+        if not ae["on"]:
+            dis.append(ae["agent"])
+            if len(dis) >= len(c["agents"]):
+                raise ValueError("至少要留一位成员启用")
+        raw["disabled_agents"] = dis
+    me = body.get("model_enabled")
+    if "model_enabled" in body:
+        if not isinstance(me, dict) or not isinstance(me.get("on"), bool) or me.get("spec") not in set(o["spec"] for o in backend_choices(c)):
+            raise ValueError("模型开关格式不对")
+        dis = [x for x in (raw.get("disabled_models") or []) if isinstance(x, str) and x != me["spec"]]
+        if not me["on"]:
+            dis.append(me["spec"])
+        raw["disabled_models"] = dis
+    if "auto_title" in body:
+        if body["auto_title"] != "" and body["auto_title"] not in c["agents"]:
+            raise ValueError("没有这位成员")
+        raw["auto_title"] = body["auto_title"]
+    if "quota_guard" in body:
+        if not isinstance(body["quota_guard"], bool):
+            raise ValueError("开关格式不对")
+        raw["quota_guard"] = body["quota_guard"]
+    if "codex_effort" in body:
+        if body["codex_effort"] != "" and body["codex_effort"] not in effort_levels("codex"):
+            raise ValueError("思考强度不对")
+        raw["codex_effort"] = body["codex_effort"]
+    ef = body.get("effort")
+    if "effort" in body:
+        if not isinstance(ef, dict) or ef.get("agent") not in c["agents"]:
+            raise ValueError("思考等级设置不对")
+        if ef.get("level") != "" and ef.get("level") not in effort_levels((c["agents"][ef["agent"]] or [""])[0]):
+            raise ValueError("这个模型没有「%s」这一档" % ef.get("level"))
+        cur = raw.get("effort") if isinstance(raw.get("effort"), dict) else {}
+        cur[ef["agent"]] = ef["level"]
+        raw["effort"] = cur
+    tr_key = next((k for k in TIERS if k in body), None)
+    if tr_key:
+        th = body.get(tr_key)
+        if not isinstance(th, dict) or th.get("agent") not in c["agents"]:
+            raise ValueError("%s模型设置不对" % TIER_NAMES[tr_key])
+        cur = raw.get(tr_key) if isinstance(raw.get(tr_key), dict) else {}
+        one = dict(cur.get(th["agent"]) if isinstance(cur.get(th["agent"]), dict) else {})
+        if "spec" in th:
+            sp = th["spec"]
+            if sp != "" and sp not in set(o["spec"] for o in backend_choices(c)):
+                raise ValueError("不认识这个模型：%s" % sp)
+            if sp and sp in (c.get("disabled_models") or []):
+                raise ValueError("这个模型已停用，先在设置的「可用模型」里勾回来")
+            if sp != one.get("spec"):
+                one["effort"] = ""  # 换了模型，原来的档位不一定还有
+            one["spec"] = sp
+        if "effort" in th:
+            tsp = one.get("spec") or (c["agents"][th["agent"]] or [""])[0]
+            if th["effort"] != "" and th["effort"] not in effort_levels(tsp):
+                raise ValueError("这个模型没有「%s」这一档" % th["effort"])
+            one["effort"] = th["effort"]
+        cur[th["agent"]] = one
+        raw[tr_key] = cur
+    ch = body.get("chain")
+    if "chain" in body and not isinstance(ch, dict):
+        raise ValueError("模型设置格式不对")
+    if isinstance(ch, dict):
+        name, spec = ch.get("agent"), ch.get("spec")
+        if name not in c["agents"]:
+            raise ValueError("没有这个 agent：%s" % name)
+        if spec not in set(o["spec"] for o in backend_choices(c)):
+            raise ValueError("不认识这个模型：%s" % spec)
+        if spec in (c.get("disabled_models") or []):
+            raise ValueError("这个模型已停用，先在设置的「可用模型」里勾回来")
+        chain = list(c["agents"][name])
+        idx = ch.get("index", 0)
+        if type(idx) is not int:
+            raise ValueError("位置必须是整数")
+        if not 0 <= idx < len(chain):
+            raise ValueError("位置不对")
+        chain[idx] = spec
+        raw.setdefault("agents", {})[name] = chain
+    for k, lo, hi in (("max_parallel", 1, 8), ("timeout", 60, 7200),
+                      ("idle_timeout", 60, 1800), ("hard_timeout", 300, 14400),
+                      ("compact_gemini", 0, 2000000), ("compact_gpt", 0, 2000000), ("compact_claude", 0, 2000000)):
+        if k in body:
+            v = body[k]
+            if type(v) is not int:
+                raise ValueError("%s 必须是整数" % k)
+            if not lo <= v <= hi:
+                raise ValueError("%s 需在 %d~%d 之间" % (k, lo, hi))
+            raw[k] = v
+    save_panel_config(raw)
+
 def serve_ui(port, me):
     import mimetypes
     import secrets
@@ -4258,12 +4812,9 @@ def serve_ui(port, me):
         env["HUB_META"] = json.dumps(meta, ensure_ascii=False)
         if meta.get("full"):
             env["HUB_FULL"] = "1"
-        logf = open(os.path.join(HUB_HOME, "ui-submits.log"), "a", encoding="utf-8")
-        try:
+        with open(os.path.join(HUB_HOME, "ui-submits.log"), "a", encoding="utf-8") as logf:
             p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=logf, stderr=logf, cwd=cwd, env=env,
                                  start_new_session=True)
-        finally:
-            logf.close()
         try:
             p.stdin.write(text.encode("utf-8"))
         finally:
@@ -4335,19 +4886,16 @@ def serve_ui(port, me):
         if ctx:
             if ctx.get("type") not in ("call", "run") or not isinstance(ctx.get("id"), str):
                 raise ValueError("追问记录格式不对")
-            if ctx["type"] == "run" and re.fullmatch(r"[0-9]{8}-[0-9]{6}x*", ctx["id"]):
-                pc = (read_json(os.path.join(RUNS_DIR, ctx["id"], "run.json")) or {}).get("parent_call")
-                if pc:  # 在对接人派出的项目组里接着说，算接着那段对话
-                    ctx = {"type": "call", "id": pc}
+            kind, rid = conversation_ref(ctx["type"], ctx["id"])
             scope = body.get("context_scope", "full")
             if scope not in ("full", "one"):
                 raise ValueError("上下文范围不对")
-            pre = follow_context(ctx["type"], ctx["id"], 1 if scope == "one" else 8)
+            pre = follow_context(kind, rid, 1 if scope == "one" else 8)
             meta["scope"] = scope
             if not pre:
                 raise ValueError("找不到要追问的记录")
             full = pre + text
-            meta["follows"] = {"type": ctx["type"], "id": ctx["id"]}
+            meta["follows"] = {"type": kind, "id": rid}
             if "fork" in body and not isinstance(body["fork"], bool):
                 raise ValueError("分叉必须是开或关")
             if body.get("fork"):  # 从这里分出一条新线：带上到这里为止的上下文，之后各走各的
@@ -4359,10 +4907,10 @@ def serve_ui(port, me):
         if mode == "image":
             out = os.path.join(UI_WORKSPACE, "images", "img-%s-%s.png" % (time.strftime("%Y%m%d-%H%M%S"),
                                                                            uuid.uuid4().hex[:4]))
-            cmd = [sys.executable, me, "image", "-o", out, "-"]
+            cmd = ["image", "-o", out]
             cwd = UI_WORKSPACE
         elif mode == "council":
-            cmd = [sys.executable, me, "council", "-w", cwd]
+            cmd = ["council", "-w", cwd]
             ag, sy = body.get("agents"), body.get("synthesizer")
             if ag is not None:  # 重新执行时沿用当时的成员和综合者
                 if not isinstance(ag, list) or not ag or not all(isinstance(x, str) and x in c["agents"] for x in ag):
@@ -4375,146 +4923,22 @@ def serve_ui(port, me):
                 if sy not in c["agents"]:
                     raise ValueError("综合者不对")
                 cmd += ["--synthesizer", sy]
-            cmd.append("-")
-        elif mode == "pressure":
-            cmd = [sys.executable, me, "run", "--pressure", "-w", cwd] + (["--write"] if body.get("write") else []) + ["-"]
-        elif mode == "chat":
-            cmd = [sys.executable, me, "chat", "--contact", agent, "-w", cwd] + (["--write"] if body.get("write") else []) + ["-"]
-        elif mode == "side":
-            cmd = [sys.executable, me, "ask", agent, "--side"] + side + ["-w", cwd, "-"]
         else:
-            cmd = [sys.executable, me, mode] + ([agent] if mode == "ask" else []) + ["-w", cwd]
+            if mode in ("pressure", "chat"):
+                cmd = ["chat", "--contact", "ds", "--pressure"] if mode == "pressure" else ["chat", "--contact", agent]
+            elif mode == "side":
+                cmd = ["ask", agent, "--side"] + side
+            else:
+                cmd = ["ask", agent] if mode == "ask" else ["run"]
+            cmd += ["-w", cwd]
             if body.get("write"):
                 cmd.append("--write")
-            cmd.append("-")
         if body.get("write") and mode != "image":
             meta["full"] = True
-        launch(cmd, cwd, full, meta)
+        launch([sys.executable, me, *cmd, "-"], cwd, full, meta)
         return meta["submission_id"]
 
     cfg_lock = threading.Lock()
-
-    def do_config(body):
-        with cfg_lock:
-            _do_config(body)
-
-    def _do_config(body):
-        c = load_config()
-        raw = read_json(CONFIG_PATH)
-        if not isinstance(raw, dict):
-            raise ValueError("配置文件 %s 读不出来（可能被改坏了），为免覆盖没有保存" % CONFIG_PATH)
-        for k in ("planner", "synthesizer", "default_worker"):
-            if k in body:
-                if body[k] not in c["agents"]:
-                    raise ValueError("没有这个 agent：%s" % body[k])
-                raw[k] = body[k]
-        if "council_agents" in body:
-            ca = body["council_agents"]
-            if not isinstance(ca, list) or not all(isinstance(x, str) and x in c["agents"] for x in ca):
-                raise ValueError("会审成员设置不对")
-            if len(dict.fromkeys(ca)) < 2:
-                raise ValueError("会审至少要选两位成员")
-            raw["council_agents"] = list(dict.fromkeys(ca))
-        if "pressure_prompt" in body:
-            pp = body["pressure_prompt"]
-            if not isinstance(pp, str) or len(pp) > 20000:
-                raise ValueError("高压模式提示词必须是文字，最多 2 万字")
-            raw["pressure_prompt"] = pp
-        ae = body.get("agent_enabled")
-        if "agent_enabled" in body:
-            if not isinstance(ae, dict) or ae.get("agent") not in c["agents"] or not isinstance(ae.get("on"), bool):
-                raise ValueError("成员开关格式不对")
-            dis = [x for x in (raw.get("disabled_agents") or []) if x in c["agents"] and x != ae["agent"]]
-            if not ae["on"]:
-                dis.append(ae["agent"])
-                if len(dis) >= len(c["agents"]):
-                    raise ValueError("至少要留一位成员启用")
-            raw["disabled_agents"] = dis
-        me = body.get("model_enabled")
-        if "model_enabled" in body:
-            if not isinstance(me, dict) or not isinstance(me.get("on"), bool) or me.get("spec") not in set(o["spec"] for o in backend_choices(c)):
-                raise ValueError("模型开关格式不对")
-            dis = [x for x in (raw.get("disabled_models") or []) if isinstance(x, str) and x != me["spec"]]
-            if not me["on"]:
-                dis.append(me["spec"])
-            raw["disabled_models"] = dis
-        if "auto_title" in body:
-            if body["auto_title"] != "" and body["auto_title"] not in c["agents"]:
-                raise ValueError("没有这位成员")
-            raw["auto_title"] = body["auto_title"]
-        if "quota_guard" in body:
-            if not isinstance(body["quota_guard"], bool):
-                raise ValueError("开关格式不对")
-            raw["quota_guard"] = body["quota_guard"]
-        if "codex_effort" in body:
-            if body["codex_effort"] != "" and body["codex_effort"] not in effort_levels("codex"):
-                raise ValueError("思考强度不对")
-            raw["codex_effort"] = body["codex_effort"]
-        ef = body.get("effort")
-        if "effort" in body:
-            if not isinstance(ef, dict) or ef.get("agent") not in c["agents"]:
-                raise ValueError("思考等级设置不对")
-            if ef.get("level") != "" and ef.get("level") not in effort_levels((c["agents"][ef["agent"]] or [""])[0]):
-                raise ValueError("这个模型没有「%s」这一档" % ef.get("level"))
-            cur = raw.get("effort") if isinstance(raw.get("effort"), dict) else {}
-            cur[ef["agent"]] = ef["level"]
-            raw["effort"] = cur
-        tr_key = next((k for k in TIERS if k in body), None)
-        if tr_key:
-            th = body.get(tr_key)
-            if not isinstance(th, dict) or th.get("agent") not in c["agents"]:
-                raise ValueError("%s模型设置不对" % TIER_NAMES[tr_key])
-            cur = raw.get(tr_key) if isinstance(raw.get(tr_key), dict) else {}
-            one = dict(cur.get(th["agent"]) if isinstance(cur.get(th["agent"]), dict) else {})
-            if "spec" in th:
-                sp = th["spec"]
-                if sp != "" and sp not in set(o["spec"] for o in backend_choices(c)):
-                    raise ValueError("不认识这个模型：%s" % sp)
-                if sp and sp in (c.get("disabled_models") or []):
-                    raise ValueError("这个模型已停用，先在设置的「可用模型」里勾回来")
-                if sp != one.get("spec"):
-                    one["effort"] = ""  # 换了模型，原来的档位不一定还有
-                one["spec"] = sp
-            if "effort" in th:
-                tsp = one.get("spec") or (c["agents"][th["agent"]] or [""])[0]
-                if th["effort"] != "" and th["effort"] not in effort_levels(tsp):
-                    raise ValueError("这个模型没有「%s」这一档" % th["effort"])
-                one["effort"] = th["effort"]
-            cur[th["agent"]] = one
-            raw[tr_key] = cur
-        ch = body.get("chain")
-        if "chain" in body and not isinstance(ch, dict):
-            raise ValueError("模型设置格式不对")
-        if isinstance(ch, dict):
-            name, spec = ch.get("agent"), ch.get("spec")
-            if name not in c["agents"]:
-                raise ValueError("没有这个 agent：%s" % name)
-            if spec not in set(o["spec"] for o in backend_choices(c)):
-                raise ValueError("不认识这个模型：%s" % spec)
-            if spec in (c.get("disabled_models") or []):
-                raise ValueError("这个模型已停用，先在设置的「可用模型」里勾回来")
-            chain = list(c["agents"][name])
-            idx = ch.get("index", 0)
-            if type(idx) is not int:
-                raise ValueError("位置必须是整数")
-            if not 0 <= idx < len(chain):
-                raise ValueError("位置不对")
-            chain[idx] = spec
-            raw.setdefault("agents", {})[name] = chain
-        for k, lo, hi in (("max_parallel", 1, 8), ("timeout", 60, 7200),
-                          ("idle_timeout", 60, 1800), ("hard_timeout", 300, 14400),
-                          ("compact_gemini", 0, 2000000), ("compact_gpt", 0, 2000000), ("compact_claude", 0, 2000000)):
-            if k in body:
-                v = body[k]
-                if type(v) is not int:
-                    raise ValueError("%s 必须是整数" % k)
-                if not lo <= v <= hi:
-                    raise ValueError("%s 需在 %d~%d 之间" % (k, lo, hi))
-                raw[k] = v
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(raw, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
 
     class H(BaseHTTPRequestHandler):
         timeout = 15  # 只连不发的连接 15 秒后断开，免得把服务拖死
@@ -4604,6 +5028,10 @@ def serve_ui(port, me):
                 urls = ["http://%s:%d/pair?code=%s" % (ip, port, d["code"]) for ip in ips]
                 return self.send(200, {"enabled": bool(load_config().get("lan_access")), "listening": lan_on,
                                        "code": d["code"], "urls": urls, "qr": qr_svg(urls[0]) if urls else None})
+            if u.path == "/api/dsh/plugins":
+                if self.remote():
+                    return self.send(403, {"ok": False, "error": "插件设置只能在电脑上看"})
+                return self.send(200, dsh_plugins_state())
             if u.path == "/icon.png":
                 return self.send(200, app_icon_png(), "image/png")
             if u.path == "/":
@@ -4704,12 +5132,10 @@ def serve_ui(port, me):
                 elif self.path == "/api/awake":  # 不休眠开关；记进配置，下次打开面板照旧
                     if not isinstance(body.get("on"), bool):
                         raise ValueError("开关格式不对")
-                    raw = read_json(CONFIG_PATH) or {}
-                    raw["keep_awake"] = body["on"]
-                    tmp = CONFIG_PATH + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(raw, f, ensure_ascii=False, indent=2)
-                    os.replace(tmp, CONFIG_PATH)
+                    with cfg_lock:
+                        raw = read_json(CONFIG_PATH) or {}
+                        raw["keep_awake"] = body["on"]
+                        save_panel_config(raw)
                     return self.send(200, {"ok": True, "on": set_awake(body["on"])})
                 elif self.path == "/api/keep/close":  # 关掉开着的 Gemini 会话（"all" = 全部）
                     ids = [d["id"] for d in keep_list()] if body.get("id") == "all" else [body.get("id")]
@@ -4739,7 +5165,10 @@ def serve_ui(port, me):
                                       str(body.get("body") or "")[:200]],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif self.path == "/api/config":
-                    do_config(body)
+                    with cfg_lock:
+                        update_panel_config(body)
+                elif self.path == "/api/dsh/plugins":
+                    return self.send(200, dsh_plugins_update(body))
                 elif self.path == "/api/lan":  # 只能在电脑上开关（上面已拒绝手机）
                     if not isinstance(body.get("enable"), bool):
                         raise ValueError("开关格式不对")
@@ -4748,10 +5177,7 @@ def serve_ui(port, me):
                         if not isinstance(raw, dict):
                             raise ValueError("配置文件读不出来，没有保存")
                         raw["lan_access"] = body["enable"]
-                        tmp = CONFIG_PATH + ".tmp"
-                        with open(tmp, "w", encoding="utf-8") as f:
-                            json.dump(raw, f, ensure_ascii=False, indent=2)
-                        os.replace(tmp, CONFIG_PATH)
+                        save_panel_config(raw)
                     if body["enable"]:
                         pair_load()
                     if body["enable"] != lan_on:  # 换监听地址需要重启面板服务，页面会自动重连
@@ -4791,6 +5217,15 @@ def serve_ui(port, me):
             return ip_kind(client_address[0]) in (("local", "private") if lan_on else ("local",))
 
     srv = Server(("0.0.0.0" if lan_on else "127.0.0.1", port), H)
+    guard = None
+    if lan_on:
+        # 只占 0.0.0.0 时，macOS 上别的程序还能单独占住 127.0.0.1 的同一个端口，
+        # Hub 窗口（连的是 127.0.0.1）就会被它的网页顶掉。把本机地址也占上，别人就绑不上了。
+        try:
+            guard = Server(("127.0.0.1", port), H)
+            threading.Thread(target=guard.serve_forever, daemon=True).start()
+        except OSError:
+            guard = None
     write_json(UI_PID, {"pid": os.getpid(), "port": port})
     if load_config().get("keep_awake") and not os.environ.get("HUB_NO_AWAKE"):
         try:
@@ -4803,6 +5238,9 @@ def serve_ui(port, me):
     except KeyboardInterrupt:
         pass
     srv.server_close()
+    if guard:
+        guard.shutdown()
+        guard.server_close()
     set_awake(False)
     if restart["on"]:
         _reexec_ui(port, me)
@@ -4831,7 +5269,7 @@ def cmd_agents(cfg, args):
     return 0
 
 
-def cmd_log(cfg, args):
+def cmd_log(args):
     if not os.path.exists(LOG_PATH):
         print("还没有调用记录")
         return 0
@@ -4889,6 +5327,8 @@ def main():
     ch.add_argument("--contact", default="auto", help="联络人：auto（按阶段自动选）或成员名")
     ch.add_argument("-w", "--cwd")
     ch.add_argument("--write", action="store_true", help="派给团队的活允许改文件")
+    ch.add_argument("--pressure", action="store_true",
+                    help="高压模式：由 ds 主导对接，首轮注入「高压模式提示词」，派活时由 ds 排工与汇总")
 
     im = sub.add_parser("image", help="让 GPT 画图")
     im.add_argument("prompt", nargs="+")
@@ -4935,7 +5375,7 @@ def main():
                 raise BackendError("不认识的成员：%s（可选：%s）" % (args.agents, ", ".join(cfg["agents"])))
             return run_council(cfg, read_prompt(args.question), args.cwd, members, args.synthesizer)
         if args.cmd == "chat":
-            return run_chat(cfg, read_prompt(args.message), args.cwd, args.write, args.contact)
+            return run_chat(cfg, read_prompt(args.message), args.cwd, args.write, args.contact, pressure=args.pressure)
         if args.cmd == "image":
             out = os.path.abspath(args.out)
             os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -4978,7 +5418,7 @@ def main():
         if args.cmd == "ui":
             return cmd_ui(cfg, args)
         if args.cmd == "log":
-            return cmd_log(cfg, args)
+            return cmd_log(args)
         ap.print_help()
         return 0
     except BackendError as e:

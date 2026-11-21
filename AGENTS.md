@@ -80,7 +80,9 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 
 **对接人自己动手**：`CHAT_PROMPT` 的 `{perm_note}` 会告诉对接人这次能不能改文件、跑命令（`write` 或 `HUB_FULL=1` 时可以）。几分钟内能做完的小核查、小改动由对接人自己做，只有大活才派给团队。
 
-**回答写法**：`USER_STYLE` 是给用户看的统一写法（先结论、默认 200 字内、不用表格和行话），拼在对接人、汇总、会审综合和直接提问的提示词里。
+**回答写法**：`USER_STYLE` 是给用户看的统一写法（简体中文、日常用语、先说结论），拼在对接人、汇总、会审综合和直接提问的提示词里。
+
+**提示词写法**：给模型的提示词（`PLAN_PROMPT`、`SYNTH_PROMPT`、`COUNCIL_PROMPT`、`CHAT_PROMPT` 等）只交代目标、背景、交付要求和原则，怎么做由模型自己判断；不要写成「必须/不许/一律」式的死规则，也不要重复叠加安全叮嘱。只保留程序要解析的固定格式：`【派活】`、`【重置派活】`、`【转告团队】`、`【进度】`/`【遗留】` 和排工 JSON。
 
 **历史读取缓存**：`_RecordCache` 按文件的 mtime/大小缓存解析好的调用和项目记录，`/api/state` 只重读变过的文件；`shared=True` 返回缓存本身不复制，只给只读的调用方用。
 
@@ -88,10 +90,11 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 
 - **分叉**：提交时 `fork: true` 加 `context`，记录带 `fork: true`。面板把分叉作为独立项目组，追问链在分叉处断开；后端带上到分叉点为止的上下文，并且不续接原会话。
 - **图片**：`/api/upload` 收 `{data: base64}`，按文件头只认 PNG/JPEG/WebP/GIF（≤10MB），存到 `<HUB_HOME>/workspace/attachments/att-时间-随机.扩展名`；提交时 `images: [文件名]`（≤6 张）。`image_note()` 把图片路径写进提示词；GPT 另以 `--image=路径` 直接附图，Gemini/Claude 加 `--add-dir` 放行附件目录，DeepSeek 用自带的 `read_image` 工具读。`/api/attachment?id=` 只返回位图。
-- **项目组名字**：`names.json` 存 `{记录键: {name, auto}}`，键是项目组第一条记录（`call:…` / `run:…`）。面板服务在 `ui_state()` 里用 `start_auto_titles()` 在后台给做完的新项目组起名：直接调用配置 `auto_title` 那位成员的后端（不经过 `ask()`，不写调用记录），手动名字（`/api/rename`）不会被自动名覆盖。`auto_title` 那位成员停用时，按 ds → gemini → gpt → claude 换一位启用的成员代起。`since` 之前的旧项目组只有调用 `/api/title/backfill` 才起名，归档的不起。离线测试必须设 `HUB_NO_AUTOTITLE=1`，否则会真的调用模型。
-- **交接**：`/api/handoff {from, to, title, keys?}` 由 `make_handoff()` 在目标那条线后面写一条 `kind: "handoff"` 的记录：`follows` 指向目标最后一轮，`handoff.from` 指向来源。交接是抄一份：来源组保留，可以交给多组，面板显示「已交接给」。带 `keys`（整组的记录键）时，先用来源最近几轮的 `follow_context` 顶着，后台线程 `_digest_handoff()` 用 `DIGEST_PROMPT` 把整组来往（`handoff_digest_text()`，上限约 40 万字）压成交接说明（目标 / 已定下的 / 成果在哪 / 弯路 / 没做完的），压好后替换 `answer`。组里还有在做的也能交，只交已做完的部分。交接后的追问不续接原生会话。`/api/handoff/undo {id}` 由 `undo_handoff()` 撤销：把那条记录改名为 `.json.undone` 留底，原本接在它后面的追问改为接到交接之前那一轮。
+- **项目组名字**：`names.json` 存 `{记录键: {name, auto}}`，键是项目组真正的第一条记录（`group_root()` 顺着追问链往前找到头；面板只加载最近几百条记录，长对话的开头会掉出去，不能按「加载到的最早一条」记名字，否则名字会丢）。`ui_state()` 给每条记录带 `root`，文件夹归属 `folders.json` 也记在这个键上；启动后第一次 `rekey_to_roots()` 把旧数据挪过去。自动起名读整组（开头两轮和最近三轮），并要求概括主题；自动名之后组里又多了 5 轮且翻倍时重起一次，手动名永远不动。面板服务在 `ui_state()` 里用 `start_auto_titles()` 在后台给做完的新项目组起名：直接调用配置 `auto_title` 那位成员的后端（不经过 `ask()`，不写调用记录），手动名字（`/api/rename`）不会被自动名覆盖。`auto_title` 那位成员停用时，按 ds → gemini → gpt → claude 换一位启用的成员代起。`since` 之前的旧项目组只有调用 `/api/title/backfill` 才起名，归档的不起。离线测试必须设 `HUB_NO_AUTOTITLE=1`，否则会真的调用模型。
+- **交接**：`/api/handoff {from, to, title, keys?}` 由 `make_handoff()` 在目标那条线后面写一条 `kind: "handoff"` 的记录：`follows` 指向目标最后一轮，`handoff.from` 指向来源。交接是抄一份：来源组保留，可以交给多组，面板显示「已交接给」。带 `keys`（整组的记录键）时，先用来源最近几轮的 `follow_context` 顶着，后台线程 `_digest_handoff()` 用 `DIGEST_PROMPT`（写说明的成员由配置 `handoff_by` 定，模型和档位在 `digest` 一档里设，不设就跟这位成员干活用的一样）把整组来往（`handoff_digest_text()`，上限约 40 万字）压成交接说明（目标 / 已定下的 / 成果在哪 / 弯路 / 没做完的），压好后替换 `answer`。组里还有在做的也能交，只交已做完的部分。交接后的追问不续接原生会话。`/api/handoff/undo {id}` 由 `undo_handoff()` 撤销：把那条记录改名为 `.json.undone` 留底，原本接在它后面的追问改为接到交接之前那一轮。
 - **原地压缩**：`/api/compact {at, keys, title}` 由 `make_compact()` 在本组最后一轮后面写一条带 `handoff.compact: true` 的交接记录，同样后台压缩。`follow_context` 遇到压缩记录就停，之后的追问只带它和它之后的内容，不续接旧会话。交接/压缩说明在追问里保留至多 2 万字。
-- **追问链过长提醒**：面板从最近一次压缩处起算轮数（`roundsTo`），20 轮起在输入框上方提示，40 轮起变红并在左栏标「偏长」，提示里有「🗜 现在压缩」按钮。
+- **追问链过长提醒**：只对中间换过成员或用过团队的追问链提醒（`mixedLine`；一直跟同一位成员聊的，它自己的会话会自动压缩，不用提醒）。面板从最近一次压缩处起算轮数，20 轮起在输入框上方提示，40 轮起变红并在左栏标「偏长」，提示里有「🗜 现在压缩」按钮。
+- **对接人对话里的单人追问**：在对接人对话里切到「单人」发消息，`send()` 会改成 `mode: chat` 并指定那位成员为对接人（`isChatLine`），仍在同一段对话里显示、能续接会话；打开对接人对话时输入框自动切回「对接人」。
 - **文件夹**：`folders.json` 存 `{folders: [{id, name}], of: {组键: 文件夹id}}`，`/api/folders {op: create|rename|delete|move, ...}` 由 `folder_op()` 处理；只影响左栏显示。左栏组卡片可拖进文件夹或点 📁 放进去。
 - **成员 / 模型开关**：配置里的 `disabled_agents`、`disabled_models` 由 `active_cfg()` 过滤，所有干活的命令（排工、会审、对接、旁问、备用模型）只看得到启用的；平时的对接人都停用时，`choose_contact` 改找启用的成员。面板通过 `/api/config` 的 `agent_enabled`、`model_enabled` 切换。
 - **权限被拒**：agy 在只读模式下被拒权限（`denied_actions` 非空且回答为空）时，`agy_denied_text()` 从它的对话记录里找出被拒的那一步，报错以 `DENIED_PREFIX` 开头；`ask()` 遇到这种报错不再换备用模型重试。只读时 `backend_agy` 传 `--settings {"permissions":{"allow":["read_file(/)"]}}`，让它能读任何位置的文件（但不能写、不能运行命令）；面板的「允许改文件」开关记在 localStorage 的 `hub-write`。
@@ -131,7 +134,7 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 - POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/handoff/undo`、`/api/compact`、`/api/folders`、`/api/awake`、`/api/keep/close`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
 - `/api/bye` 不需要令牌，只用于页面关闭时登记。
 
-安全措施：检查 Host 头；图片接口只返回位图（不返回 SVG，防止 XSS）；设置 CSP 和 `X-Frame-Options`。局域网模式（`lan_access`）默认关闭，开启后只接受私有网段，需要配对码加 HttpOnly cookie，配对码输错有限速；设置、登录、开关局域网这些操作只能在本机做（见 `gate()` 和 `REMOTE_POSTS`）。
+安全措施：检查 Host 头；图片接口只返回位图（不返回 SVG，防止 XSS）；设置 CSP 和 `X-Frame-Options`。局域网模式（`lan_access`）默认关闭，开启后只接受私有网段，需要配对码加 HttpOnly cookie，配对码输错有限速；设置、登录、开关局域网这些操作只能在本机做（见 `gate()` 和 `REMOTE_POSTS`）。 局域网模式开着时，面板会同时占住 `127.0.0.1` 和局域网地址，免得本机别的程序抢走同一个端口、把 Hub 窗口顶掉。
 
 前端用 `schedulePoll()` 轮询 `/api/state?compact=1&v=<上一版>`：页面可见时每 1.5 秒，切到后台时每 10 秒。
 

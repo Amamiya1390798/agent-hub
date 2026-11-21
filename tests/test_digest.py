@@ -1,5 +1,5 @@
 """交接整组：先放最近几轮顶着，后台把整组压缩成交接说明再换上；压缩失败保留原内容。"""
-import os, tempfile, time, unittest
+import os, tempfile, threading, time, unittest
 
 HUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hub")
 
@@ -50,6 +50,44 @@ class Digest(unittest.TestCase):
         rec = self.wait(cid)
         self.assertEqual(rec["handoff"]["digest"], "fail")
         self.assertIn("out/1.png", rec["answer"])
+
+    def test_handoff_and_compact_are_ready_before_background_digest(self):
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        g = self.g
+        digest = g["_digest_handoff"]
+
+        def wait_to_digest(*args):
+            started.set()
+            release.wait(5)
+            try:
+                digest(*args)
+            finally:
+                finished.set()
+
+        g["_digest_handoff"] = wait_to_digest
+        g["BACKENDS"]["agy"] = lambda *args: "交接好了"
+        source = {"type": "call", "id": "c_a2"}
+        target = {"type": "call", "id": "c_b1"}
+        keys = ["call:c_a1", "call:c_a2"]
+        for compact in (False, True):
+            with self.subTest(compact=compact):
+                started.clear()
+                release.clear()
+                finished.clear()
+                try:
+                    if compact:
+                        cid = g["make_compact"](source, keys, self.cfg)
+                    else:
+                        cid = g["make_handoff"](source, target, keys=keys, cfg=self.cfg)
+                    self.assertTrue(started.wait(5))
+                    rec = g["ui_call"](cid)
+                    self.assertEqual(rec["follows"], source if compact else target)
+                    self.assertEqual(rec["handoff"]["from"], None if compact else source)
+                    self.assertEqual((rec["handoff"]["digest"], rec["handoff"]["rounds"]), ("running", 2))
+                    self.assertIn("out/1.png", rec["answer"])
+                finally:
+                    release.set()
+                    finished.wait(5)
 
     def test_compact_cuts_context(self):
         g = self.g

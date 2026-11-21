@@ -151,7 +151,7 @@ class HubTests(unittest.TestCase):
             self.assertEqual(g['quota_codex']()['windows'][0]['remaining'],75)
         self.assertEqual(g['_iso_to_epoch']('2026-01-01T09:00:00+09:00'),g['_iso_to_epoch']('2026-01-01T00:00:00Z'))
         with patch.dict(g,{'find_bin':lambda *a:'fake','_run':lambda *a:(0,'Gemini\tfive_hour\t42%\t2026-01-01T09:00:00+09:00\nGemini\tweek\tnan%\tx','')}):
-            q = g['quota_agy'](self.cfg)
+            q = g['quota_agy_all'](self.cfg)['gemini']
             self.assertEqual(len(q['windows']),1)
             self.assertEqual(q['windows'][0]['remaining'],42)
 
@@ -161,8 +161,8 @@ class HubTests(unittest.TestCase):
                  'Claude and GPT models\tWeekly Limit Remaining\t30%\t2026-01-01T00:00:00Z\n'
                  'Claude and GPT models\tFive Hour Limit Remaining\t60%\t2026-01-01T00:00:00Z')
         with patch.dict(g,{'find_bin':lambda *a:'fake','_run':lambda *a:(0,usage,'')}):
-            self.assertEqual(g['quota_agy'](self.cfg)['windows'][0]['remaining'],80)
-            cq = g['quota_agy'](self.cfg,'claude')['windows']
+            self.assertEqual(g['quota_agy_all'](self.cfg)['gemini']['windows'][0]['remaining'],80)
+            cq = g['quota_agy_all'](self.cfg)['claude']['windows']
             self.assertEqual([w['label'] for w in cq],['5 小时','本周'])
             cfg = dict(self.cfg, agents=dict(self.cfg['agents'], claude=['agy:claude-opus-5-5-high','claude:opus']))
             with patch.dict(g,{'quota_codex':lambda:None,'quota_ds':lambda:{}}):

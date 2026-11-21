@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PARTIAL = '已经完成的部分'
-CONTINUE = '（前一位做到一半被停下了，以下是它已经写出的部分，请在此基础上接着做完，不要从头再来：）\n'
+CONTINUE = '（以下是前一位成员留下的部分结果，供接手参考：）\n'
 
 FAKE = r'''
 import json, os, sys, time

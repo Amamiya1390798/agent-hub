@@ -41,7 +41,7 @@ function boot(){
   vm.createContext(ctx);
   vm.runInContext(source.replace(
     'schedulePoll(0); setInterval(ticks, 1000);',
-    'globalThis.ui={set:s=>{S=s;},groups,items,renderList,select,getSel:()=>sel,getFilter:()=>filter,setFilter:v=>{filter=v;},setQuery:v=>{query=v;},openGroups,last};'
+    'globalThis.ui={set:s=>{S=s;},longOf,isChatLine,getMode:()=>mode,setMode:v=>{mode=v;},groups,items,renderList,select,getSel:()=>sel,getFilter:()=>filter,setFilter:v=>{filter=v;},setQuery:v=>{query=v;},openGroups,last};'
   ), ctx);
   return { ui: ctx.ui, nodes, docListeners };
 }
@@ -292,6 +292,42 @@ const config = { planner: 'gemini', synthesizer: 'gemini', max_parallel: 3, time
     ui.setQuery('声卡选购'); ui.last.list = ''; ui.renderList();
     assert.ok(nodes.list.innerHTML.includes('声卡选购') && !nodes.list.innerHTML.includes('筹备新专辑'), '按名字搜索');
     ui.setQuery(''); ui.last.list = '';
+  }
+
+  {
+    // 名字跟着项目组真正的开头走：开头掉出加载范围后，组名不变
+    const mk = (id, i, agent, extra) => Object.assign({ id, kind: 'chat', agent, status: 'ok', start: 9000 + i, display: '第' + i + '句', follows: i ? { type: 'call', id: 'c_l' + (i - 1) } : null, root: 'call:c_l0' }, extra || {});
+    const calls = [];
+    for (let i = 5; i < 50; i++) calls.push(mk('c_l' + i, i, 'gemini'));
+    ui.set({ agents, config, runs: [], calls, archived: [], names: { 'call:c_l0': '示例名' }, folders: { folders: [], of: {} } });
+    const g = ui.groups().projects.find(p => p.items.some(i => i.id === 'c_l20'));
+    assert.equal(g.id, 'call:c_l0', '组的键是真正的开头');
+    assert.equal(g.title, '示例名');
+    assert.equal(ui.longOf(g), 0, '一直跟同一位聊：自动压缩管，不提醒');
+    calls[30].agent = 'gpt';
+    ui.set({ agents, config, runs: [], calls: calls.slice(), archived: [], names: {}, folders: { folders: [], of: {} } });
+    const g2 = ui.groups().projects.find(p => p.items.some(i => i.id === 'c_l20'));
+    assert.equal(ui.longOf(g2), 45, '中间换过人：照常提醒');
+  }
+
+  {
+    // 对接人对话里用「单人」追问的一轮：仍算这段对话；打开对话时输入框切回对接人
+    const calls = [
+      { id: 'c_m1', kind: 'chat', agent: 'gpt', status: 'ok', start: 9100, display: '工作量什么意思' },
+      { id: 'c_m2', kind: 'ask', agent: 'claude', status: 'fail', start: 9101, display: '你误解了', follows: { type: 'call', id: 'c_m1' } },
+      { id: 'c_m3', kind: 'ask', agent: 'claude', status: 'ok', start: 9102, display: '单独问' }
+    ];
+    ui.set({ agents, config, runs: [], calls, archived: [], names: {}, folders: { folders: [], of: {} } });
+    const byId = id => ui.items().find(i => i.id === id);
+    assert.ok(ui.isChatLine(byId('c_m2')), '接在对接人对话后面的单人追问，仍在对话里显示');
+    assert.ok(!ui.isChatLine(byId('c_m3')), '真正单独的提问照旧');
+    ui.setMode('claude');
+    ui.select('call', 'c_m2');
+    assert.equal(ui.getMode(), 'chat', '打开对接人对话，输入框切回对接人');
+    ui.setMode('claude');
+    ui.select('call', 'c_m3');
+    assert.equal(ui.getMode(), 'claude', '单独提问不改模式');
+    ui.select(null);
   }
 
   console.log('ui groups: grouping, parent_call merge, solo split, expand/collapse, tasks, filter/search and xss escaping passed');

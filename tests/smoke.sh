@@ -26,6 +26,7 @@ python3 tests/test_panel_refresh.py
 python3 tests/test_council.py
 python3 tests/test_lan.py
 python3 tests/test_pressure.py
+python3 tests/test_write_guard.py
 python3 tests/test_effort.py
 python3 tests/test_side.py
 python3 tests/test_resume.py

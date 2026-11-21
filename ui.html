@@ -279,6 +279,21 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .fv-body img{max-width:100%;height:auto;border-radius:8px}
 .fv-body .fv-dir button{display:block;width:100%;text-align:left;padding:6px 8px;border-radius:6px}
 .fv-body .fv-dir button:hover{background:var(--hover)}
+.dsh-box{width:min(520px,100%);height:auto;max-height:min(82vh,100%)}
+.dsh-card{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:10px;background:var(--bg)}
+.dsh-hd{display:flex;align-items:center;gap:10px}
+.dsh-hd .dsh-meta{flex:1;min-width:0}
+.dsh-hd .dsh-name{font-weight:600;font-size:13.5px}
+.dsh-hd .dsh-pkg{font-size:11px;color:var(--faint);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.dsh-desc{font-size:12px;color:var(--muted);margin:4px 0 0}
+.dsh-opts{margin-top:10px;padding-top:8px;border-top:1px dashed var(--line);display:flex;flex-direction:column;gap:8px}
+.dsh-opt{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12.5px}
+.dsh-opt input[type="number"]{width:64px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--ink);font-size:12.5px;text-align:center}
+.dsh-more{margin-top:8px}
+.dsh-more summary{cursor:pointer;font-size:12.5px;color:var(--muted);padding:4px 0}
+.dsh-other{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.dsh-other:last-child{border-bottom:0}
+.ag-foot{display:flex;align-items:center;justify-content:space-between;gap:8px}
 @media(max-width:760px){.fview{padding:0}.fv-box{width:100%;height:100%;border-radius:0;padding-top:env(safe-area-inset-top)}.fv-acts .btn{min-height:36px;padding:4px 10px}}
 .sw-head{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line)}
 .sw-head .small{flex:1;margin:0}
@@ -351,8 +366,6 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
 .q .bal{font-size:12px;color:var(--muted)} .q .bal b{font-size:16px;color:var(--ink);margin-left:6px}
 .ag .err{margin-top:8px;font-size:12px;color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,transparent);padding:6px 8px;border-radius:8px;word-break:break-word}
 .box{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:12px 13px;margin-bottom:10px;font-size:13px}
-.box .l{display:flex;align-items:center;gap:8px;margin:6px 0}
-.box .l>span{color:var(--muted);flex:1}
 .box select,.box input[type=number]{padding:3px 6px;border-radius:7px;border:1px solid var(--line);background:var(--panel);width:128px}
 .small{font-size:12px;color:var(--faint);line-height:1.5}
 .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);background:var(--ink);color:var(--bg);padding:8px 16px;border-radius:10px;font-size:13px;opacity:0;pointer-events:none;transition:.2s;z-index:50;max-width:80vw}
@@ -370,7 +383,6 @@ pre.raw{margin:0;padding:10px 12px;background:var(--hover);border-radius:10px;wh
   .app{grid-template-columns:minmax(0,1fr)}
   .side{position:fixed;left:0;top:0;bottom:0;width:300px;z-index:20;transform:translateX(-100%);transition:transform .2s;box-shadow:var(--shadow)}
   body.side-open .side{transform:none} body.side-open .scrim{display:block}
-  .topbar .menu{display:inline-flex}
   .wrap{padding:18px 16px}.actbar{margin:0 -16px 16px;padding:8px 16px}.composer{padding:0 12px 12px}.sugs{grid-template-columns:1fr}
   .hero{padding-top:4vh}.hero h1{font-size:22px}
 }
@@ -529,6 +541,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 </div>
 <div class="scrim" data-act="closedrawers"></div>
 <div class="fview" id="fview" hidden role="dialog" aria-label="查看文件"><div class="fv-box"><div class="fv-head"><b id="fv-name"></b><span class="fv-acts" id="fv-acts"></span><button class="iconbtn" data-act="fv-close" aria-label="关闭">✕</button></div><div class="fv-path small" id="fv-path"></div><div class="fv-body scroll" id="fv-body"></div></div></div>
+<div class="fview" id="dshwin" hidden role="dialog" aria-label="DeepSeek 插件"><div class="fv-box dsh-box"><div class="fv-head"><b>DeepSeek 插件</b><button class="iconbtn" data-act="dsh-close" aria-label="关闭">✕</button></div><div class="fv-path small">管理 Hub 调用 ds（headless）时启用的插件和二级开关，改完即生效于下次提问。</div><div class="fv-body scroll" id="dsh-body"></div></div></div>
 <div class="sidewin" id="sidewin" hidden role="dialog" aria-label="旁问">
   <div class="sw-head"><b>旁问</b><p class="small">单独问个小问题，不进主线，也不打断团队</p><button class="iconbtn" data-act="sidewin" aria-label="关闭旁问">✕</button></div>
   <div class="sw-hist scroll" id="sw-hist"></div>
@@ -740,7 +753,7 @@ function items(){
     title:r.display || r.goal, follows:r.follows, fork:!!r.fork, council:r.mode === "council", pressure:!!r.pressure,
     agents:[r.planner].concat(r.tasks.filter(t => !t.skip_reason).map(t => t.agent), r.tasks.length > 1 ? [r.synthesizer] : []), rec:r});
   for (const c of S.calls) if (!c.run && !c.parent && c.kind !== "side") out.push({type:"call", id:c.id, start:c.start, end:c.end, status:c.status, error:c.error,
-    title:c.display || (c.kind === "image" && c.title) || c.prompt_preview, follows:c.follows, fork:!!c.fork, image:c.kind === "image",
+    title:c.display || (c.kind === "image" && c.title) || c.prompt_preview, follows:c.follows, fork:!!c.fork, image:c.kind === "image", pressure:!!c.pressure,
     agents:c.kind === "handoff" ? [] : [c.agent].concat((itemIndex.children.get(c.id) || []).map(x => x.agent)), rec:c});
   out.sort((a,b) => b.start - a.start);
   for (const i of out){
@@ -759,7 +772,8 @@ const uniq = a => a.filter((x,i) => x && a.indexOf(x) === i);
 const ARCH_ICON = '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true"><rect x="1.8" y="2.5" width="12.4" height="3.2" rx=".8"/><path d="M2.8 5.7v7a1 1 0 0 0 1 1h8.4a1 1 0 0 0 1-1v-7M6.3 8.6h3.4"/></svg>';
 const akey = i => i.type + ":" + i.id;
 const isArch = i => !!(S && S.archived && S.archived.indexOf(akey(i)) >= 0);
-const nameOf = i => (S && S.names && S.names[akey(i)]) || i.title;   // 自动起的或你改的名字，没有就用第一句话
+const rootKey = i => (i.rec && i.rec.root) || akey(i);   // 项目组真正的开头（可能早已不在加载的记录里）；名字、文件夹都记在它上面
+const nameOf = i => (S && S.names && (S.names[rootKey(i)] || S.names[akey(i)])) || i.title;   // 自动起的或你改的名字，没有就用第一句话
 function groupOf(it){            // 这条记录所在的项目组（或它自己这一条单独提问）
   if (!it) return null;
   const {projects, solos} = groups();
@@ -776,20 +790,18 @@ function groups(){
   const uf = {}, buckets = {};
   const find = x => { while (uf[x] && uf[x] !== x) x = uf[x] = uf[uf[x]] || uf[x]; return uf[x] || (uf[x] = x); };
   const union = (a, b) => { a = find(a); b = find(b); if (a !== b) uf[a] = b; };
+  const prevKey = i => i.type === "run" && i.rec.parent_call ? "call:" + i.rec.parent_call
+    : i.follows && i.follows.type && i.follows.id && !i.fork ? akey(i.follows) : null;
   for (const i of all){
-    const k = i.type + ":" + i.id;
-    find(k);
-    if (i.follows && i.follows.type && i.follows.id && !i.fork) union(k, i.follows.type + ":" + i.follows.id);   // 分叉另起一组
-    if (i.type === "run" && i.rec && i.rec.parent_call) union(k, "call:" + i.rec.parent_call);
-    if (i.type === "call" && i.rec && i.rec.dispatch && i.rec.dispatch.run) union(k, "run:" + i.rec.dispatch.run);
-    // 交接只是把结果抄一份过去：来源那组照旧留着，还能再交接给别的组
+    const key = akey(i), prev = i.follows && i.follows.type && i.follows.id && !i.fork && akey(i.follows);
+    if (prev) union(key, prev);
+    if (i.type === "run" && i.rec.parent_call) union(key, "call:" + i.rec.parent_call);
+    if (i.type === "call" && i.rec.dispatch && i.rec.dispatch.run) union(key, "run:" + i.rec.dispatch.run);
   }
   for (const i of all){
-    const r = find(i.type + ":" + i.id);
-    (buckets[r] || (buckets[r] = [])).push(i);
+    const root = find(akey(i));
+    (buckets[root] || (buckets[root] = [])).push(i);
   }
-  const prevKey = i => i.type === "run" && i.rec && i.rec.parent_call ? "call:" + i.rec.parent_call
-    : i.follows && i.follows.type && i.follows.id && !i.fork ? i.follows.type + ":" + i.follows.id : null;
   const projects = [], solos = [];
   for (const list of Object.values(buckets)){
     if (list.length === 1 && list[0].type === "call" && list[0].rec.kind !== "chat" && !list[0].fork){
@@ -823,18 +835,13 @@ function groups(){
     let runIt = null;
     for (let k = list.length - 1; k >= 0; k--) if (RUNNING[list[k].status]){ runIt = list[k]; break; }
     const runs = list.filter(i => i.type === "run");
-    const ags = [];
-    for (const i of list){
-      for (const a of i.agents) ags.push(a);
-      if (i.type === "run" && i.rec && i.rec.tasks) for (const t of i.rec.tasks) if (!t.skip_reason) ags.push(t.agent);
-    }
     projects.push({
-      id: first.type + ":" + first.id,
+      id: rootKey(first),
       title: nameOf(first),
       status: runIt ? runIt.status : latest.status,
       error: runIt ? runIt.error : latest.error,
-      agents: uniq(ags),
-      kind: (first.fork ? "⑂ 分叉 · " : "") + (runs.length ? (runs[runs.length - 1].council ? "会审" : runs[runs.length - 1].pressure ? "高压" : "协作") : "对话"),
+      agents: uniq(list.flatMap(i => i.agents)),
+      kind: (first.fork ? "⑂ 分叉 · " : "") + (runs.length ? (runs[runs.length - 1].council ? "会审" : runs[runs.length - 1].pressure ? "高压" : "协作") : list.some(x => x.pressure) ? "高压对话" : "对话"),
       count: list.reduce((n, i) => n + (i.type === "run" ? Math.max(1, (i.rec.tasks || []).length) : 1), 0),
       time: Math.max(...list.map(i => i.start)),
       archived: list.every(isArch),
@@ -938,15 +945,9 @@ function renderList(){
   const fh = fs.map(f => '<button class="chip' + (filter === f[0] ? " on" : "") + '" data-act="filter" data-v="' + f[0] + '">' + f[1] + "</button>").join("");
   if (fh !== last.filters){ $("filters").innerHTML = fh; last.filters = fh; }
   const wantArch = filter === "archived";       // 归档的平时不显示，只在「已归档」里出现
-  projects = projects.filter(g => g.archived === wantArch);
-  solos = solos.filter(i => isArch(i) === wantArch);
-  if (filter === "running"){
-    projects = projects.filter(g => RUNNING[g.status]);
-    solos = solos.filter(i => RUNNING[i.status]);
-  } else if (filter === "failed"){
-    projects = projects.filter(g => stInfo(g.status, g.error).k === "bad");
-    solos = solos.filter(i => stInfo(i.status, i.error).k === "bad");
-  }
+  const matchesStatus = i => filter === "running" ? RUNNING[i.status] : filter !== "failed" || stInfo(i.status, i.error).k === "bad";
+  projects = projects.filter(g => g.archived === wantArch && matchesStatus(g));
+  solos = solos.filter(i => isArch(i) === wantArch && matchesStatus(i));
   const q = (query || "").trim().toLowerCase();
   if (q){
     projects = projects.filter(g => (g.title || "").toLowerCase().indexOf(q) >= 0 || g.items.some(i => (i.title || "").toLowerCase().indexOf(q) >= 0));
@@ -970,15 +971,9 @@ function renderList(){
     fh2 += '</div>';
   }
   if (FD.folders.length || rp.length) h += '<div class="day fday" data-drop="">文件夹<button class="fnew" data-act="folder-new" title="新建一个文件夹，把项目组拖进去">＋ 新建</button></div>' + fh2;
-  if (rp.length){
-    h += '<div class="day" data-drop="">项目组</div>';
-    for (const g of rp) h += cardHtml(g);
-  }
-  if (rs.length){
-    h += '<div class="day" data-drop="">单独提问</div>';
-    for (const i of rs) h += soloHtml(i);
-  }
-  if (!projects.length && !solos.length && !FD.folders.length) h = keepBox() + '<div class="empty">' + (wantArch ? "还没有归档的记录<br>在记录详情顶上点「归档」就会收到这里" : items().length ? "没有符合条件的记录" : "还没有记录<br>在右边下一个任务试试") + "</div>";
+  if (rp.length) h += '<div class="day" data-drop="">项目组</div>' + rp.map(cardHtml).join("");
+  if (rs.length) h += '<div class="day" data-drop="">单独提问</div>' + rs.map(soloHtml).join("");
+  if (!projects.length && !solos.length && !FD.folders.length) h += '<div class="empty">' + (wantArch ? "还没有归档的记录<br>在记录详情顶上点「归档」就会收到这里" : items().length ? "没有符合条件的记录" : "还没有记录<br>在右边下一个任务试试") + "</div>";
   if (h !== last.list){ const st = $("list").scrollTop; $("list").innerHTML = h; $("list").scrollTop = st; last.list = h; ticks(); }
 }
 
@@ -995,7 +990,6 @@ function resetIn(ts){
 }
 function quotaHtml(a){
   const q = a.quota;
-  if (!q) return '<div class="q"><div class="qn">额度读取中…</div></div>';
   let h = '<div class="q">';
   if (q.windows && q.windows.length){
     for (const w of q.windows){
@@ -1034,20 +1028,10 @@ function phoneHtml(){            // 只在电脑上显示：打开局域网、�
 function modelSelect(a, i){
   const sp = a.chain[i];
   if (isRemote()) return '<div class="model-line"><span>' + (i ? '备用模型' : '干活用') + '</span><span>' + esc((((S && S.backends) || []).find(b => b.spec === sp) || {}).label || sp) + '</span></div>';
-  const all = i ? usable(S.backends || [{spec:sp, label:sp}], sp) : ownModels(a, sp);
-  let list = all;
-  if (!i){        // 首选模型：Gemini 同一系列只列一次，档位到下面「思考等级」里选
-    const curFam = (gemLevel(sp) || [])[1];
-    const rep = fam => {
-      if (fam === curFam) return sp;
-      const f = all.filter(o => (gemLevel(o.spec) || [])[1] === fam);
-      return (f.find(o => gemLevel(o.spec)[2] === "medium") || f[0]).spec;
-    };
-    list = all.filter(o => { const g = gemLevel(o.spec); return !g || rep(g[1]) === o.spec; });
-  }
+  const list = i ? usable(S.backends || [{spec:sp, label:sp}], sp) : familyModels(ownModels(a, sp), sp);
   const opts = list.map(o => {
     const label = o.spec === "codex" ? o.label.replace("GPT · 跟随 Codex 设置", "GPT · 沿用本机设置") : o.spec === "dsh" ? "DeepSeek" : !i && gemLevel(o.spec) ? gemFamily(o.label) : o.label;
-    return '<option value="' + esc(o.spec) + '"' + (o.spec === sp ? " selected" : "") + '>' + esc(label + (o.off ? "（已停用）" : "")) + '</option>';
+    return optionHtml(o.spec, label + (o.off ? "（已停用）" : ""), o.spec === sp);
   }).join("");
   return '<label class="model-line"><span>' + (i ? '备用模型' : '干活用') + '</span><select class="msel" aria-label="' + esc(a.name) + (i ? '备用模型' : '使用模型') + '" data-chain="' + esc(a.name) + ':' + i + '">' + opts + '</select></label>';
 }
@@ -1058,6 +1042,25 @@ const gemLevel = sp => (sp || "").startsWith("agy:") ? sp.slice(4).match(GEM_LV)
 const gemLabel = o => (String(o.label || "").match(/\(([^)]+)\)\s*$/) || [0, (gemLevel(o.spec) || [0, 0, o.spec])[2]])[1];   // 模型自己的写法，如 Medium
 const gemFamily = label => String(label || "").replace(/\s*\((Low|Medium|High|XHigh|Max)\)\s*$/i, "");
 const EFF_NOTE = {ultra: "（会自动分派子任务，最费额度）"};
+function familyModels(models, selected){
+  const current = (gemLevel(selected) || [])[1];
+  return models.filter(model => {
+    const level = gemLevel(model.spec);
+    if (!level) return true;
+    const family = level[1];
+    if (family === current) return model.spec === selected;
+    const siblings = models.filter(o => (gemLevel(o.spec) || [])[1] === family);
+    return model.spec === (siblings.find(o => gemLevel(o.spec)[2] === "medium") || siblings[0]).spec;
+  });
+}
+function familyLevels(models, family){
+  return models.filter(model => (gemLevel(model.spec) || [])[1] === family)
+    .sort((a, b) => GEM_ORDER.indexOf(gemLevel(a.spec)[2]) - GEM_ORDER.indexOf(gemLevel(b.spec)[2]));
+}
+function optionHtml(value, label, selected, title){
+  return '<option value="' + esc(value) + '"' + (selected ? " selected" : "") +
+    (title ? ' title="' + esc(title) + '"' : "") + '>' + esc(label) + '</option>';
+}
 function effortSelect(a){               // 卡片上的「思考等级」：沿用每个模型自己的档位名称和档位数
   const sp = a.chain[0] || "", kind = sp.split(":")[0], cfg = S.config || {};
   const line = inner => '<label class="model-line"><span>思考等级</span>' + inner + '</label>';
@@ -1065,13 +1068,12 @@ function effortSelect(a){               // 卡片上的「思考等级」：沿�
   if (kind === "agy"){
     const m = gemLevel(sp);
     if (!m) return text("这个模型不分档位");
-    const sib = usable(S.backends, sp).filter(b => { const x = gemLevel(b.spec); return x && x[1] === m[1]; })
-      .sort((x, y) => GEM_ORDER.indexOf(gemLevel(x.spec)[2]) - GEM_ORDER.indexOf(gemLevel(y.spec)[2]));
+    const sib = familyLevels(usable(S.backends, sp), m[1]);
     const cur = sib.find(b => b.spec === sp) || {spec: sp, label: ""};
     if (sib.length < 2) return text(gemLabel(cur) + "（只有这一档）");
     if (isRemote()) return text(gemLabel(cur));
     return line('<select class="msel" aria-label="' + esc(a.name) + '思考等级" data-gem="1" data-chain="' + esc(a.name) + ':0">' +
-      sib.map(b => '<option value="' + esc(b.spec) + '"' + (b.spec === sp ? " selected" : "") + '>' + esc(gemLabel(b)) + '</option>').join("") + '</select>');
+      sib.map(b => optionHtml(b.spec, gemLabel(b), b.spec === sp)).join("") + '</select>');
   }
   const be = (S.backends || []).find(b => b.spec === sp) || {};
   const levels = be.efforts || [];
@@ -1080,7 +1082,7 @@ function effortSelect(a){               // 卡片上的「思考等级」：沿�
     const def = kind === "codex" ? "默认" + (cfg.codex_effort_default ? "（本机设置：" + cfg.codex_effort_default + "）" : "（本机设置）") : "默认";
     if (isRemote()) return text(cur || def);
     return line('<select class="msel" aria-label="' + esc(a.name) + '思考等级" data-effort="' + esc(a.name) + '">' +
-      [{id: "", desc: ""}].concat(levels).map(e => '<option value="' + esc(e.id) + '"' + (e.id === cur ? " selected" : "") + (e.desc ? ' title="' + esc(e.desc) + '"' : "") + '>' + esc(e.id ? e.id + (EFF_NOTE[e.id] || "") : def) + '</option>').join("") + '</select>');
+      [{id: "", desc: ""}].concat(levels).map(e => optionHtml(e.id, e.id ? e.id + (EFF_NOTE[e.id] || "") : def, e.id === cur, e.desc)).join("") + '</select>');
   }
   return text(kind === "dsh" ? "DeepSeek 不支持调节" : "这个模型不支持调节");
 }
@@ -1092,7 +1094,7 @@ function ownModels(a, cur){              // 这位成员自家的模型（Claude
   return usable(S.backends || [], cur).filter(o => homeOf(o.spec) === k || o.spec === cur);
 }
 const TIER_LIST = [["chat", "对接", "当对接人跟你聊天时（不设就用干活的模型）"], ["think", "动脑", "定方案、审查、拍板、会审"], ["design", "审美", "排版、配色、界面视觉、挑图"], ["copy", "文案", "标题、广告语、对外文字、润色"]];
-const TIER_NAME = {work: "干活", think: "动脑", design: "审美", copy: "文案", chat: "对接", plan: "拆任务", synth: "汇总"};
+const TIER_NAME = {work: "干活", think: "动脑", design: "审美", copy: "文案", chat: "对接", plan: "拆任务", synth: "汇总", digest: "压缩"};
 function plannedSpec(agent, kind){       // 任务还没开工时，按成员卡片推算会用哪个模型
   const a = ((S && S.agents) || []).find(x => x.name === agent) || {chain: []};
   const th = (((S && S.config && S.config.tiers) || {})[kind] || {})[agent] || {};
@@ -1114,7 +1116,6 @@ function tierRow(a, tier, name, hint){  // 卡片上一行：某类活用的模�
   const th = (((S.config || {}).tiers || {})[tier] || {})[a.name] || {}, sp = th.spec || "", base = a.chain[0] || "";
   const use = sp || base, kind = kindOf(use);
   const lbl = o => o.spec === "codex" ? o.label.replace("GPT · 跟随 Codex 设置", "GPT · 沿用本机设置") : o.spec === "dsh" ? "DeepSeek" : o.label;
-  const opt = (v, t, on) => '<option value="' + esc(v) + '"' + (on ? " selected" : "") + '>' + esc(t) + '</option>';
   const sel = (what, attr, opts) => '<select class="msel" aria-label="' + esc(a.name + name + what) + '" ' + attr + '="' + esc(a.name) + '" data-tier="' + tier + '">' + opts + '</select>';
   const wrap = inner => '<label class="model-line" title="' + esc(name + "的活：" + hint) + '"><span>' + name + '</span>' + inner + '</label>';
   const mine = ownModels(a, sp), g = gemLevel(use);
@@ -1129,19 +1130,18 @@ function tierRow(a, tier, name, hint){  // 卡片上一行：某类活用的模�
       const sib = mine.filter(o => (gemLevel(o.spec) || [])[1] === f);
       return (sib.find(o => gemLevel(o.spec)[2] === g[2]) || sib.find(o => gemLevel(o.spec)[2] === "medium") || sib[0] || {spec: f}).spec;
     };
-    const sib = mine.filter(o => { const m = gemLevel(o.spec); return m && m[1] === g[1]; })
-      .sort((x, y) => GEM_ORDER.indexOf(gemLevel(x.spec)[2]) - GEM_ORDER.indexOf(gemLevel(y.spec)[2]));
-    return wrap(sel("模型", "data-tier-spec", opt("", "跟干活一样", !sp) +
-        fams.map(x => { const m = gemLevel(x.o.spec); return opt(m ? pick(m[1]) : x.o.spec, m ? gemFamily(x.o.label) : lbl(x.o), sp && (m ? m[1] === g[1] : x.o.spec === sp)); }).join("")) +
-      (sp && sib.length > 1 ? sel("档位", "data-tier-spec", sib.map(o => opt(o.spec, gemLabel(o), sp === o.spec)).join("")) : ""));
+    const sib = familyLevels(mine, g[1]);
+    return wrap(sel("模型", "data-tier-spec", optionHtml("", "跟干活一样", !sp) +
+        fams.map(x => { const m = gemLevel(x.o.spec); return optionHtml(m ? pick(m[1]) : x.o.spec, m ? gemFamily(x.o.label) : lbl(x.o), sp && (m ? m[1] === g[1] : x.o.spec === sp)); }).join("")) +
+      (sp && sib.length > 1 ? sel("档位", "data-tier-spec", sib.map(o => optionHtml(o.spec, gemLabel(o), sp === o.spec)).join("")) : ""));
   }
   const gfams = [];                      // 带档位的系列（如 Antigravity 里的 Claude）各列一次，选中后再出档位框
   mine.forEach(o => { const m = gemLevel(o.spec); if (m && !gfams.some(x => x[1] === m[1])) gfams.push([(mine.find(y => y.spec === "agy:" + m[1] + "-medium") || o).spec, m[1], gemFamily(o.label)]); });
-  let h = sel("模型", "data-tier-spec", opt("", "跟干活一样", !sp) + mine.filter(o => !gemLevel(o.spec)).map(o => opt(o.spec, lbl(o), o.spec === sp)).join("") +
-    gfams.map(x => opt(x[0], x[2], false)).join(""));
+  let h = sel("模型", "data-tier-spec", optionHtml("", "跟干活一样", !sp) + mine.filter(o => !gemLevel(o.spec)).map(o => optionHtml(o.spec, lbl(o), o.spec === sp)).join("") +
+    gfams.map(x => optionHtml(x[0], x[2], false)).join(""));
   const levels = ((S.backends || []).find(b => b.spec === use) || {}).efforts || [];
   if ((kind === "codex" || kind === "claude") && levels.length)
-    h += sel("档位", "data-tier-eff", [{id: "", desc: ""}].concat(levels).map(e => opt(e.id, e.id ? e.id + (EFF_NOTE[e.id] || "") : "档位同干活", e.id === (th.effort || ""))).join(""));
+    h += sel("档位", "data-tier-eff", [{id: "", desc: ""}].concat(levels).map(e => optionHtml(e.id, e.id ? e.id + (EFF_NOTE[e.id] || "") : "档位同干活", e.id === (th.effort || ""))).join(""));
   return wrap(h);
 }
 function tierRows(a){ return '<div class="small" style="margin-top:10px">按活儿换模型（不设就跟干活一样）</div>' + TIER_LIST.map(t => tierRow(a, t[0], t[1], t[2])).join(""); }
@@ -1162,23 +1162,18 @@ const findSide = id => { const c = S && S.calls.find(x => x.id === id && x.kind 
 function sideCtlHtml(st){
   const {a, kind, models, sp} = st;
   let h = '<span>谁来答</span><div class="two"><select data-sw="agent" aria-label="旁问成员">' + liveAgents().map(x => '<option value="' + esc(x.name) + '"' + (x.name === a.name ? " selected" : "") + '>' + esc(x.name) + '</option>').join("") + '</select>';
-  let list = models;
-  if (kind === "agy"){                  // Gemini 同系列只列一次，档位在右边选
-    const cur = (gemLevel(sp) || [])[1];
-    const rep = fam => { if (fam === cur) return sp; const f = models.filter(o => (gemLevel(o.spec) || [])[1] === fam); return (f.find(o => gemLevel(o.spec)[2] === "medium") || f[0]).spec; };
-    list = models.filter(o => { const g = gemLevel(o.spec); return !g || rep(g[1]) === o.spec; });
-  }
+  const list = kind === "agy" ? familyModels(models, sp) : models;
   h += '<select data-sw="spec" aria-label="旁问模型">' + list.map(o => '<option value="' + esc(o.spec) + '"' + (o.spec === sp ? " selected" : "") + '>' + esc(gemLevel(o.spec) ? gemFamily(o.label) : o.spec === "codex" ? "GPT · 沿用本机设置" : o.spec === "dsh" ? "DeepSeek" : o.label) + '</option>').join("") + '</select></div>';
   h += '<span>思考等级</span>';
   if (kind === "agy" && gemLevel(sp)){
-    const fam = gemLevel(sp)[1], sib = models.filter(b => (gemLevel(b.spec) || [])[1] === fam).sort((x, y) => GEM_ORDER.indexOf(gemLevel(x.spec)[2]) - GEM_ORDER.indexOf(gemLevel(y.spec)[2]));
-    h += sib.length > 1 ? '<select data-sw="spec" aria-label="旁问思考等级">' + sib.map(b => '<option value="' + esc(b.spec) + '"' + (b.spec === sp ? " selected" : "") + '>' + esc(gemLabel(b)) + '</option>').join("") + '</select>' : '<span>' + esc(gemLabel(models.find(b => b.spec === sp) || {spec: sp})) + '（只有这一档）</span>';
+    const sib = familyLevels(models, gemLevel(sp)[1]);
+    h += sib.length > 1 ? '<select data-sw="spec" aria-label="旁问思考等级">' + sib.map(b => optionHtml(b.spec, gemLabel(b), b.spec === sp)).join("") + '</select>' : '<span>' + esc(gemLabel(models.find(b => b.spec === sp) || {spec: sp})) + '（只有这一档）</span>';
   } else {
     const levels = (models.find(b => b.spec === sp) || {}).efforts || [];
     if (levels.length){
       const mine = ((S.config || {}).effort || {})[a.name];
       if (sideEffort && !levels.some(e => e.id === sideEffort)) sideEffort = "";
-      h += '<select data-sw="effort" aria-label="旁问思考等级"><option value="">跟成员设置一样（' + esc(mine || "默认") + '）</option>' + levels.map(e => '<option value="' + esc(e.id) + '"' + (e.id === sideEffort ? " selected" : "") + (e.desc ? ' title="' + esc(e.desc) + '"' : "") + '>' + esc(e.id + (EFF_NOTE[e.id] || "")) + '</option>').join("") + '</select>';
+      h += '<select data-sw="effort" aria-label="旁问思考等级"><option value="">跟成员设置一样（' + esc(mine || "默认") + '）</option>' + levels.map(e => optionHtml(e.id, e.id + (EFF_NOTE[e.id] || ""), e.id === sideEffort, e.desc)).join("") + '</select>';
     } else h += '<span>' + (kind === "dsh" ? "DeepSeek 不支持调节" : "这个模型不支持调节") + '</span>';
   }
   const cur = findItem(sel), fol = sideFollow && findSide(sideFollow.id);
@@ -1229,7 +1224,8 @@ async function sendSide(){
   const st = sideState();
   if (uploading("side")){ toast("图片还在上传，稍等一下"); return; }
   const body = {mode:"side", agent:st.a.name, text, web:sideWeb, spec:st.sp, cwd:""};
-  if (readyImgs("side").length) body.images = readyImgs("side");
+  const images = readyImgs("side");
+  if (images.length) body.images = images;
   if (sideEffort && st.kind !== "agy") body.effort = sideEffort;
   if (st.base){
     body.context = {type:st.base.type, id:st.base.id};
@@ -1277,13 +1273,12 @@ function bindImageInput(w, txtId, dropEl, fileId){
     if (files.some(f => /^image\//.test(f.type))){ e.preventDefault(); addImages(files, w); }
   });
   const el = dropEl();
-  if (!el || !el.addEventListener) return bindFile(w, fileId);
+  $(fileId).addEventListener("change", e => { addImages(e.target.files, w); e.target.value = ""; });
+  if (!el || !el.addEventListener) return;
   el.addEventListener("dragover", e => { if (e.dataTransfer && Array.from(e.dataTransfer.types || []).indexOf("Files") >= 0){ e.preventDefault(); el.classList.add("dropping"); } });
   el.addEventListener("dragleave", () => el.classList.remove("dropping"));
   el.addEventListener("drop", e => { el.classList.remove("dropping"); if (e.dataTransfer && e.dataTransfer.files.length){ e.preventDefault(); addImages(e.dataTransfer.files, w); } });
-  bindFile(w, fileId);
 }
-function bindFile(w, fileId){ $(fileId).addEventListener("change", e => { addImages(e.target.files, w); e.target.value = ""; }); }
 function modelListHtml(){              // 设置里的「可用模型」：勾掉的不出现在下拉框里，也不会被调用
   const kinds = [["agy", "Gemini（Antigravity 里只用 Gemini）"], ["codex", "GPT"], ["claude", "Claude"], ["dsh", "DeepSeek"]];
   const users = sp => S.agents.filter(a => a.chain[0] === sp).map(a => a.name + " 首选").concat(S.agents.filter(a => a.chain.indexOf(sp) > 0).map(a => a.name + " 备用"));
@@ -1300,9 +1295,11 @@ function modelListHtml(){              // 设置里的「可用模型」：勾�
 }
 function settingsHtml(){
   const cfg = S.config, hl = S.health || {results:{}};
+  const themeSelect = '<select id="theme">' + [["auto", "跟随系统"], ["light", "浅色"], ["dark", "深色"]]
+    .map(([value, label]) => optionHtml(value, label, value === theme)).join("") + '</select>';
   if (isRemote()) return '<h3>设置<button class="btn x" data-act="settings">返回团队</button></h3>' +
     '<section class="box"><h4>在手机上</h4><p>分工方式、模型、手机访问、登录这些设置只能在电脑上改，免得手机丢了被人乱改。</p>' +
-    '<div class="setting"><label><span>页面配色</span><select id="theme"><option value="auto"' + (theme === "auto" ? " selected" : "") + '>跟随系统</option><option value="light"' + (theme === "light" ? " selected" : "") + '>浅色</option><option value="dark"' + (theme === "dark" ? " selected" : "") + '>深色</option></select></label></div>' +
+    '<div class="setting"><label><span>页面配色</span>' + themeSelect + '</label></div>' +
     '<p class="small">想把 Hub 放到手机桌面：安卓 Chrome 点右上角 ⋮ →「添加到主屏幕」；iPhone Safari 点分享 →「添加到主屏幕」。</p></section>';
   const optA = v => S.agents.filter(a => !a.disabled || a.name === v).map(a => '<option' + (a.name === v ? " selected" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</option>').join("");
   const field = (name, control, help) => '<div class="setting"><label><span>' + name + '</span>' + control + '</label><p>' + help + '</p></div>';
@@ -1315,6 +1312,7 @@ function settingsHtml(){
     '<section class="box"><h4>分工方式</h4>' +
     roleField('谁来拆任务', 'planner', 'plan', '收到目标后，由它决定分几步、交给谁。建议日常用 Gemini，复杂目标再选更擅长规划的成员；拆任务也会花它的额度。下面可以单独选它拆任务时用的模型和档位，不设就跟它干活用的一样。') +
     roleField('谁来汇总', 'synthesizer', 'synth', '把大家的回答整理成一份结果；会审时由它比较共同点和分歧。建议用 Gemini；只有一个子任务时直接交回结果。下面可以单独选它汇总时用的模型和档位，不设就跟它干活用的一样（会审综合不设时用它的「动脑」档）。') +
+    roleField('谁来写压缩说明', 'handoff_by', 'digest', '点「🗜 压缩」或「⇢ 交接」时，由它把整组来往写成一份说明。要读完整组对话，内容多，建议用额度多的 Gemini。下面可以单独选它写说明时用的模型和档位，不设就跟它干活用的一样。') +
     field('谁参加会审', '<span class="council-pick">' + S.agents.map(a => '<label style="display:inline-flex;gap:4px;margin-right:10px' + (a.disabled ? ';opacity:.5' : '') + '"><input type="checkbox" data-council="' + esc(a.name) + '"' + ((cfg.council_agents || []).indexOf(a.name) >= 0 ? " checked" : "") + (a.disabled ? " disabled" : "") + '>' + esc(a.name + (a.disabled ? "（已停用）" : "")) + '</label>').join("") + '</span>', '会审时勾选的成员同时各自作答，互相看不到答案，再由汇总的人比较。默认 Gemini、GPT、DeepSeek；Claude 默认不参加，想让它参加就勾上。') +
     field('项目组自动起名', '<select data-cfg="auto_title"><option value=""' + (!cfg.auto_title ? " selected" : "") + '>不自动起名</option>' + liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (cfg.auto_title === a.name ? " selected" : "") + '>由 ' + esc(a.name) + ' 起名</option>').join("") + (cfg.auto_title && !liveAgents().some(a => a.name === cfg.auto_title) ? '<option value="' + esc(cfg.auto_title) + '" selected>由 ' + esc(cfg.auto_title) + ' 起名（已停用，现由 ' + esc(cfg.auto_title_live || '无人') + ' 代起）</option>' : '') + '</select>', '新的项目组做完后，请这位成员根据内容起个 4～12 字的短名字，每组只花一次很少的额度；你手动改过的名字不会被覆盖。随时可以在项目组上点 ✎ 重命名。' + (cfg.auto_title ? '<br><button class="btn" data-act="title-backfill" style="margin-top:6px">给已有的项目组起名</button>（归档的不起；每组花一次很少的额度）' : '')) +
     field('额度快用完的成员', '<select data-cfg="quota_guard" data-bool="1"><option value="1"' + (cfg.quota_guard !== false ? " selected" : "") + '>自动跳过（低于 15% 时）</option><option value="0"' + (cfg.quota_guard === false ? " selected" : "") + '>照样让他干活</option></select>', '只看 5 小时和本周额度读得到的成员（Gemini、GPT，以及走 Antigravity 的 Claude）。选「自动跳过」：低于 15% 时会审不叫他、排工不派给他、自动对接也不选他，避免把额度用光；选「照样让他干活」：不管剩多少都照常安排。') +
@@ -1329,8 +1327,8 @@ function settingsHtml(){
     '<button class="btn" data-act="quota">刷新额度</button><p class="small">重新读取剩余额度，不会增加额度，也不会发消息给 AI，不消耗模型额度。平时每 5 分钟自动读取；GPT 显示最近会话留下的数据。</p></section>' +
     '<section class="box"><h4>提醒与外观</h4>' +
     field('完成时通知我', '<button class="btn" data-act="notify">' + (notify ? '已开启，点击关闭' : '开启') + '</button>', '任务结束、你没在看它时提醒你。不花模型额度，建议开启；浏览器可能会请求通知权限。') +
-    field('页面配色', '<select id="theme"><option value="auto"' + (theme === "auto" ? " selected" : "") + '>跟随系统</option><option value="light"' + (theme === "light" ? " selected" : "") + '>浅色</option><option value="dark"' + (theme === "dark" ? " selected" : "") + '>深色</option></select>', '立即改变页面颜色。建议跟随系统，夜间也可以手动选深色。') + '</section>' +
-    '<section class="box"><h4>高压模式提示词</h4><p class="small">选「高压」方式下任务时，由 DeepSeek 拆任务并汇总；它拆任务之前会先读到下面这段话。写什么由你决定，留空就是普通的 DeepSeek 排工。</p>' +
+    field('页面配色', themeSelect, '立即改变页面颜色。建议跟随系统，夜间也可以手动选深色。') + '</section>' +
+    '<section class="box"><h4>高压模式提示词</h4><p class="small">选「高压」方式时，由 DeepSeek（ds）作为主导对接人与你直接对话并执行；首轮对接与派活排工前都会先读到下面这段话。写什么由你决定，留空就是普通的 ds 对接。</p>' +
     '<textarea id="pp" rows="8" style="width:100%;box-sizing:border-box;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line,#444);background:transparent;color:inherit;resize:vertical" placeholder="例如：每个子任务必须给出明确的交付物和截止时间……">' + esc(ppDraft !== null ? ppDraft : (cfg.pressure_prompt || "")) + '</textarea>' +
     '<p class="small" style="display:flex;justify-content:space-between;align-items:center;gap:8px"><span>' + (ppDraft !== null && ppDraft !== (cfg.pressure_prompt || "") ? "还没保存" : (cfg.pressure_prompt ? "已保存，" + (cfg.pressure_prompt.length) + " 字" : "目前是空的")) + '</span><button class="btn primary" data-act="pp-save">保存提示词</button></p></section>' +
     '<section class="box"><h4>检查与登录</h4><button class="btn" data-act="health"' + (hl.running ? ' disabled' : '') + '>' + (hl.running ? '检查中…' : '检查全部') + '</button><p class="small">给所有已配置模型（包括 Claude 和备用模型）发一条短消息，会花少量额度。只有遇到无法回答的问题时才建议检查。</p><p class="small">' + (hl.ts ? '上次检查：' + dayLabel(hl.ts) + ' ' + clock(hl.ts) : '还没检查过；不影响正常提问。') + '</p>' +
@@ -1370,7 +1368,8 @@ function renderRail(){
     const liveModels = uniq(S.calls.filter(c => c.agent === a.name && c.status === 'running').map(c => c.backend));
     if (liveModels.length) h += '<div class="small">正在使用：' + liveModels.map(sp => esc(((S.backends || []).find(b => b.spec === sp) || {}).label || sp)).join('、') + '</div>';
     h += modelSelect(a, 0) + effortSelect(a) + tierRows(a);
-    h += '<button class="detail-toggle" data-act="agent-details" data-agent="' + esc(a.name) + '" aria-expanded="' + expanded + '">' + (expanded ? '▾ 收起详情' : '▸ 详情') + '</button>';
+    h += '<div class="ag-foot"><button class="detail-toggle" data-act="agent-details" data-agent="' + esc(a.name) + '" aria-expanded="' + expanded + '">' + (expanded ? '▾ 收起详情' : '▸ 详情') + '</button>' +
+      (a.name === 'ds' && !isRemote() ? '<button class="detail-toggle" data-act="dsh-plugins" title="管理 DeepSeek (headless) 插件与二级开关">🧩 插件</button>' : '') + '</div>';
     if (expanded){
       h += '<div class="agent-detail">';
       for (const cur of a.current) h += '<div class="now live"><button data-act="goto" data-call="' + esc(cur.id) + '" data-run="' + esc(cur.run || '') + '">' + esc(cur.title || '任务') + '</button>' + tick(cur.start) + '</div>';
@@ -1414,7 +1413,7 @@ function need(type, id, sig){
   return d.data;
 }
 const callSig = c => c.rev ? c.rev + "|" + ((S.live || {})[c.id] || 0) : c.status + "|" + (c.secs || "") + "|" + (c.live || 0);
-const fallbackTag = (agent, backend, preferred) => {
+const fallbackTag = (backend, preferred) => {
   return preferred && backend && backend !== "-" && backend !== preferred ? '<span class="badge warn" title="首选 ' + esc(preferred) + ' 不可用">由后备顶替 · ' + esc(backend) + "</span>" : "";
 };
 function errHtml(msg, detail, partial, key){   // 报错：中文说明 + 可展开的技术细节 + 超时前写出的部分
@@ -1463,7 +1462,7 @@ function callRow(c, label){           // 一次调用（可展开看指令/回�
     body = '<div class="rb">' + body + subRows(c.id) + "</div>";
   }
   return '<div class="row' + (isOpen ? " open" : "") + '"><button class="rh" data-act="toggle" data-key="' + esc(key) + '">' +
-    '<span class="chev">▶</span>' + label + fallbackTag(c.agent, c.backend, c.preferred_backend) +
+    '<span class="chev">▶</span>' + label + fallbackTag(c.backend, c.preferred_backend) +
     (c.write ? '<span class="badge plain">可改文件</span>' : "") +
     '<span style="margin-left:auto;display:inline-flex;gap:8px;align-items:center">' + tick(c.start, c.end, c.secs) + icon(si.k) + "</span></button>" + body + "</div>";
 }
@@ -1606,6 +1605,25 @@ function liveBar(){                     // 页面最上方：现在所有在进�
   return '<div class="livebar"><b>进行中 ' + all.length + '</b>' + all.map(x => '<button class="chip running" data-act="select" data-type="' + x.type + '" data-id="' + esc(x.id) + '"><span class="dot" style="background:' + agc(x.agent) + '"></span>' +
     esc(x.agent) + '<span class="t">' + esc(x.t) + '</span><span class="s small" style="display:inline">' + esc(x.s) + "</span></button>").join("") + "</div>";
 }
+function taskCard(t, lite){
+  const key = "t:" + lite.id + ":" + t.id, isOpen = open.has(key) || (t.status === "running" && !closed.has(key)), si = t.status ? stInfo(t.status) : {k:"wait", t:"仅方案"};
+  let body = "";
+  if (isOpen){
+    copyStore[key + ":p"] = t.prompt; copyStore[key + ":a"] = t.answer;
+    body = '<div class="rb">' + (t.skip_reason ? '<div class="note">' + esc(t.skip_reason) + "</div>" : block("交给它的指令", t.prompt, key + ":p", false)) +
+      (t.answer && !t.skip_reason ? block("它的回答", t.answer, key + ":a", true) : t.status === "running" ? liveHtml(t.live, t.agent, key) : '<div class="small" style="margin-top:8px">' + (t.status === "pending" ? "还没开始。" : "没有产出。") + "</div>") +
+      (t.status === "fail" ? errHtml("", t.error_detail, t.partial, key) : "") +
+      sessHtml(t.session, key) + (t.call_id ? subRows(t.call_id) : "") + "</div>";
+  }
+  const nk = t.call_id ? kids(t.call_id).length : 0;
+  return step(t.agent, t.status === "running",
+    '<div class="row' + (isOpen ? " open" : "") + '"><button class="rh" data-act="toggle" data-key="' + esc(key) + '"><span class="chev">▶</span>' +
+    '<span class="who" style="color:' + agc(t.agent) + '">' + esc(t.agent) + '</span><span class="badge plain">' + esc(t.id) + '</span><span class="what">' + esc(t.title) + (t.skip_reason ? "：" + esc(t.skip_reason) : "") + "</span>" +
+    (t.depends_on && t.depends_on.length ? '<span class="badge plain">接 ' + esc(t.depends_on.join("、")) + "</span>" : "") +
+    (nk ? '<span class="badge plain">请了 ' + nk + " 次帮手</span>" : "") + fallbackTag(t.backend, t.preferred_backend) + (t.write ? '<span class="badge plain">可改文件</span>' : "") +
+    '<span style="margin-left:auto;display:inline-flex;gap:8px;align-items:center">' +
+    (t.status === "running" ? tick((S.calls.find(c => c.id === t.call_id) || {}).start || t.started || lite.start) : t.secs != null && t.status !== "skipped" ? '<span class="dur">' + (dur(t.secs) || "0秒") + "</span>" : "") + badge(si.k, si.t) + "</span></button>" + body + "</div>");
+}
 function viewRun(it){
   const lite = it.rec;
   const calls = S.calls.filter(c => c.run === lite.id);
@@ -1649,31 +1667,11 @@ function viewRun(it){
   h += '</div><div class="team-summary small">' + participants.length + ' 位成员参与' +
     (lite.tasks.length ? '，分工 ' + lite.tasks.length + ' 件（' + Object.entries(counts).map(([n,c]) => esc(n) + ' ×' + c).join('、') + '）。点任务卡片看指令和回答；带「接」的要等前一步完成。' : '，正在安排分工') + '</div>' +
     (tasks.length ? fold("board:" + lite.id, false, "共享进度板 <span class=\"small\" style=\"display:inline;font-weight:400\">· 每件的进度、原因和遗留</span>", boardHtml({...lite, tasks})) : "") + '<div class="task-grid">';
-  for (const t of tasks){
-    const key = "t:" + lite.id + ":" + t.id, isOpen = open.has(key) || (t.status === "running" && !closed.has(key)), si = t.status ? stInfo(t.status) : {k:"wait", t:"仅方案"};
-    const waiting = t.status === "pending" && t.depends_on && t.depends_on.length;
-    let body = "";
-    if (isOpen){
-      copyStore[key + ":p"] = t.prompt; copyStore[key + ":a"] = t.answer;
-      body = '<div class="rb">' + (t.skip_reason ? '<div class="note">' + esc(t.skip_reason) + "</div>" : block("交给它的指令", t.prompt, key + ":p", false)) +
-        (t.answer && !t.skip_reason ? block("它的回答", t.answer, key + ":a", true) : t.status === "running" ? liveHtml(t.live, t.agent, key) : '<div class="small" style="margin-top:8px">' + (t.status === "pending" ? "还没开始。" : "没有产出。") + "</div>") +
-        (t.status === "fail" ? errHtml("", t.error_detail, t.partial, key) : "") +
-        sessHtml(t.session, key) + (t.call_id ? subRows(t.call_id) : "") + "</div>";
-    }
-    const nk = t.call_id ? kids(t.call_id).length : 0;
-    h += step(t.agent, t.status === "running",
-      '<div class="row' + (isOpen ? " open" : "") + '"><button class="rh" data-act="toggle" data-key="' + esc(key) + '"><span class="chev">▶</span>' +
-      '<span class="who" style="color:' + agc(t.agent) + '">' + esc(t.agent) + '</span><span class="badge plain">' + esc(t.id) + '</span><span class="what">' + esc(t.title) + (t.skip_reason ? "：" + esc(t.skip_reason) : "") + "</span>" +
-      (waiting ? '<span class="badge plain">接 ' + esc(t.depends_on.join("、")) + "</span>" : t.depends_on && t.depends_on.length ? '<span class="badge plain">接 ' + esc(t.depends_on.join("、")) + "</span>" : "") +
-      (nk ? '<span class="badge plain">请了 ' + nk + " 次帮手</span>" : "") + fallbackTag(t.agent, t.backend, t.preferred_backend) + (t.write ? '<span class="badge plain">可改文件</span>' : "") +
-      '<span style="margin-left:auto;display:inline-flex;gap:8px;align-items:center">' +
-      (t.status === "running" ? tick((S.calls.find(c => c.id === t.call_id) || {}).start || t.started || lite.start) : t.secs != null && t.status !== "skipped" ? '<span class="dur">' + (dur(t.secs) || "0秒") + "</span>" : "") + badge(si.k, t.status ? si.t : "仅方案") + "</span></button>" + body + "</div>");
-  }
+  h += tasks.map(t => taskCard(t, lite)).join("");
   h += '</div><div class="steps">';
   // 汇总
-  const syn = synCalls;
-  if (syn.length || lite.status === "synthesizing")
-    h += step(lite.synthesizer || "gemini", lite.status === "synthesizing", syn.map(c => callRow(c, '<span class="who" style="color:' + agc(c.agent) + '">' + esc(c.agent) + '</span><span class="what">' + (council ? "比较共同点和分歧" : "汇总大家的结果") + '</span>')).join("") ||
+  if (synCalls.length || lite.status === "synthesizing")
+    h += step(lite.synthesizer || "gemini", lite.status === "synthesizing", synCalls.map(c => callRow(c, '<span class="who" style="color:' + agc(c.agent) + '">' + esc(c.agent) + '</span><span class="what">' + (council ? "比较共同点和分歧" : "汇总大家的结果") + '</span>')).join("") ||
       '<div class="row"><div class="rh"><span class="what">' + (council ? "比较共同点和分歧…" : "汇总大家的结果…") + '</span></div></div>');
   h += "</div>";
   const proc = h.slice(procStart);
@@ -1682,13 +1680,14 @@ function viewRun(it){
 }
 function viewCall(it){
   const c = it.rec, full = need("call", c.id, callSig(c)) || {};
-  let h = headHtml(it, '<span style="color:' + agc(c.agent) + ';font-weight:650">' + esc(c.agent) + "</span>" + fallbackTag(c.agent, c.backend, c.preferred_backend) + (c.write ? '<span class="badge plain">可改文件</span>' : ""));
+  const rawPrompt = full.prompt && full.display && full.prompt !== full.display;
+  let h = headHtml(it, '<span style="color:' + agc(c.agent) + ';font-weight:650">' + esc(c.agent) + "</span>" + fallbackTag(c.backend, c.preferred_backend) + (c.write ? '<span class="badge plain">可改文件</span>' : ""));
   const ks = kids(c.id);
-  if (ks.length || (full.attempts && full.attempts.length) || (full.prompt && full.display && full.prompt !== full.display)){
+  if (ks.length || (full.attempts && full.attempts.length) || rawPrompt){
     h += '<div class="sec">过程</div>';
     if (full.attempts && full.attempts.length) h += attemptsHtml(full.attempts);
     if (ks.length) h += '<div class="steps">' + ks.map(k => step(k.agent, k.status === "running", callRow(k, '<span class="who" style="color:' + agc(c.agent) + '">' + esc(c.agent) + '</span><span class="what">请 <b style="color:' + agc(k.agent) + '">' + esc(k.agent) + "</b> 帮忙：" + esc((k.prompt_preview || "").slice(0, 60)) + "</span>"))).join("") + "</div>";
-    if (full.prompt && full.display && full.prompt !== full.display){
+    if (rawPrompt){
       const key = "raw:" + c.id; copyStore[key] = full.prompt;
       h += '<div class="row' + (open.has(key) ? " open" : "") + '" style="margin-top:8px"><button class="rh" data-act="toggle" data-key="' + esc(key) + '"><span class="chev">▶</span><span class="what">实际发给它的完整指令</span></button>' +
         (open.has(key) ? '<div class="rb"><pre class="raw">' + esc(full.prompt) + "</pre></div>" : "") + "</div>";
@@ -1707,17 +1706,28 @@ function viewCall(it){
   return h;
 }
 const LONG_SOFT = 20, LONG_BAD = 40;
-const longOf = g => { try { return roundsTo(g.latest); } catch(e){ return 0; } };     // 一条追问链接了多少轮算长
-function roundsTo(it){                    // 从这条线开头数到这一轮，一共几轮
+const longOf = g => { try { return longRounds(g.latest); } catch(e){ return 0; } };     // 换过人的追问链接了多少轮算长
+function sinceCompact(it){                // 这条线从开头（压缩过就从最近一次压缩）到这一轮的几轮
   const ch = chainOf(it), base = it.type === "run" && it.rec.parent_call ? ch.find(i => i.type === "call" && i.id === it.rec.parent_call) : it;
   let k = ch.indexOf(base || it);
   if (k < 0) k = ch.length - 1;
-  let from = 0;                           // 压缩过的话，从最近一次压缩那里重新数
+  let from = 0;
   for (let j = k; j >= 0; j--) if (ch[j].rec && ch[j].rec.handoff && ch[j].rec.handoff.compact){ from = j; break; }
-  return k - from + 1;
+  return ch.slice(from, k + 1);
 }
-const LONG_WARN = n => n >= LONG_BAD ? "这条线已经接了 " + n + " 轮，回答会明显变慢、更费额度，早期定下的细节也容易被忘。可以点「🗜 压缩」把前面压成一份说明，接着在这一组做。"
-  : n >= LONG_SOFT ? "这条线已经接了 " + n + " 轮，开始变长了。一个阶段做完时，可以点「🗜 压缩」。" : "";
+// 一直跟同一位成员聊：它自己的会话长了会自动压缩，不用提醒。
+// 中间换过人或用过团队：每次换人都要把前面的来往当文字重新带一遍，这才需要手动压缩。
+function mixedLine(seg){
+  const who = new Set();
+  for (const i of seg){
+    if (i.type === "run" || (i.rec && i.rec.dispatch)) return true;
+    if (i.rec && i.rec.kind !== "handoff" && i.rec.agent && i.rec.agent !== "-") who.add(i.rec.agent);
+  }
+  return who.size > 1;
+}
+function longRounds(it){ const seg = sinceCompact(it); return mixedLine(seg) ? seg.length : 0; }
+const LONG_WARN = n => n >= LONG_BAD ? "这条线已经接了 " + n + " 轮，中间换过成员或用过团队。每次换人都要把前面的来往重新带一遍，会越来越慢、越费额度。可以点「🗜 压缩」把前面压成一份说明，接着在这一组做。"
+  : n >= LONG_SOFT ? "这条线已经接了 " + n + " 轮，中间换过成员或用过团队。一个阶段做完时，可以点「🗜 压缩」。" : "";
 function compactBtn(it){                // 原地压缩：前面的来往压成一份说明，之后只带它往后的
   const g = groupOf(it);
   if (!g || g.items.length < 3) return "";
@@ -1746,14 +1756,22 @@ function chainOf(it){                 // 一串连续追问：从最早一条到
   }
   return out;
 }
+// 对接人对话里中途用「单人」问的一轮，仍放在这段对话里显示，不另起一页（否则看着像前面的记录都没了）
+function isChatLine(it){
+  if (!it || it.type !== "call") return false;
+  if (it.rec.kind === "chat" || it.rec.kind === "handoff") return true;
+  if (it.rec.kind !== "ask" || !it.follows || it.fork) return false;
+  try { return chainOf(it).some(x => x.rec && (x.rec.kind === "chat" || x.rec.kind === "handoff")); } catch(e){ return false; }
+}
 function viewChat(it){                 // 主联络窗口：像聊天一样，只跟对接人说话
   const turns = chainOf(it);
-  let h = headHtml(it, '<span>和对接人的对话 · ' + turns.length + ' 轮</span>' + (it.rec.chat && it.rec.chat.write ? '<span class="badge plain">可改文件</span>' : "")) + '<div class="chat">';
+  const isPres = turns.some(t => t.rec && (t.rec.pressure || (t.rec.chat && t.rec.chat.pressure)));
+  let h = headHtml(it, '<span>' + (isPres ? '和 ds 主导对接的对话' : '和对接人的对话') + ' · ' + turns.length + ' 轮</span>' + (isPres ? '<span class="badge plain">高压</span>' : "") + (it.rec.chat && it.rec.chat.write ? '<span class="badge plain">可改文件</span>' : "")) + '<div class="chat">';
   for (const t of turns){
     const r = t.rec;
     if (r.kind === "handoff"){
-      const full = need("call", r.id, r.rev || "ok" + ((r.handoff || {}).digest || "")) || {}, hf = r.handoff || {}, key = "hand:" + r.id;
-      if (full.answer) copyStore[key] = full.answer;
+      const hf = r.handoff || {};
+      const full = need("call", r.id, r.rev || "ok" + (hf.digest || "")) || {};
       const dg = hf.digest === "running" && Date.now() / 1000 - (r.start || 0) < 1800 ? "正在把整组 " + (hf.rounds || "") + " 轮压缩成交接说明，好了会自动换上…"
         : hf.digest === "ok" ? "整组 " + (hf.rounds || "") + " 轮已压缩成交接说明" : hf.digest ? "整组压缩没成功（" + (hf.digest_error || "原因不明") + "），先用的是最近几轮的内容" : "";
       const cp = !!hf.compact;
@@ -1771,8 +1789,9 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
     }
     const full = r.kind === "chat" || r.kind === "ask" ? need("call", r.id, r.rev ? callSig(r) : callSig(r) + "|" + JSON.stringify(r.dispatch || {})) || {} : {};
     const ci = full.chat || r.chat || {};
-    h += '<div class="them" data-rt="call" data-rid="' + esc(r.id) + '"><div class="who" style="color:' + agc(r.agent) + '">' + esc(r.agent) + (callModel(r) ? '<span class="cmodel" title="这一轮实际用的模型"> · ' + esc(callModel(r)) + "</span>" : "") + (r.kind === "chat" ? " · 对接人" + (ci.mode === "manual" ? "（你指定）" : "（自动选）") : "") + (r.resumed ? '<span class="small" title="直接接着上一轮的原会话，没有重发前文，缓存命中更高"> · 续接原会话</span>' : "") + "</div>";
+    h += '<div class="them" data-rt="call" data-rid="' + esc(r.id) + '"><div class="who" style="color:' + agc(r.agent) + '">' + esc(r.agent) + (callModel(r) ? '<span class="cmodel" title="这一轮实际用的模型"> · ' + esc(callModel(r)) + "</span>" : "") + (r.kind === "chat" ? " · 对接人" + (ci.mode === "pressure" ? "（高压·ds 主导）" : ci.mode === "manual" ? "（你指定）" : "（自动选）") : r.kind === "ask" ? " · 单人" : "") + (r.resumed ? '<span class="small" title="直接接着上一轮的原会话，没有重发前文，缓存命中更高"> · 续接原会话</span>' : "") + "</div>";
     if (ci.handoff) h += '<div class="handoff">' + esc(ci.handoff) + "</div>";
+    if ((r.pressure || full.pressure) && !r.resumed && full.pressure_prompt) h += '<details class="note" style="margin:6px 0 8px"><summary>高压模式：ds 对接前读了你写的提示词（' + full.pressure_prompt.length + ' 字），点开查看</summary><div style="white-space:pre-wrap;margin-top:8px">' + esc(full.pressure_prompt) + '</div></details>';
     if (full.answer){ const key = "chat:" + r.id; copyStore[key] = full.answer; h += '<div class="md">' + md(full.answer) + '</div><div class="lab"><span></span><span><button class="copy" data-act="fork" data-type="call" data-id="' + esc(r.id) + '" title="带上到这一轮为止的对话，另开一条线">⑂ 从这里分叉</button><button class="copy" data-act="copy" data-key="' + esc(key) + '">复制</button></span></div>'; }
     else if (r.status === "running") h += liveHtml(full.live, r.agent, "chat:" + r.id);
     if (r.status === "fail" && !r.dispatch) h += errHtml(full.error || r.error || "没有回答", full.error_detail, full.partial, "chat:" + r.id);
@@ -1814,7 +1833,7 @@ function renderView(){
   let h;
   liveFragments = fragments;
   try {
-    h = it ? (it.type === "run" ? viewRun(it) : it.rec.kind === "chat" || it.rec.kind === "handoff" ? viewChat(it) : viewCall(it)) : viewNew();
+    h = it ? (it.type === "run" ? viewRun(it) : isChatLine(it) ? viewChat(it) : viewCall(it)) : viewNew();
   } finally {
     liveFragments = null;
   }
@@ -1846,7 +1865,7 @@ function renderView(){
     });
   }
   last.view = h; last.liveBar = bar; last.viewKey = key; last.viewLive = fragments;
-  const isChat = it && it.type === "call" && (it.rec.kind === "chat" || it.rec.kind === "handoff");
+  const isChat = it && it.type === "call" && isChatLine(it);
   v.scrollTop = isChat && (!keep || atEnd) ? v.scrollHeight : keep ? st : 0;
   syncActbar();
   ticks();
@@ -1856,7 +1875,7 @@ function renderView(){
 function renderComposer(){
   const ms = [["chat","对接人",""], ["run","自动分工",""], ["council","会审",""]].concat(!S || liveAgents().some(a => a.name === "ds") ? [["pressure","高压",""]] : []).concat(liveAgents().map(a => [a.name, a.name, agc(a.name)]), S && liveAgents().some(a => a.name === "gpt") ? [["image","画图",""]] : []);
   if (S && !ms.some(m => m[0] === mode)) mode = "chat";   // 恢复的草稿模式已不存在
-  let mh = ms.map(m => '<button class="' + (mode === m[0] ? "on" : "") + '" data-act="mode" data-v="' + esc(m[0]) + '">' + (m[2] ? '<i class="dot" style="background:' + m[2] + '"></i>' : "") + esc(m[1]) + "</button>").join("");
+  const mh = ms.map(m => '<button class="' + (mode === m[0] ? "on" : "") + '" data-act="mode" data-v="' + esc(m[0]) + '">' + (m[2] ? '<i class="dot" style="background:' + m[2] + '"></i>' : "") + esc(m[1]) + "</button>").join("");
   if (S && contact !== "auto" && !liveAgents().some(a => a.name === contact)) contact = "auto";   // 记住的人已经不在了或停用了
   const copts = '<option value="auto"' + (contact === "auto" ? " selected" : "") + '>对接人：自动</option>' +
     liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (contact === a.name ? " selected" : "") + '>对接人：' + esc(a.name) + "</option>").join("");
@@ -1871,7 +1890,7 @@ function renderComposer(){
       : "由 " + contact + " 对接：它自己答，或替你排工、开会审，结果交回这个对话")
     : mode === "run" ? cfg.planner + " 排工 → 分给多位成员一起做 → " + cfg.synthesizer + " 汇总"
     : mode === "council" ? councilHint(cfg, cq, cm)
-    : mode === "pressure" ? "高压：ds 读完你在设置里写的提示词后排工 → 分给多位成员一起做 → ds 汇总" + (cfg.pressure_prompt ? "" : "（提示词还没写，在 ⚙ 设置 → 高压模式提示词）")
+    : mode === "pressure" ? "高压（ds 主导对接）：由 ds 读完提示词后直接与你对话并执行；需要团队时由它派活并汇总" + (cfg.pressure_prompt ? "" : "（提示词还没写，在 ⚙ 设置 → 高压模式提示词）")
     : mode === "image" ? "由 gpt 生成图片，保存在 Hub 的图片目录" : a ? "只交给 " + mode + "：" + a.profile.split("。")[0] : "";
   $("wtog").style.display = mode === "image" ? "none" : "";
   $("dtog").style.display = mode === "image" || isRemote() ? "none" : "";
@@ -1893,7 +1912,7 @@ function renderComposer(){
     : it ? '<div class="ctx"><span>↩ 接着这条追问：' + esc((it.title || "").slice(0, 40)) + (partial ? "（上一轮还在做，只带上已完成的部分）" : "") + '</span><button data-act="noctx" title="不带上文，作为新任务">✕</button></div>'
     : back ? '<div class="ctx off"><span>作为新任务发送，不带上文</span><button data-act="yesctx" title="重新接着当前这条追问">↩ 改回接着追问</button></div>' : "";
   if (it && !forking){                    // 追问链太长：提醒另起一组
-    const n = roundsTo(it), w = LONG_WARN(n);
+    const n = longRounds(it), w = LONG_WARN(n);
     if (w){ const g = groupOf(it); contextHtml += '<div class="ctxwarn' + (n >= LONG_BAD ? " bad" : "") + '">' + esc(w) + (g && !RUNNING[chainEnd(g.latest).status] ? ' <button class="job" data-act="compact" data-key="' + esc(g.key) + '">🗜 现在压缩</button>' : "") + '</div>'; }
   }
   if (contextHtml !== last.context){ $("ctx").innerHTML = contextHtml; last.context = contextHtml; }
@@ -1909,6 +1928,14 @@ function councilHint(cfg, cq, cm){      // 和后端同样的规则：低额度�
   return "会审：" + ok.join("、") + " 各自独立作答 → " + synth + " 比较共同点和分歧（只读，不改文件）" + tail;
 }
 function autosize(){ const t = $("txt"); t.style.height = "auto"; t.style.height = Math.min(220, t.scrollHeight) + "px"; }
+function confirmRemoteSubmit(body, writeQuestion){
+  if (!isRemote()) return true;
+  body.cwd = "";
+  if (!body.write && body.mode !== "image") return true;
+  if (!confirm(body.mode === "image" ? "画图会在电脑上保存图片文件，确定吗？" : writeQuestion)) return false;
+  body.confirm_write = true;
+  return true;
+}
 async function send(){
   const text = $("txt").value.trim();
   if (!text || sending) return;
@@ -1918,16 +1945,15 @@ async function send(){
     cwd: typedCwd || (useCtx && cit.rec.cwd && cit.rec.cwd !== S.workspace ? cit.rec.cwd : ""), write: allowWrite && mode !== "image"};
   if (useCtx) body.context = ctx;
   if (useCtx && forking) body.fork = true;
+  // 在对接人对话里用「单人」接着问：改成「对接人：指定这位」，仍在同一段对话里接着聊，能续接会话、能派团队
+  if (useCtx && !forking && body.mode === "ask" && isChatLine(cit)){ body.mode = "chat"; body.agent = mode; }
   if (uploading("main")){ toast("图片还在上传，稍等一下"); return; }
-  if (readyImgs("main").length){
+  const images = readyImgs("main");
+  if (images.length){
     if (mode === "image"){ toast("画图暂时不支持参考图，先去掉图片"); return; }
-    body.images = readyImgs("main");
+    body.images = images;
   }
-  if (isRemote()) body.cwd = "";   // 手机上不能指定电脑上的目录
-  if ((body.write || body.mode === "image") && isRemote()){
-    if (!confirm(body.mode === "image" ? "画图会在电脑上保存图片文件，确定吗？" : "确定允许这次任务改动电脑上的文件吗？\n它会无人值守地新建、修改甚至覆盖工作目录里的文件。")) return;
-    body.confirm_write = true;
-  }
+  if (!confirmRemoteSubmit(body, "确定允许这次任务改动电脑上的文件吗？\n它会无人值守地新建、修改甚至覆盖工作目录里的文件。")) return;
   sending = true; $("send").disabled = true;
   try {
     beginSubmit();
@@ -1939,7 +1965,7 @@ async function send(){
     if (document.body.classList) document.body.classList.remove("copts");
     saveDraft();
     autosize();
-    toast("已交给" + (mode === "chat" ? "对接人" : mode === "run" ? "团队" : mode === "pressure" ? "高压团队" : mode === "council" ? "会审" : mode === "image" ? " gpt 画图" : " " + mode));
+    toast("已交给" + (mode === "chat" ? "对接人" : mode === "run" ? "团队" : mode === "pressure" ? " ds（高压对接）" : mode === "council" ? "会审" : mode === "image" ? " gpt 画图" : " " + mode));
     poll();
   } catch(e){ followLatest = false; toast("没发出去：" + e.message); }
   sending = false;
@@ -2047,6 +2073,49 @@ async function openFile(path, rec){
   b.scrollTop = 0;
   $("fview").hidden = false;
 }
+function renderDshPlugins(data){
+  const body = $("dsh-body");
+  if (!body) return;
+  let h = "";
+  for (const p of (data.plugins || [])){
+    const dis = !p.installed && !p.enabled;
+    h += '<div class="dsh-card"><div class="dsh-hd"><div class="dsh-meta"><div class="dsh-name">' + esc(p.title) +
+      '</div><div class="dsh-pkg">' + esc(p.name) + (p.installed ? '' : '（桌面版未安装）') + '</div></div>' +
+      '<label class="onoff" title="' + (p.enabled ? '关闭插件' : '开启并同步到 headless') + '"><input type="checkbox" data-dsh-bundle="' + esc(p.name) + '"' + (p.enabled ? ' checked' : '') + (dis ? ' disabled' : '') + '><i></i></label></div>' +
+      '<div class="dsh-desc">' + esc(p.desc) + '</div>';
+    if (p.enabled && p.options && p.options.length){
+      h += '<div class="dsh-opts">';
+      for (const o of p.options){
+        if (o.type === "bool"){
+          h += '<label class="dsh-opt"><span>' + esc(o.label) + '</span><span class="onoff"><input type="checkbox" data-dsh-opt="' + esc(p.name) + ':' + esc(o.key) + '"' + (o.value ? ' checked' : '') + '><i></i></span></label>';
+        } else {
+          h += '<label class="dsh-opt"><span>' + esc(o.label) + '</span><input type="number" min="' + (o.min || 1) + '" max="' + (o.max || 100) + '" value="' + esc(String(o.value)) + '" data-dsh-opt="' + esc(p.name) + ':' + esc(o.key) + '"></label>';
+        }
+      }
+      h += '</div>';
+    }
+    h += '</div>';
+  }
+  const others = data.others || [];
+  if (others.length){
+    h += '<details class="dsh-more"><summary>其他桌面版插件（' + others.length + '）</summary>';
+    for (const o of others){
+      h += '<div class="dsh-other"><span><code>' + esc(o.name) + '</code>' + (o.ui_only ? ' <span class="small">（桌面界面插件，不建议开）</span>' : '') + '</span>' +
+        '<label class="onoff"><input type="checkbox" data-dsh-bundle="' + esc(o.name) + '"' + (o.enabled ? ' checked' : '') + (!o.installed && !o.enabled ? ' disabled' : '') + '><i></i></label></div>';
+    }
+    h += '</details>';
+  }
+  body.innerHTML = h || '<p class="small">未检测到 dsh 配置。</p>';
+}
+async function openDshPlugins(){
+  $("dsh-body").innerHTML = '<p class="small">读取中…</p>';
+  $("dshwin").hidden = false;
+  try {
+    renderDshPlugins(await api("/api/dsh/plugins"));
+  } catch(err){
+    $("dsh-body").innerHTML = '<div class="note bad">' + esc(err.message) + '</div>';
+  }
+}
 function renderAwake(){
   const b = $("tb-awake"); if (!b || !b.classList || !S) return;
   b.classList.toggle("primary", !!S.awake);
@@ -2058,6 +2127,13 @@ function syncTabs(){
 }
 function select(type, id){
   sel = type ? {type, id} : null; ctx = sel; forking = false; handoffArm = null; followLatest = false; stopArm = null; clearTimeout(stopTimer);
+  // 打开的是对接人对话，输入框却停在「单人」：切回对接人（高压对话切回高压），免得追问不小心跑偏
+  const si = sel && findItem(sel);
+  if (si && isChatLine(si) && S){
+    const isPresLine = chainOf(si).some(x => x.rec && (x.rec.pressure || (x.rec.chat && x.rec.chat.pressure)));
+    if (isPresLine && (mode === "chat" || liveAgents().some(a => a.name === mode)) && liveAgents().some(a => a.name === "ds")){ mode = "pressure"; saveDraft(); }
+    else if (!isPresLine && liveAgents().some(a => a.name === mode)){ mode = "chat"; saveDraft(); }
+  }
   document.body.classList.remove("side-open", "rail-open"); syncTabs();
   renderList(); renderView(); renderComposer();
   if (sideOpen) renderSide();
@@ -2132,6 +2208,8 @@ document.addEventListener("click", async e => {
     else if (act === "yesctx"){ ctx = sel; renderComposer(); $("txt").focus(); }
     else if (act === "file"){ e.preventDefault(); const holder = el.closest("[data-rid]"); await openFile(el.dataset.path, holder ? {type: holder.dataset.rt, id: holder.dataset.rid} : fview.rec || sel); }
     else if (act === "fv-close"){ $("fview").hidden = true; }
+    else if (act === "dsh-plugins"){ await openDshPlugins(); }
+    else if (act === "dsh-close"){ $("dshwin").hidden = true; }
     else if (act === "fv-open"){ const r = await api("/api/open", Object.assign({what: "file", path: fview.path, reveal: el.dataset.reveal === "1"}, fview.rec && fview.rec.id ? {type: fview.rec.type, id: fview.rec.id} : {})); toast(r.revealed ? "已在访达中标出这个文件" : "已在电脑上打开"); }
     else if (act === "mopt"){ document.body.classList.toggle("copts"); last.modes = null; renderComposer(); }
     else if (act === "awake"){
@@ -2140,15 +2218,17 @@ document.addEventListener("click", async e => {
     }
     else if (act === "sidewin"){ sideOpen = !sideOpen; last.side = last.sideCtl = last.rail = ""; renderSide(); renderRail(); if (sideOpen) $("sw-txt").focus(); }
     else if (act === "side-send") await sendSide();
-    else if (act === "handoff-arm"){ handoffArm = handoffArm === el.dataset.id ? null : el.dataset.id; last.view = last.list = ""; renderView(); renderList(); }
+    else if (act === "handoff-arm" || act === "handoff-cancel"){
+      handoffArm = act === "handoff-arm" && handoffArm !== el.dataset.id ? el.dataset.id : null;
+      last.view = last.list = ""; renderView(); renderList();
+    }
     else if (act === "handoff-undo"){
       if (!confirm("撤销这次交接？这一组里的交接内容会去掉，之后追问不再带上它；来源那组不受影响。")) return;
       try { const r = await api("/api/handoff/undo", {id: el.dataset.id}); toast("已撤销交接"); await poll(); if (r.back) select(r.back.type, r.back.id); else select(null); }
       catch (e){ toast(e.message || "撤销失败"); }
     }
-    else if (act === "handoff-cancel"){ handoffArm = null; last.view = last.list = ""; renderView(); renderList(); }
     else if (act === "compact"){
-      const {projects, solos} = groups(), pg = projects.find(p => p.id === el.dataset.key);
+      const pg = groups().projects.find(p => p.id === el.dataset.key);
       if (!pg) return;
       const end = chainEnd(pg.latest);
       if (!confirm("把「" + (pg.title || "这一组") + "」前面的 " + pg.items.length + " 件来往压成一份说明？\n要一两分钟，压好自动换上。之后在这一组接着问，只带这份说明和后面的几轮。原来的记录都还在，也可以撤销。")) return;
@@ -2167,8 +2247,10 @@ document.addEventListener("click", async e => {
     else if (act === "folder-del"){
       if (confirm("删掉文件夹「" + (el.dataset.name || "") + "」？里面的项目组会放回外面，记录不会删。")){ try { await api("/api/folders", {op: "delete", id: el.dataset.id}); toast("文件夹已删，里面的项目组放回外面了"); } catch(err){ toast(err.message); } last.list = ""; poll(); }
     }
-    else if (act === "folder-pick"){ folderArm = folderArm === el.dataset.key ? null : el.dataset.key; last.list = ""; renderList(); }
-    else if (act === "folder-cancel"){ folderArm = null; last.list = ""; renderList(); }
+    else if (act === "folder-pick" || act === "folder-cancel"){
+      folderArm = act === "folder-pick" && folderArm !== el.dataset.key ? el.dataset.key : null;
+      last.list = ""; renderList();
+    }
     else if (act === "rename"){
       const v = prompt("给它起个名字（清空就恢复成自动的名字）", el.dataset.name || "");
       if (v === null) return;
@@ -2237,17 +2319,11 @@ document.addEventListener("click", async e => {
       if (!text && it.type === "call"){ const full = await api("/api/call?id=" + encodeURIComponent(r.id)); text = full.display || full.prompt; }
       if (!text) throw new Error("找不到原始指令，没法重新执行");
       const body = it.type === "run" ? (r.mode === "council" ? Object.assign({mode:"council", text, cwd:r.cwd}, (r.participants || []).length >= 2 ? {agents:r.participants} : {}, r.synthesizer ? {synthesizer:r.synthesizer} : {}) : {mode:r.pressure ? "pressure" : "run", text, cwd:r.cwd, write:!!r.write})
-        : r.kind === "chat" ? {mode:"chat", agent:(r.chat && r.chat.mode === "manual") ? r.agent : "auto", text, cwd:r.cwd, write:!!(r.chat && r.chat.write)}
+        : r.kind === "chat" ? (r.pressure || (r.chat && r.chat.pressure) ? {mode:"pressure", text, cwd:r.cwd, write:!!(r.chat && r.chat.write)} : {mode:"chat", agent:(r.chat && r.chat.mode === "manual") ? r.agent : "auto", text, cwd:r.cwd, write:!!(r.chat && r.chat.write)})
         : {mode:r.kind === "image" ? "image" : "ask", agent:r.agent, text, cwd:r.cwd, write:!!r.write};
       if (r.follows) body.context = r.follows;
       if (r.follows && r.fork) body.fork = true;
-      if (isRemote()){
-        body.cwd = "";
-        if (body.write || body.mode === "image"){
-          if (!confirm(body.mode === "image" ? "画图会在电脑上保存图片文件，确定吗？" : "这条原本允许改文件，重新执行也会改动电脑上的文件，确定吗？")) return;
-          body.confirm_write = true;
-        }
-      }
+      if (!confirmRemoteSubmit(body, "这条原本允许改文件，重新执行也会改动电脑上的文件，确定吗？")) return;
       beginSubmit();
       const accepted = await api("/api/submit", body);
       if (followLatest) pendingSubmission = accepted.submission_id;
@@ -2274,12 +2350,6 @@ document.addEventListener("change", async e => {
   const el = e.target;
   if (el.id === "contact"){ contact = el.value; localStorage.setItem("hub.contact", contact); last.modes = ""; renderComposer(); return; }
   if (el.id === "theme"){ theme = el.value; el.blur(); last.rail = ""; localStorage.setItem("hub.theme", theme); applyTheme(); return; }
-  if (el.dataset && el.dataset.chain){
-    const p = el.dataset.chain.split(":");
-    try { await api("/api/config", {chain:{agent:p[0], index:+p[1], spec:el.value}}); toast(el.dataset.gem ? p[0] + " 的思考等级已改成「" + el.options[el.selectedIndex].text + "」，下次干活生效" : p[0] + " 的" + (+p[1] ? "后备" : "首选") + "已换成 " + el.options[el.selectedIndex].text); el.blur(); last.rail = ""; poll(); }
-    catch(err){ toast(err.message); el.blur(); last.rail = ""; poll(); }
-    return;
-  }
   if (el.dataset && el.dataset.folderMove !== undefined){ el.blur(); folderMove([el.dataset.folderMove], el.value); return; }
   if (el.dataset && el.dataset.handoff && el.value){
     const {projects, solos} = groups(), key = el.dataset.handoff;
@@ -2309,27 +2379,32 @@ document.addEventListener("change", async e => {
     else if (k === "web") sideWeb = el.checked;
     el.blur(); last.sideCtl = ""; renderSide(); return;
   }
-  if (el.dataset && (el.dataset.tierSpec || el.dataset.tierEff)){
-    const who = el.dataset.tierSpec || el.dataset.tierEff, tier = el.dataset.tier, nm = TIER_NAME[tier] || tier;
-    const body = {[tier]: el.dataset.tierSpec ? {agent: who, spec: el.value} : {agent: who, effort: el.value}};
-    try { await api("/api/config", body); toast(who + " 做" + nm + "的活时" + (el.dataset.tierSpec ? "用的模型" : "的档位") + "已改成「" + el.options[el.selectedIndex].text + "」，下次生效"); }
-    catch(err){ toast(err.message); }
-    el.blur(); last.rail = ""; poll(); return;
-  }
-  if (el.dataset && el.dataset.effort){
-    try { await api("/api/config", {effort:{agent:el.dataset.effort, level:el.value}}); toast(el.dataset.effort + " 的思考等级已改成「" + el.options[el.selectedIndex].text + "」，下次干活生效"); }
-    catch(err){ toast(err.message); }
-    el.blur(); last.rail = ""; poll(); return;
-  }
-  if (el.dataset && el.dataset.council){
-    const picked = Array.from(document.querySelectorAll("[data-council]")).filter(x => x.checked).map(x => x.dataset.council);
-    try { await api("/api/config", {council_agents: picked}); toast("会审成员已保存"); } catch(err){ toast(err.message); }
-    last.rail = ""; poll(); return;
-  }
-  if (el.dataset && el.dataset.cfg){
-    const v = el.dataset.bool ? el.value === "1" : el.type === "number" ? Math.round(parseFloat(el.value) * (parseFloat(el.dataset.scale) || 1)) : el.value;
-    try { await api("/api/config", {[el.dataset.cfg]: v}); toast("已保存"); el.blur(); last.rail = ""; poll(); } catch(err){ toast(err.message); el.blur(); last.rail = ""; poll(); }
-  }
+  const data = el.dataset || {};
+  let body, saved;
+  if (data.chain){
+    const [agent, index] = data.chain.split(":");
+    body = {chain:{agent, index:+index, spec:el.value}};
+    saved = () => data.gem ? agent + " 的思考等级已改成「" + el.options[el.selectedIndex].text + "」，下次干活生效"
+      : agent + " 的" + (+index ? "后备" : "首选") + "已换成 " + el.options[el.selectedIndex].text;
+  } else if (data.tierSpec || data.tierEff){
+    const who = data.tierSpec || data.tierEff, tier = data.tier, name = TIER_NAME[tier] || tier;
+    body = {[tier]: {agent:who, [data.tierSpec ? "spec" : "effort"]:el.value}};
+    saved = () => who + " 做" + name + "的活时" + (data.tierSpec ? "用的模型" : "的档位") + "已改成「" + el.options[el.selectedIndex].text + "」，下次生效";
+  } else if (data.effort){
+    body = {effort:{agent:data.effort, level:el.value}};
+    saved = () => data.effort + " 的思考等级已改成「" + el.options[el.selectedIndex].text + "」，下次干活生效";
+  } else if (data.council){
+    body = {council_agents: [...document.querySelectorAll("[data-council]")].filter(x => x.checked).map(x => x.dataset.council)};
+    saved = () => "会审成员已保存";
+  } else if (data.cfg){
+    const value = data.bool ? el.value === "1" : el.type === "number" ? Math.round(parseFloat(el.value) * (parseFloat(data.scale) || 1)) : el.value;
+    body = {[data.cfg]: value};
+    saved = () => "已保存";
+  } else return;
+  try { await api("/api/config", body); toast(saved()); }
+  catch(err){ toast(err.message); }
+  if (!data.council) el.blur();
+  last.rail = ""; poll();
 });
 ["mousedown", "keydown", "input"].forEach(ev => $("rail").addEventListener(ev, e => {
   if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") railBusyUntil = Date.now() + 8000;
@@ -2342,7 +2417,37 @@ function saveDraft(){   // 草稿只存在当前窗口；不保存「允许改�
 }
 $("txt").addEventListener("input", () => { autosize(); saveDraft(); $("send").disabled = sending || !$("txt").value.trim(); });
 $("fview").addEventListener("click", e => { if (e.target === $("fview")) $("fview").hidden = true; });
-document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("fview").hidden) $("fview").hidden = true; });
+if ($("dshwin")){
+  $("dshwin").addEventListener("click", e => { if (e.target === $("dshwin")) $("dshwin").hidden = true; });
+  $("dshwin").addEventListener("change", async e => {
+    const t = e.target;
+    if (!t || !t.dataset) return;
+    try {
+      if (t.dataset.dshBundle){
+        const r = await api("/api/dsh/plugins", {action: "toggle_bundle", name: t.dataset.dshBundle, on: !!t.checked});
+        renderDshPlugins(r);
+        toast(t.checked ? "已开启 " + t.dataset.dshBundle + "，下次提问生效" : "已关闭 " + t.dataset.dshBundle);
+      } else if (t.dataset.dshOpt){
+        const idx = t.dataset.dshOpt.indexOf(":");
+        const plugin = t.dataset.dshOpt.slice(0, idx), key = t.dataset.dshOpt.slice(idx + 1);
+        const value = t.type === "checkbox" ? !!t.checked : parseInt(t.value, 10);
+        if (t.type !== "checkbox" && !Number.isFinite(value)) return;
+        const r = await api("/api/dsh/plugins", {action: "set_option", plugin, key, value});
+        renderDshPlugins(r);
+        toast("已保存，下次提问生效");
+      }
+    } catch(err){
+      toast(err.message);
+      openDshPlugins();
+    }
+  });
+}
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape"){
+    if (!$("fview").hidden) $("fview").hidden = true;
+    if ($("dshwin") && !$("dshwin").hidden) $("dshwin").hidden = true;
+  }
+});
 $("txt").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)){ e.preventDefault(); send(); } });
 bindImageInput("main", "txt", () => document.querySelector && document.querySelector(".cbox"), "file-main");
 bindImageInput("side", "sw-txt", () => $("sidewin"), "file-side");

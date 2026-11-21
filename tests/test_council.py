@@ -217,9 +217,9 @@ class CouncilTests(Base):
         self.assertIn('主力干活', cfg['profiles']['gemini'])
         self.assertEqual(cfg['profiles']['gpt'], '我自己写的')
 
-    def test_plan_prompt_is_scheduling_and_simple_stays_single(self):
+    def test_plan_prompt_documents_task_format(self):
         p = self.g['PLAN_PROMPT']
-        for word in ('排工', '只排 1 个任务', '审查', 'eta_min', '{quota_rule}'):
+        for word in ('JSON', 'eta_min', 'depends_on', 'write', '{quota_rule}'):
             self.assertIn(word, p)
 
     def test_quota_guard_switch(self):
@@ -400,13 +400,12 @@ class ReviewFixTests(Base):
         m = R.match('【派活】自动分工：做点事')
         self.assertEqual((m.group('how'), m.group('who'), m.group('goal')), ('自动分工', None, '做点事'))
 
-    def test_council_board_says_cap_is_not_target(self):
+    def test_board_describes_independent_review_and_keeps_report_format(self):
         txt = self.g['board_text']({'id': 'x', 'goal': 'g', 'timeout': 900, 'tasks': [{'id': 'm1', 'agent': 'gemini', 'title': 't', 'status': 'running'}]}, 'm1', False)
-        self.assertIn('必须先亲自打开看过', txt)
+        self.assertIn('独立作答', txt)
         txt = self.g['board_text']({'id': 'x', 'goal': 'g', 'timeout': 900, 'tasks': [{'id': 't1', 'agent': 'gemini', 'title': 't', 'status': 'running', 'eta_min': 6}]}, 't1')
-        self.assertIn('预计 6 分钟能做完', txt)
-        self.assertIn('卡住停下', txt)
-        self.assertNotIn('硬上限', txt)
+        self.assertIn('预计 6 分钟', txt)
+        self.assertEqual([line.split('】')[0] for line in txt.splitlines()[-2:]], ['【进度', '【遗留'])
 
     def test_explicit_members_not_filled(self):
         rc, run, _ = self.council(Fake({}), members=['gemini'])

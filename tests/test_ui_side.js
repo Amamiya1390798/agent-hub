@@ -8,12 +8,13 @@ const posts=[];
 const ctx={document:{getElementById:node,addEventListener(){},documentElement:{dataset:{}},querySelectorAll(){return []},body:{classList:{add(){},remove(){},toggle(){},contains(){return false}}}},window:{},localStorage:{getItem(){return null},setItem(){}},sessionStorage:{getItem(){return null},setItem(){},removeItem(){}},addEventListener(){},matchMedia:()=>({matches:false,addEventListener(){}}),setInterval(){},setTimeout:()=>1,clearTimeout(){},getSelection:()=>null,fetch:()=>new Promise(()=>{})};
 vm.createContext(ctx);
 vm.runInContext(source.replace('schedulePoll(0); setInterval(ticks, 1000);',
-  'globalThis.ui={set:s=>S=s,items,renderSide,sideCtlHtml,sideState,renderComposer,open:v=>{sideOpen=v;},setSel:v=>{sel=v;ctx=v;},setCtx:v=>{ctx=v;},setSide:o=>{if("base" in o)sideBase=o.base;if("follow" in o)sideFollow=o.follow;if("agent" in o)sideAgent=o.agent;if("effort" in o)sideEffort=o.effort;},api:f=>{api=f;},sendSide,last,groups,chainOf,findItem,send,fork:(t,i)=>{ctx={type:t,id:i};forking=true;},isForking:()=>forking,setScope:v=>{sideScope=v;},pendImgs,thumbsHtml,viewChat,handPicker,setArm:v=>{handoffArm=v;}};'),ctx);
+  'globalThis.ui={set:s=>S=s,setMode:v=>{mode=v;},items,renderSide,sideCtlHtml,sideState,renderComposer,open:v=>{sideOpen=v;},setSel:v=>{sel=v;ctx=v;},setCtx:v=>{ctx=v;},setSide:o=>{if("base" in o)sideBase=o.base;if("follow" in o)sideFollow=o.follow;if("agent" in o)sideAgent=o.agent;if("effort" in o)sideEffort=o.effort;},api:f=>{api=f;},sendSide,last,groups,chainOf,findItem,send,fork:(t,i)=>{ctx={type:t,id:i};forking=true;},isForking:()=>forking,setScope:v=>{sideScope=v;},pendImgs,thumbsHtml,viewChat,handPicker,setArm:v=>{handoffArm=v;}};'),ctx);
 const agents=[{name:'gemini',chain:['agy:gemini-4-carbon-medium'],profile:'x'},{name:'gpt',chain:['codex'],profile:'x'},{name:'ds',chain:['dsh'],profile:'x'}];
 const backends=['low','medium','high'].map(l=>({spec:'agy:gemini-4-carbon-'+l,label:'Gemini 4 Carbon ('+l[0].toUpperCase()+l.slice(1)+')'}))
   .concat([{spec:'codex',label:'GPT',efforts:[{id:'low',desc:''},{id:'ultra',desc:''}]},{spec:'codex:gpt-6-luna',label:'Luna',efforts:[{id:'low',desc:''}]},{spec:'dsh',label:'DS'}]);
 const calls=[
   {id:'c_main',kind:'ask',agent:'gemini',status:'ok',start:10,end:12,display:'主线问题',cwd:'/w'},
+  {id:'c_chat1',kind:'chat',agent:'gpt',status:'ok',start:5,end:6,display:'对接人聊天',cwd:'/w',chat:{mode:'auto'}},
   {id:'c_side1',kind:'side',agent:'gpt',backend:'codex',status:'ok',start:20,end:25,display:'旁问一下',follows:{type:'call',id:'c_main'},side:{web:true,effort:'low'}},
 ];
 ctx.ui.set({agents,backends,calls,runs:[],config:{effort:{gpt:'low'}},workspace:'/w',health:{results:{}}});
@@ -82,6 +83,12 @@ assert.ok(/value="follow" selected>接着旁问：旁问一下/.test(h));
   posts.length=0; nodes.txt.value='分叉里说的话';
   await ctx.ui.send();
   assert.equal(posts[0][1].fork,true); assert.deepEqual(posts[0][1].context,{type:'call',id:'c_main'});
+  // 在对接人对话里切到「单人 · claude」发：改成对接人（指定 claude），还在这段对话里
+  ctx.ui.setSel({type:'call',id:'c_chat1'}); ctx.ui.setMode('claude');
+  posts.length=0; nodes.txt.value='你误解了';
+  await ctx.ui.send();
+  assert.deepEqual({mode:posts[0][1].mode,agent:posts[0][1].agent,context:posts[0][1].context},{mode:'chat',agent:'claude',context:{type:'call',id:'c_chat1'}});
+  ctx.ui.setMode('chat');
   assert.equal(ctx.ui.isForking(),false,'发完就不再是分叉状态');
   // 贴图：发送时带上已上传的图，上传中的不带；记录里显示缩略图
   ctx.ui.pendImgs.side.push({id:'att-20261115-010101-aaaaaaaa.png'});

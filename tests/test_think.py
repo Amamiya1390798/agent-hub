@@ -121,10 +121,10 @@ class Think(unittest.TestCase):
         src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "hub"), encoding="utf-8").read()
         self.assertIn('tier="synth", meta={"run": run_id, "kind": "synth"', src)
 
-    def test_chat_prompt_states_permission(self):
-        P = self.g["CHAT_PROMPT"]
-        self.assertIn("{perm_note}", P)
-        self.assertIn("跑几条命令核查", P)
+    def test_chat_prompt_shows_both_dispatch_modes(self):
+        prompt = self.g["CHAT_PROMPT"]
+        self.assertIn("【派活】自动分工：", prompt)
+        self.assertIn("【派活】会审：", prompt)
 
 
 if __name__ == "__main__":
