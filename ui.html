@@ -2405,7 +2405,7 @@ document.addEventListener("change", async e => {
     } catch(err){ toast(err.message || "没交接成功"); el.value = ""; }
     return;
   }
-  if (el.dataset && "gadd" in el.dataset){ if (el.value){ groupSeats = seatsOf().concat([JSON.parse(el.value)]); last.gopts = ""; renderComposer(); } return; }
+  if (el.dataset && "gadd" in el.dataset){ if (el.value){ groupSeats = seatsOf().concat([JSON.parse(el.value)]); el.blur(); last.gopts = ""; renderComposer(); } return; }
   if (el.dataset && "grounds" in el.dataset){ groupRounds = +el.value || 3; return; }
   if (el.dataset && (el.dataset.agentOn || el.dataset.model)){
     const body = el.dataset.agentOn ? {agent_enabled: {agent: el.dataset.agentOn, on: el.checked}} : {model_enabled: {spec: el.dataset.model, on: el.checked}};
