@@ -56,6 +56,19 @@ assert.ok(st.includes('现在少于 15 分钟'));
 const nv=ui.viewNew();
 assert.ok(nv.includes('比较几种方案（会审）'));
 assert.equal((nv.match(/data-act="sug"/g)||[]).length,6);
+// 群聊：气泡式显示、模式按钮、提示、标签
+const grun={id:'g1',mode:'group',planner:null,synthesizer:null,status:'running',start:1,end:null,summary:'群聊：gemini、gpt 轮流聊 2 轮',participants:['gemini','gpt'],rounds:2,
+  tasks:[{id:'t1',agent:'gemini',title:'第 1 轮 · gemini',status:'ok',depends_on:[],answer:'我先说：音箱选 A',secs:4},
+         {id:'t2',agent:'gpt',title:'第 1 轮 · gpt',status:'running',depends_on:[],answer:null,started:2}]};
+ui.set({agents,config,health:{results:{}},calls:[],runs:[grun],workspace:'/w'});
+ui.cache['run:g1']={sig:'x',data:grun};
+const gh=ui.viewRun({type:'run',id:'g1',title:'聊聊音箱',rec:grun,status:'running',start:1,end:null});
+for(const t of ['音箱选 A','第 1 轮','正在输入','gemini','gpt']) assert.ok(gh.includes(t),t);
+assert.ok(!gh.includes('拆解任务') && !gh.includes('undefined'));
+assert.equal(ui.items()[0].group,true);
+ui.setMode('group');ui.renderComposer();
+assert.ok(nodes.hint.textContent.includes('轮流聊'));
+assert.ok(nodes.modes.innerHTML.includes('data-v="group"'));
 console.log('ui council: board, skipped member, synthesis label, composer, settings and templates passed');
 // 草稿：保存文字和模式；旧版纯文字也能恢复；不保存改文件开关
 const store={};

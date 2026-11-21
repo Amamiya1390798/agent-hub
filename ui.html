@@ -481,7 +481,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
 @media(max-width:760px){.intro{grid-template-columns:1fr;gap:6px}.intro li{padding:8px 12px}.intro span{margin-top:2px}.chint .r{display:none}.hero{padding-top:10px}}
 .mopt{display:none!important}
 @media(max-width:760px){
-  body:not(.copts) .crow>.seg,body:not(.copts) #contact,body:not(.copts) #wtog,body:not(.copts) #dtog,body:not(.copts) #cwd,body:not(.copts) .chint{display:none!important}
+  body:not(.copts) .crow>.seg,body:not(.copts) #contact,body:not(.copts) #gopts,body:not(.copts) #wtog,body:not(.copts) #dtog,body:not(.copts) #cwd,body:not(.copts) .chint{display:none!important}
   .crow{flex-wrap:wrap}.mopt{display:inline-flex!important;max-width:58vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   #tb-awake .tx{display:none} #tb-awake,#tb-side{padding:6px 10px;flex:none}
   .actbar .acts{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:2px}
@@ -526,6 +526,7 @@ button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid 
         <div class="crow">
           <div class="seg" id="modes"></div>
           <select id="contact" aria-label="谁来对接" style="display:none"></select>
+          <span id="gopts" style="display:none;font-size:12.5px"></span>
           <button class="tog" id="wtog" data-act="write" title="允许团队成员在工作目录里创建、修改文件">✎ 允许改文件</button>
           <button class="tog" id="dtog" data-act="cwd" title="指定工作目录">▸ 目录</button>
           <button class="tog mopt" id="mopt" data-act="mopt" title="展开或收起发送选项">选项</button>
@@ -576,6 +577,7 @@ let followLatest = false, pendingSubmission = null, pollSeq = 0, appliedPollSeq 
 let pollTimer = 0;
 const beginSubmit = () => { pendingSubmission = null; followLatest = true; };
 let filter = "all", query = "";
+let groupRounds = 3, groupSeats = null;   // groupSeats: null=所有在岗成员；否则 [{agent, spec}]，同一位成员可以多个席位（各用不同模型）
 let mode = "chat", allowWrite = localStorage.getItem("hub-write") !== "0", showCwd = false, ctx = null;
 let forking = false;
 let handoffArm = null;                // 正在选「交接到哪一组」的那条记录 id
@@ -750,8 +752,8 @@ function items(){
   for (const cs of itemIndex.children.values()) cs.sort((a,b) => a.start - b.start);
   const out = [];
   for (const r of S.runs) out.push({type:"run", id:r.id, start:r.start, end:r.end, status:r.status, error:r.error,
-    title:r.display || r.goal, follows:r.follows, fork:!!r.fork, council:r.mode === "council", pressure:!!r.pressure,
-    agents:[r.planner].concat(r.tasks.filter(t => !t.skip_reason).map(t => t.agent), r.tasks.length > 1 ? [r.synthesizer] : []), rec:r});
+    title:r.display || r.goal, follows:r.follows, fork:!!r.fork, council:r.mode === "council", group:r.mode === "group", pressure:!!r.pressure,
+    agents:r.mode === "group" ? uniq(r.tasks.map(t => t.agent)) : [r.planner].concat(r.tasks.filter(t => !t.skip_reason).map(t => t.agent), r.tasks.length > 1 ? [r.synthesizer] : []), rec:r});
   for (const c of S.calls) if (!c.run && !c.parent && c.kind !== "side") out.push({type:"call", id:c.id, start:c.start, end:c.end, status:c.status, error:c.error,
     title:c.display || (c.kind === "image" && c.title) || c.prompt_preview, follows:c.follows, fork:!!c.fork, image:c.kind === "image", pressure:!!c.pressure,
     agents:c.kind === "handoff" ? [] : [c.agent].concat((itemIndex.children.get(c.id) || []).map(x => x.agent)), rec:c});
@@ -841,7 +843,7 @@ function groups(){
       status: runIt ? runIt.status : latest.status,
       error: runIt ? runIt.error : latest.error,
       agents: uniq(list.flatMap(i => i.agents)),
-      kind: (first.fork ? "⑂ 分叉 · " : "") + (runs.length ? (runs[runs.length - 1].council ? "会审" : runs[runs.length - 1].pressure ? "高压" : "协作") : list.some(x => x.pressure) ? "高压对话" : "对话"),
+      kind: (first.fork ? "⑂ 分叉 · " : "") + (runs.length ? (runs[runs.length - 1].council ? "会审" : runs[runs.length - 1].group ? "群聊" : runs[runs.length - 1].pressure ? "高压" : "协作") : list.some(x => x.pressure) ? "高压对话" : "对话"),
       count: list.reduce((n, i) => n + (i.type === "run" ? Math.max(1, (i.rec.tasks || []).length) : 1), 0),
       time: Math.max(...list.map(i => i.start)),
       archived: list.every(isArch),
@@ -876,7 +878,7 @@ function cardHtml(g){                 // 左栏一个项目组
     h += '<div class="gbody">';
     for (const i of g.items){
       const isi = stInfo(i.status, i.error), isSel = !!(sel && sel.type === i.type && sel.id === i.id);
-      const who = i.type === "run" ? (i.council ? "会审" : i.pressure ? "高压" : "协作") : (i.rec.agent || "提问");
+      const who = i.type === "run" ? (i.council ? "会审" : i.group ? "群聊" : i.pressure ? "高压" : "协作") : (i.rec.agent || "提问");
       const whoStyle = i.type === "run" ? "" : ' style="color:' + agc(i.rec.agent) + '"';
       h += '<button class="gitem' + (isSel ? " sel" : "") + '" data-act="select" data-type="' + esc(i.type) + '" data-id="' + esc(i.id) + '">' +
         '<span class="gwho"' + whoStyle + ">" + esc(who) + '</span><span class="gsep"> · </span>' +
@@ -1624,8 +1626,26 @@ function taskCard(t, lite){
     '<span style="margin-left:auto;display:inline-flex;gap:8px;align-items:center">' +
     (t.status === "running" ? tick((S.calls.find(c => c.id === t.call_id) || {}).start || t.started || lite.start) : t.secs != null && t.status !== "skipped" ? '<span class="dur">' + (dur(t.secs) || "0秒") + "</span>" : "") + badge(si.k, si.t) + "</span></button>" + body + "</div>");
 }
+function viewGroup(it){                 // 群聊：像聊天软件一样，一条条气泡，谁说的一目了然
+  const lite = it.rec, running = !!RUNNING[lite.status];
+  const sig = lite.rev ? lite.rev + "" : lite.status + "|" + lite.tasks.map(t => t.status + (t.call_id || "")).join(",");
+  const full = need("run", lite.id, sig) || lite;
+  const tasks = lite.tasks.map(t => Object.assign({}, (full.tasks || []).find(x => x.id === t.id), t));
+  let h = (lite.parent_call ? '<button class="crumb" data-act="select" data-type="call" data-id="' + esc(lite.parent_call) + '">← 回到和对接人的对话</button>' : "") + headHtml(it, "");
+  if (lite.error && lite.error !== "已手动停止") h += '<div class="note bad" style="margin-bottom:14px">' + esc(lite.error) + "</div>";
+  h += '<div class="small" style="margin-bottom:10px">' + esc(full.summary || "") + "</div>";
+  h += '<div class="chat">' + tasks.map(t => {
+    const rn = (t.title || "").split(" · ")[0];
+    return '<div class="them" style="margin-bottom:12px"><div class="who" style="color:' + agc(t.agent) + '">' + esc(t.label || t.agent) + ' <span class="small" style="display:inline">' + esc(rn) +
+      (t.status === "running" ? " · 正在输入…" + tick(t.started || lite.start) : t.secs != null ? " · " + (dur(t.secs) || "0秒") : "") + '</span></div>' +
+      (t.status === "running" ? "" : '<div class="md">' + (t.status === "fail" ? '<span class="small">' + esc(t.answer || "没说上话") + "</span>" : md(t.answer || "")) + "</div>") + "</div>";
+  }).join("") + "</div>";
+  if (!tasks.length) h += '<div class="small">正在开场…</div>';
+  return h;
+}
 function viewRun(it){
   const lite = it.rec;
+  if (lite.mode === "group") return viewGroup(it);
   const calls = S.calls.filter(c => c.run === lite.id);
   const sig = lite.rev ? lite.rev + "|" + calls.map(callSig).join(",")
     : lite.status + "|" + lite.tasks.map(t => t.status + (t.call_id || "")).join(",") + "|" + calls.map(c => c.status + (c.live || "")).join("");
@@ -1784,7 +1804,7 @@ function viewChat(it){                 // 主联络窗口：像聊天一样，�
     }
     h += '<div class="me">' + esc(t.title || "") + thumbsHtml(r.images) + "</div>";
     if (t.type === "run"){
-      h += '<div class="them"><div class="who">团队（' + (r.mode === "council" ? "会审" : r.pressure ? "高压" : "自动分工") + '）</div><button class="job" data-act="select" data-type="run" data-id="' + esc(r.id) + '">打开这个项目组看过程 · ' + esc(stInfo(r.status, r.error).t) + "</button></div>";
+      h += '<div class="them"><div class="who">团队（' + (r.mode === "council" ? "会审" : r.mode === "group" ? "群聊" : r.pressure ? "高压" : "自动分工") + '）</div><button class="job" data-act="select" data-type="run" data-id="' + esc(r.id) + '">打开这个项目组看过程 · ' + esc(stInfo(r.status, r.error).t) + "</button></div>";
       continue;
     }
     const full = r.kind === "chat" || r.kind === "ask" ? need("call", r.id, r.rev ? callSig(r) : callSig(r) + "|" + JSON.stringify(r.dispatch || {})) || {} : {};
@@ -1872,8 +1892,18 @@ function renderView(){
 }
 
 /* ---------- 输入区 ---------- */
+const seatsOf = () => groupSeats || liveAgents().map(a => ({agent: a.name, spec: ""}));
+const seatName = x => x.agent + (x.spec ? " · " + specLabel(x.spec) : "");
+function seatOptions(){               // 可加的席位：每位成员的默认模型，以及它自家的其他模型
+  const out = [];
+  for (const a of liveAgents()){
+    out.push({v: JSON.stringify({agent: a.name, spec: ""}), t: a.name + "（默认模型）"});
+    for (const b of ownModels(a, a.chain[0])) if (b.spec !== a.chain[0]) out.push({v: JSON.stringify({agent: a.name, spec: b.spec}), t: a.name + " · " + (b.label || b.spec)});
+  }
+  return out;
+}
 function renderComposer(){
-  const ms = [["chat","对接人",""], ["run","自动分工",""], ["council","会审",""]].concat(!S || liveAgents().some(a => a.name === "ds") ? [["pressure","高压",""]] : []).concat(liveAgents().map(a => [a.name, a.name, agc(a.name)]), S && liveAgents().some(a => a.name === "gpt") ? [["image","画图",""]] : []);
+  const ms = [["chat","对接人",""], ["run","自动分工",""], ["council","会审",""], ["group","群聊",""]].concat(!S || liveAgents().some(a => a.name === "ds") ? [["pressure","高压",""]] : []).concat(liveAgents().map(a => [a.name, a.name, agc(a.name)]), S && liveAgents().some(a => a.name === "gpt") ? [["image","画图",""]] : []);
   if (S && !ms.some(m => m[0] === mode)) mode = "chat";   // 恢复的草稿模式已不存在
   const mh = ms.map(m => '<button class="' + (mode === m[0] ? "on" : "") + '" data-act="mode" data-v="' + esc(m[0]) + '">' + (m[2] ? '<i class="dot" style="background:' + m[2] + '"></i>' : "") + esc(m[1]) + "</button>").join("");
   if (S && contact !== "auto" && !liveAgents().some(a => a.name === contact)) contact = "auto";   // 记住的人已经不在了或停用了
@@ -1881,6 +1911,11 @@ function renderComposer(){
     liveAgents().map(a => '<option value="' + esc(a.name) + '"' + (contact === a.name ? " selected" : "") + '>对接人：' + esc(a.name) + "</option>").join("");
   if (copts !== last.contact && document.activeElement !== $("contact")){ $("contact").innerHTML = copts; last.contact = copts; }
   $("contact").style.display = mode === "chat" ? "" : "none";
+  const gh = mode !== "group" ? "" : seatsOf().map((x, i) => '<span class="badge plain" style="margin-right:6px">' + esc(seatName(x)) + ' <button data-act="gdel" data-i="' + i + '" title="去掉" style="border:0;background:none;cursor:pointer;color:inherit">×</button></span>').join("") +
+    '<select data-gadd aria-label="加一位"><option value="">＋ 加一位…</option>' + seatOptions().map(o => '<option value="' + esc(o.v) + '">' + esc(o.t) + "</option>").join("") + "</select> " +
+    '<select data-grounds aria-label="聊几轮">' + [1,2,3,4,5,6,8,10].map(n => '<option value="' + n + '"' + (n === groupRounds ? " selected" : "") + ">聊 " + n + " 轮</option>").join("") + "</select>";
+  if (gh !== last.gopts && !($("gopts").contains && $("gopts").contains(document.activeElement))){ $("gopts").innerHTML = gh; last.gopts = gh; }
+  $("gopts").style.display = mode === "group" ? "" : "none";
   if (mh !== last.modes){ $("modes").innerHTML = mh; last.modes = mh; }
   const cfg = S ? S.config : {planner:"claude", synthesizer:"gemini"};
   const a = S && S.agents.find(x => x.name === mode);
@@ -1890,6 +1925,7 @@ function renderComposer(){
       : "由 " + contact + " 对接：它自己答，或替你排工、开会审，结果交回这个对话")
     : mode === "run" ? cfg.planner + " 排工 → 分给多位成员一起做 → " + cfg.synthesizer + " 汇总"
     : mode === "council" ? councilHint(cfg, cq, cm)
+    : mode === "group" ? "群聊：下面选好的席位围绕你给的话题轮流聊（同一位成员可以加多个，各用不同模型），互相看得到聊天记录，你不用管。聊完后在这条群聊下面接着发话，大家继续聊"
     : mode === "pressure" ? "高压（ds 主导对接）：由 ds 读完提示词后直接与你对话并执行；需要团队时由它派活并汇总" + (cfg.pressure_prompt ? "" : "（提示词还没写，在 ⚙ 设置 → 高压模式提示词）")
     : mode === "image" ? "由 gpt 生成图片，保存在 Hub 的图片目录" : a ? "只交给 " + mode + "：" + a.profile.split("。")[0] : "";
   $("wtog").style.display = mode === "image" ? "none" : "";
@@ -1941,8 +1977,13 @@ async function send(){
   if (!text || sending) return;
   const cit = ctx && findItem(ctx), useCtx = cit && mode !== "image";
   const typedCwd = showCwd ? $("cwd").value.trim() : "";
-  const body = {mode: mode === "run" || mode === "pressure" || mode === "image" || mode === "council" || mode === "chat" ? mode : "ask", agent: mode === "chat" ? contact : mode, text,
+  const body = {mode: mode === "run" || mode === "pressure" || mode === "image" || mode === "council" || mode === "group" || mode === "chat" ? mode : "ask", agent: mode === "chat" ? contact : mode, text,
     cwd: typedCwd || (useCtx && cit.rec.cwd && cit.rec.cwd !== S.workspace ? cit.rec.cwd : ""), write: allowWrite && mode !== "image"};
+  if (mode === "group"){
+    const seats = seatsOf();
+    if (seats.length < 2){ toast("群聊至少要两个席位"); return; }
+    body.seats = seats.map(x => x.spec ? x : {agent: x.agent}); body.rounds = groupRounds;
+  }
   if (useCtx) body.context = ctx;
   if (useCtx && forking) body.fork = true;
   // 在对接人对话里用「单人」接着问：改成「对接人：指定这位」，仍在同一段对话里接着聊，能续接会话、能派团队
@@ -1965,7 +2006,7 @@ async function send(){
     if (document.body.classList) document.body.classList.remove("copts");
     saveDraft();
     autosize();
-    toast("已交给" + (mode === "chat" ? "对接人" : mode === "run" ? "团队" : mode === "pressure" ? " ds（高压对接）" : mode === "council" ? "会审" : mode === "image" ? " gpt 画图" : " " + mode));
+    toast("已交给" + (mode === "chat" ? "对接人" : mode === "run" ? "团队" : mode === "pressure" ? " ds（高压对接）" : mode === "council" ? "会审" : mode === "group" ? "群聊" : mode === "image" ? " gpt 画图" : " " + mode));
     poll();
   } catch(e){ followLatest = false; toast("没发出去：" + e.message); }
   sending = false;
@@ -2200,6 +2241,7 @@ document.addEventListener("click", async e => {
       catch(e2){ const ta = document.createElement("textarea"); ta.value = txt; ta.style.cssText = "position:fixed;opacity:0"; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }
       toast("已复制");
     }
+    else if (act === "gdel"){ groupSeats = seatsOf().filter((_, i) => i !== +el.dataset.i); last.gopts = ""; renderComposer(); }
     else if (act === "mode"){ mode = el.dataset.v; saveDraft(); renderComposer(); $("txt").focus(); }
     else if (act === "write"){ allowWrite = !allowWrite; try { localStorage.setItem("hub-write", allowWrite ? "1" : "0"); } catch (e2){} renderComposer(); }   // 记住：下次打开还是这个选择
     else if (act === "cwd"){ showCwd = !showCwd; renderComposer(); if (showCwd) $("cwd").focus(); }
@@ -2318,7 +2360,7 @@ document.addEventListener("click", async e => {
       let text = it.type === "run" ? (r.display || r.goal) : r.display;
       if (!text && it.type === "call"){ const full = await api("/api/call?id=" + encodeURIComponent(r.id)); text = full.display || full.prompt; }
       if (!text) throw new Error("找不到原始指令，没法重新执行");
-      const body = it.type === "run" ? (r.mode === "council" ? Object.assign({mode:"council", text, cwd:r.cwd}, (r.participants || []).length >= 2 ? {agents:r.participants} : {}, r.synthesizer ? {synthesizer:r.synthesizer} : {}) : {mode:r.pressure ? "pressure" : "run", text, cwd:r.cwd, write:!!r.write})
+      const body = it.type === "run" ? (r.mode === "group" ? {mode:"group", text, cwd:r.cwd, seats:r.seats, rounds:r.rounds} : r.mode === "council" ? Object.assign({mode:"council", text, cwd:r.cwd}, (r.participants || []).length >= 2 ? {agents:r.participants} : {}, r.synthesizer ? {synthesizer:r.synthesizer} : {}) : {mode:r.pressure ? "pressure" : "run", text, cwd:r.cwd, write:!!r.write})
         : r.kind === "chat" ? (r.pressure || (r.chat && r.chat.pressure) ? {mode:"pressure", text, cwd:r.cwd, write:!!(r.chat && r.chat.write)} : {mode:"chat", agent:(r.chat && r.chat.mode === "manual") ? r.agent : "auto", text, cwd:r.cwd, write:!!(r.chat && r.chat.write)})
         : {mode:r.kind === "image" ? "image" : "ask", agent:r.agent, text, cwd:r.cwd, write:!!r.write};
       if (r.follows) body.context = r.follows;
@@ -2363,6 +2405,8 @@ document.addEventListener("change", async e => {
     } catch(err){ toast(err.message || "没交接成功"); el.value = ""; }
     return;
   }
+  if (el.dataset && "gadd" in el.dataset){ if (el.value){ groupSeats = seatsOf().concat([JSON.parse(el.value)]); last.gopts = ""; renderComposer(); } return; }
+  if (el.dataset && "grounds" in el.dataset){ groupRounds = +el.value || 3; return; }
   if (el.dataset && (el.dataset.agentOn || el.dataset.model)){
     const body = el.dataset.agentOn ? {agent_enabled: {agent: el.dataset.agentOn, on: el.checked}} : {model_enabled: {spec: el.dataset.model, on: el.checked}};
     try { await api("/api/config", body); toast((el.dataset.agentOn || el.parentNode.textContent.trim().slice(0, 30)) + (el.checked ? " 已启用" : " 已停用")); }

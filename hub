@@ -6,6 +6,7 @@ hub —— 本机多 Agent 调度器（Claude / GPT / Gemini / DeepSeek 互相�
   hub ask <agent> "问题"        让某个 agent 回答/干活（agent: gemini | claude | gpt | ds）
   hub run "目标"                规划者拆任务 -> 各 agent 并行执行 -> 汇总
   hub council "问题"            会审：几位各自独立作答 -> 一位比较共同点和分歧
+  hub group "话题"              群聊：几位轮流发言，互相看得到聊天记录
   hub chat "话"                 跟联络人说话：它自己答，或替你排工/会审，结果交回对话
   hub image "描述" -o out.png   让 GPT 画图
   hub ui                        打开网页面板：看谁在干什么、协作过程与内容
@@ -2341,6 +2342,108 @@ def run_council(cfg, question, cwd, members=None, synthesizer=None, on_open=None
         return 0 if all_ok else 1
 
 
+GROUP_PROMPT = """这是一个多位 AI 成员的群聊，话题由用户给出。你是「{me}」，群里还有：{others}。像在群里聊天一样自然发言：可以回应别人的观点、提出不同意见、追问、补充或开新角度，不必面面俱到，也不用每次都总结。保持简短（几句到一小段），用简体中文。
+如果觉得话题已经聊透、没什么可补充了，可以在最后单独一行写【聊完了】。
+
+话题：{topic}
+
+{log}
+现在轮到你（第 {rnd} 轮）。"""
+
+
+def parse_seats(cfg, items):
+    """群聊席位：每个是 {"agent": 成员, "spec": 指定模型或 None}；同一位成员可以占多个席位（用不同模型）。
+    命令行写法："gpt" 或 "gpt=codex:gpt-6.2-sol"。"""
+    out = []
+    for it in items or []:
+        if isinstance(it, str):
+            a, _, sp = it.partition("=")
+            it = {"agent": a.strip(), "spec": sp.strip() or None}
+        if isinstance(it, dict) and it.get("agent") in cfg["agents"]:
+            out.append({"agent": it["agent"], "spec": it.get("spec") or None})
+    return out
+
+
+def run_group(cfg, topic, cwd, seats=None, rounds=3, on_open=None, parent_call=None):
+    """群聊：几个席位围绕话题轮流发言，每次发言前都能看到之前的聊天记录（只读，不派活、不汇总）。"""
+    seats = parse_seats(cfg, seats if seats is not None else [{"agent": n} for n in council_members(cfg, list(cfg["agents"]))])
+    seats = [x for x in seats if not quota_skip(x["agent"])[0]]
+    if len(seats) < 2:
+        raise BackendError("群聊至少要两个可用的席位（有人停用或额度不够时会被排除）")
+    labels = []
+    for x in seats:  # 聊天里的名字：指定了模型就带上模型名；重名的加序号
+        base = x["agent"] + ("（%s）" % spec_label(x["spec"]) if x["spec"] else "")
+        n = labels.count(base) + sum(1 for l in labels if l.startswith(base + " #"))
+        labels.append(base if n == 0 else "%s #%d" % (base, n + 1))
+    members = labels
+    rounds = max(1, min(int(rounds or 3), 10))
+    run_id, run_dir, state, save = _open_run(
+        cfg, topic, cwd, False, mode="group", planner=None, synthesizer=None, participants=members, seats=seats, status="running",
+        rounds=rounds, **_sub_fields(topic, parent_call),
+        summary="群聊：%s 围绕话题轮流聊 %d 轮" % ("、".join(members), rounds))
+    with _record_guard(lambda: state, save, "failed"):
+        if on_open:
+            on_open(run_id)
+        log, turns, quiet_votes, failed = [], 0, set(), 0
+        for rnd in range(1, rounds + 1):
+            for seat, name in zip(seats, members):
+                if len(quiet_votes) == len(members):
+                    break
+                tid = "t%d" % (turns + 1)
+                t = {"id": tid, "agent": seat["agent"], "label": name, "title": "第 %d 轮 · %s" % (rnd, name), "depends_on": [], "write": False,
+                     "prompt": "", "why": "群聊发言", "eta_min": None, "status": "running", "backend": None, "secs": None,
+                     "call_id": None, "answer": None, "kind": "think", "started": time.time()}
+                others = "、".join(m for m in members if m != name)
+                t["prompt"] = GROUP_PROMPT.format(
+                    me=name, others=others, topic=topic, rnd=rnd,
+                    log=("到目前为止的聊天记录：\n" + "\n\n".join(log) + "\n\n") if log else "还没有人发言，你先开个头。\n\n")
+                with state_lock(save):
+                    state["tasks"].append(t)
+                    save()
+                eprint("[hub] 群聊 ▶ %s（第 %d 轮）" % (name, rnd))
+
+                def started(cid, t=t):
+                    with state_lock(save):
+                        t["call_id"] = cid
+                        save()
+                t0 = time.time()
+                try:
+                    text, spec = ask(cfg, seat["agent"], t["prompt"], cwd=state["cwd"], quiet=True, note=False, tier="think", spec=seat["spec"],
+                                     meta={"run": run_id, "task": tid, "kind": "task", "title": t["title"], "on_start": started})
+                    text = text.strip()
+                    ended = "【聊完了】" in text
+                    text = text.replace("【聊完了】", "").strip()
+                    upd = dict(status="ok", backend=spec, secs=round(time.time() - t0, 1), answer=text)
+                    log.append("【%s】%s" % (name, text))
+                    (quiet_votes.add if ended else quiet_votes.discard)(name)
+                except BackendError as e:
+                    upd = dict(status="fail", backend="-", secs=round(time.time() - t0, 1), answer="【发言失败】%s" % e)
+                    failed += 1
+                with state_lock(save):
+                    t.update(upd)
+                    save()
+                turns += 1
+                if failed >= len(members) * 2:  # 连续大面积失败就别硬聊了
+                    break
+            if len(quiet_votes) == len(members) or failed >= len(members) * 2:
+                break
+        said = [x for x in log]
+        final = "\n\n".join(said) if said else "没有人发言。"
+        with open(os.path.join(run_dir, "final.md"), "w", encoding="utf-8") as f:
+            f.write(final + "\n")
+        ok = bool(said) and failed < len(members) * 2
+        note = "大家都觉得聊完了" if len(quiet_votes) == len(members) else None
+        save(status="done" if ok else "failed", end=time.time(), final=final, error=None if ok else "发言失败太多，群聊中止",
+             summary=state["summary"] + ("；" + note if note else ""))
+        print(final)
+        eprint("[hub] 群聊结束：共 %d 条发言，%d 次失败。过程记录：%s" % (len(said), failed, run_dir))
+        return 0 if ok else 1
+
+
+def state_lock(save):
+    return save.lock
+
+
 # ---------------------------------------------------------------- 主联络窗口：用户只跟一位「联络人」说话
 
 
@@ -3658,7 +3761,7 @@ def stop_record(kind, rid):
         cmdline = subprocess.check_output(["ps", "-o", "command=", "-p", str(pid)], text=True)
     except (OSError, subprocess.CalledProcessError):
         cmdline = ""
-    if not re.search(r"(^|/)hub (run|ask|image|council|chat)\b", cmdline):
+    if not re.search(r"(^|/)hub (run|ask|image|council|group|chat)\b", cmdline):
         return "进程对不上，为安全起见没有停止"
     try:
         os.kill(int(pid), signal.SIGTERM)
@@ -4838,7 +4941,7 @@ def serve_ui(port, me):
         c = load_config()
         if not text:
             raise ValueError("内容是空的")
-        if mode not in ("run", "pressure", "ask", "image", "council", "chat", "side"):
+        if mode not in ("run", "pressure", "ask", "image", "council", "group", "chat", "side"):
             raise ValueError("方式不对")
         if mode in ("ask", "side") and agent not in c["agents"]:
             raise ValueError("没有这个 agent")
@@ -4923,6 +5026,19 @@ def serve_ui(port, me):
                 if sy not in c["agents"]:
                     raise ValueError("综合者不对")
                 cmd += ["--synthesizer", sy]
+        elif mode == "group":
+            cmd = ["group", "-w", cwd]
+            ag, rd = body.get("seats"), body.get("rounds")
+            if ag is not None:
+                if not isinstance(ag, list) or not ag or len(ag) > 12 or not all(
+                        isinstance(x, dict) and x.get("agent") in live["agents"]
+                        and (not x.get("spec") or (isinstance(x["spec"], str) and x["spec"] in enabled_specs(c))) for x in ag):
+                    raise ValueError("群聊成员或模型不对，或有人已停用")
+                cmd += ["--agents", ",".join(x["agent"] + ("=" + x["spec"] if x.get("spec") else "") for x in ag)]
+            if rd is not None:
+                if not isinstance(rd, int) or isinstance(rd, bool) or not 1 <= rd <= 10:
+                    raise ValueError("轮数要在 1 到 10 之间")
+                cmd += ["--rounds", str(rd)]
         else:
             if mode in ("pressure", "chat"):
                 cmd = ["chat", "--contact", "ds", "--pressure"] if mode == "pressure" else ["chat", "--contact", agent]
@@ -5322,6 +5438,12 @@ def main():
     co.add_argument("--agents", help="参加的成员，用逗号分隔（默认看配置 council_agents）")
     co.add_argument("--synthesizer", choices=list(cfg["agents"]), help="负责比较意见的成员（默认看配置 synthesizer）")
 
+    gr = sub.add_parser("group", help="群聊：几位成员围绕话题轮流发言，互相能看到聊天记录（只读）")
+    gr.add_argument("topic", nargs="+", help="话题；写 - 则从标准输入读")
+    gr.add_argument("-w", "--cwd")
+    gr.add_argument("--agents", help="参加的席位，用逗号分隔，成员名或 成员=模型（如 gpt=codex:gpt-6.2-sol,gpt=codex:gpt-6.2-astra；默认所有在岗成员）")
+    gr.add_argument("--rounds", type=int, default=3, help="聊几轮（每轮每人说一次，1-10）")
+
     ch = sub.add_parser("chat", help="跟联络人说话：它自己答，或替你派活给团队")
     ch.add_argument("message", nargs="+", help="内容；写 - 则从标准输入读")
     ch.add_argument("--contact", default="auto", help="联络人：auto（按阶段自动选）或成员名")
@@ -5374,6 +5496,11 @@ def main():
             if members and any(m not in cfg["agents"] for m in members):
                 raise BackendError("不认识的成员：%s（可选：%s）" % (args.agents, ", ".join(cfg["agents"])))
             return run_council(cfg, read_prompt(args.question), args.cwd, members, args.synthesizer)
+        if args.cmd == "group":
+            members = [x.strip() for x in args.agents.split(",") if x.strip()] if args.agents else None
+            if members and any(m.partition("=")[0] not in cfg["agents"] for m in members):
+                raise BackendError("不认识的成员：%s（可选：%s）" % (args.agents, ", ".join(cfg["agents"])))
+            return run_group(cfg, read_prompt(args.topic), args.cwd, members, args.rounds)
         if args.cmd == "chat":
             return run_chat(cfg, read_prompt(args.message), args.cwd, args.write, args.contact, pressure=args.pressure)
         if args.cmd == "image":

@@ -53,6 +53,7 @@ Hub 是一个本机多 Agent 调度器：把同一台 Mac 上已登录的几个 
 - **`ask(cfg, agent, prompt, ...)`**：单次调用。负责选后端、写调用记录、实时输出、失败换备用。所有其他流程最终都调用它。
 - **`run_goal(...)`**（`hub run`）：`make_plan` 让排工者按 `PLAN_PROMPT` 输出 JSON 任务列表（含 `depends_on`、`write`、`why`、`eta_min`）→ `_exec_tasks` 按依赖并行执行，同时最多 `max_parallel` 件 → 用 `SYNTH_PROMPT` 汇总。传 `--pressure` 时是「高压模式」：由 `ds` 排工和汇总，并把配置里的 `pressure_prompt` 放在排工提示词前面。
 - **`run_council(...)`**（`hub council`）：几位成员只读、互相看不到答案地回答同一个问题，再由一位按 `COUNCIL_SYNTH_PROMPT` 比较。
+- **`run_group(...)`**（`hub group`）：群聊。按「席位」轮流发言，席位是 `{agent, spec}`，同一位成员可占多个席位各用不同模型（命令行写 `gpt=codex:gpt-6.2-sol`，`parse_seats()` 解析）；每次发言前把之前的聊天记录拼进 `GROUP_PROMPT`，只读、不汇总；全员在末尾写【聊完了】会提前结束；任务记录带 `label`（聊天里显示的名字），run 记录带 `seats`、`rounds`。面板用 `viewGroup()` 画成气泡，输入框的席位选择在 `#gopts`。
 - **`run_chat(...)`**（`hub chat`）：对接人模式。`choose_contact` 按阶段（定方案 / 动手 / 整理）和剩余额度选人，对接人可以直接回答，也可以发起 run 或 council，结果交回对话。
 - **旁问**（`mode: "side"`）：`hub ask <成员> --side [--spec 模型] [--effort 档位] [--web]`。只读；记录的 `kind` 为 `side`，不进左栏主线。`--web` 时 GPT 加 `-c web_search="live"`，Claude 加 `--allowedTools WebSearch WebFetch`，并在提示词末尾附 `WEB_NOTE`。
 **常驻会话（Gemini）**：面板里的顶层对话（chat / ask / side，且 `HUB_META` 存在、不是队员互相求助）用 `keep_turn()` 把 `agy --input-format stream-json` 进程留在后台，输入走 `~/.agent-hub/keep/<id>.in`（FIFO），输出写 `<id>.log`。下一句按会话编号找到它直接写入，不重新启动。面板左栏「开着的会话」列出它们，`/api/keep/close {id|"all"}` 关闭；进程一启动就退出时自动退回一次性调用。配置 `keep_sessions: false` 可关掉。
@@ -131,7 +132,7 @@ Claude 后端没有流式输出，只受总上限约束。`ask()` 不会再跑�
 `hub ui` 启动 `ThreadingHTTPServer`，默认只监听 `127.0.0.1:8765`。
 
 - GET：`/`、`/api/state?c=<客户端id>[&compact=1&v=<版本>]`、`/api/call?id=`、`/api/run?id=`、`/api/image?id=`、`/api/file?path=`、`/api/clients`、`/api/pair`、`/pair`、`/icon.png`
-- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/handoff/undo`、`/api/compact`、`/api/folders`、`/api/awake`、`/api/keep/close`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
+- POST（需要请求头 `X-Hub-Token`）：`/api/submit`（`mode` 取 `chat` / `run` / `pressure` / `council` / `group`（可带 `seats`、`rounds`）/ `ask` / `side` / `image`；可带 `context`、`context_scope`、`fork`，旁问还可带 `spec`、`effort`、`web`）、`/api/archive`（`{keys, on}`）、`/api/upload`、`/api/rename`、`/api/title/backfill`、`/api/handoff`、`/api/handoff/undo`、`/api/compact`、`/api/folders`、`/api/awake`、`/api/keep/close`、`/api/stop`、`/api/health`、`/api/quota`、`/api/config`、`/api/login`、`/api/notify`、`/api/open`、`/api/lan`、`/api/pair/reset`
 - `/api/bye` 不需要令牌，只用于页面关闭时登记。
 
 安全措施：检查 Host 头；图片接口只返回位图（不返回 SVG，防止 XSS）；设置 CSP 和 `X-Frame-Options`。局域网模式（`lan_access`）默认关闭，开启后只接受私有网段，需要配对码加 HttpOnly cookie，配对码输错有限速；设置、登录、开关局域网这些操作只能在本机做（见 `gate()` 和 `REMOTE_POSTS`）。 局域网模式开着时，面板会同时占住 `127.0.0.1` 和局域网地址，免得本机别的程序抢走同一个端口、把 Hub 窗口顶掉。
